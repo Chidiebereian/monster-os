@@ -1,0 +1,12 @@
+{
+  "train": {
+    "key_column": "game_id", "event_time_column": "ts", "label_column": "won",
+    "allowed_labels": [0, 1], "prediction_cutoff": 1700000000, "group_column": "team",
+    "rows": [
+      {"game_id": 1, "ts": 1690000000, "pts": 112, "won": 1, "team": 1},
+      {"game_id": 2, "ts": 1690086400, "pts": 98,  "won": 0, "team": 2},
+      {"game_id": 2, "ts": 1690086400, "pts": 98,  "won": 0, "team": 2},
+      {"game_id": 3, "ts": 1710000000, "pts": 105, "won": 3, "team": 1}
+    ]
+  }
+}

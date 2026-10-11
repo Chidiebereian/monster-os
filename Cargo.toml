@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "apps/api-gateway",
+    "apps/arbitrage-engine",
+    "apps/backtesting-engine",
+    "apps/copy-trading",
+    "apps/feature-store",
+    "apps/market-intelligence",
+    "apps/model-registry",
+    "apps/monster-gpt",
+    "apps/pricing-engine",
+    "apps/simulation-engine",
+    "apps/sport-intelligence",
+    "apps/whale-tracker",
+    "services/bayesian-service",
+    "services/bootstrap-service",
+    "services/bradley-terry-service",
+    "services/data-quality-service",
+    "services/elo-service",
+    "services/kelly-service",
+    "services/mlb-service",
+    "services/monte-carlo-service",
+    "services/nba-service",
+    "services/nfl-service",
+    "services/nhl-service",
+    "services/odds-service",
+    "services/portfolio-service",
+    "services/prediction-market-service",
+    "services/soccer-service",
+]
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,6 @@
+/target
+.env
+*.parquet
+*.arrow
+research/notebooks/.ipynb_checkpoints/
+__pycache__/
