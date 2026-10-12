@@ -159,8 +159,10 @@ export interface PlayerProjection {
 }
 export interface ProjectionList { sport: string; stat: string; model_id: string; count: number; projections: PlayerProjection[]; }
 export interface ProjectionDetail {
+  stat: string;
+  unit: string;
   projection: PlayerProjection;
-  recent_games: { season: number; week: string; opponent: string; passing_tds: number | string }[];
+  recent_games: { season: number; week: string; opponent: string; value: number | string | null }[];
 }
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number; }
 export interface Candles { market_id: string | null; outcome_index: number | null; interval_secs: number; candles: Candle[]; }

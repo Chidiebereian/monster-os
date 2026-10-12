@@ -14,8 +14,26 @@ import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../comp
 type StatDef = { key: string; label: string; model: string; unit: string };
 type SportDef = { sport: string; label: string; stats: StatDef[] };
 
+const nflStat = (key: string, label: string, unit: string): StatDef => ({ key, label, unit, model: `nfl-${key}-v1` });
 const PROJ_SPORTS: SportDef[] = [
-  { sport: "nfl", label: "NFL", stats: [{ key: "pass_td", label: "Passing TDs", model: "nfl-passtd-v1", unit: "TDs" }] },
+  {
+    sport: "nfl",
+    label: "NFL",
+    stats: [
+      nflStat("pass_yds", "Passing Yards", "yds"),
+      nflStat("pass_td", "Passing TDs", "TDs"),
+      nflStat("pass_att", "Pass Attempts", "att"),
+      nflStat("completions", "Completions", "comp"),
+      nflStat("interceptions", "Interceptions", "INT"),
+      nflStat("rush_yds", "Rushing Yards", "yds"),
+      nflStat("carries", "Carries", "att"),
+      nflStat("rush_td", "Rushing TDs", "TDs"),
+      nflStat("rec_yds", "Receiving Yards", "yds"),
+      nflStat("receptions", "Receptions", "rec"),
+      nflStat("targets", "Targets", "tgt"),
+      nflStat("rec_td", "Receiving TDs", "TDs"),
+    ],
+  },
   { sport: "nba", label: "NBA", stats: [] },
   { sport: "mlb", label: "MLB", stats: [] },
   { sport: "nhl", label: "NHL", stats: [] },
@@ -220,17 +238,18 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
           {detail.data && detail.data.recent_games.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
               {detail.data.recent_games.slice(0, 16).map((g, i) => {
-                const v = Number(g.passing_tds);
+                const v = Number(g.value ?? 0);
+                const label = Number.isInteger(v) ? v : Math.round(v);
                 return (
                   <div
                     key={i}
-                    title={`${g.season} wk ${g.week} vs ${g.opponent}: ${v}`}
+                    title={`${g.season} wk ${g.week} vs ${g.opponent}: ${v} ${stat.unit}`}
                     className={clsx(
-                      "w-7 h-7 rounded flex items-center justify-center text-xs font-mono",
-                      v >= 3 ? "bg-emerald/25 text-emerald-light" : v >= 1 ? "bg-white/5 text-gray-300" : "bg-crimson/15 text-crimson-light",
+                      "min-w-7 h-7 px-1.5 rounded flex items-center justify-center text-xs font-mono",
+                      v >= mean ? "bg-emerald/25 text-emerald-light" : v > 0 ? "bg-white/5 text-gray-300" : "bg-crimson/15 text-crimson-light",
                     )}
                   >
-                    {v}
+                    {label}
                   </div>
                 );
               })}
