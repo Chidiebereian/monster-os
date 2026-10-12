@@ -42,6 +42,7 @@ const SERVICES: &[(&str, u16)] = &[
     ("portfolio-service", 8112),
     ("data-quality-service", 8113),
     ("odds-service", 8120),
+    ("projection-service", 8121),
 ];
 
 /// Hop-by-hop headers that must not be forwarded (RFC 9110 §7.6.1).

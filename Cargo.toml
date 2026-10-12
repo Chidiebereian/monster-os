@@ -11,6 +11,7 @@ members = [
     "apps/model-registry",
     "apps/monster-gpt",
     "apps/pricing-engine",
+    "apps/projection-service",
     "apps/simulation-engine",
     "apps/sport-intelligence",
     "apps/whale-tracker",
