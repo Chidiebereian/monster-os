@@ -448,6 +448,10 @@ struct ListQuery {
     limit: Option<i64>,
     min_games: Option<i32>,
     q: Option<String>,
+    /// comma-separated team codes to filter to (e.g. a game's two teams)
+    teams: Option<String>,
+    /// only players whose last season is >= this (current roster when a game is picked)
+    min_last_season: Option<i32>,
 }
 
 async fn list_stat(state: web::Data<State>, path: web::Path<String>, query: web::Query<ListQuery>) -> impl Responder {
@@ -456,13 +460,19 @@ async fn list_stat(state: web::Data<State>, path: web::Path<String>, query: web:
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let min_games = query.min_games.unwrap_or(0);
     let search = query.q.clone().unwrap_or_default();
+    let teams: Option<Vec<String>> = query.teams.as_ref().and_then(|s| {
+        let v: Vec<String> = s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        if v.is_empty() { None } else { Some(v) }
+    });
     let sql = "SELECT p.player_id, pl.display_name, pl.team, pl.position, pl.last_season, \
                       p.proj_mean, p.proj_sd, p.dispersion, p.sample_games, p.career_mean, p.recent_mean, \
                       p.market_line, p.market_implied, p.model_id, p.family, p.unit \
                FROM player_projections p JOIN sports_players pl ON pl.sport=p.sport AND pl.player_id=p.player_id \
                WHERE p.sport='nfl' AND p.stat=$1 AND p.sample_games >= $2 AND ($3='' OR pl.display_name ILIKE '%'||$3||'%') \
+                 AND ($5::text[] IS NULL OR pl.team = ANY($5)) \
+                 AND ($6::int IS NULL OR pl.last_season >= $6) \
                ORDER BY p.proj_mean DESC LIMIT $4";
-    match state.db.query(sql, &[&def.key, &min_games, &search, &limit]).await {
+    match state.db.query(sql, &[&def.key, &min_games, &search, &limit, &teams, &query.min_last_season]).await {
         Ok(rows) => {
             let out: Vec<Value> = rows.iter().map(proj_row_json).collect();
             HttpResponse::Ok().json(json!({ "sport": "nfl", "stat": def.key, "label": def.label, "unit": def.unit, "family": def.family.as_str(), "model_id": model_id(def.key), "count": out.len(), "projections": out }))

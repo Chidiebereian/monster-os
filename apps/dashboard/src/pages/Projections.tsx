@@ -95,10 +95,33 @@ export function Projections() {
 function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
+  const [gameId, setGameId] = useState("");
+
+  const games = useQuery({
+    queryKey: ["games", sport, "scheduled"],
+    queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }),
+    enabled: sport === "nfl",
+  });
+  // upcoming games sorted by date, soonest first
+  const upcoming = [...(games.data?.games ?? [])]
+    .filter((g) => g.home && g.away)
+    .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
+  const game = upcoming.find((g) => g.game_id === gameId);
+  const teams = game ? `${game.away},${game.home}` : undefined;
+  // when a game is picked, restrict to current-roster players (last season near now)
+  const currentSeason = Math.max(0, ...upcoming.map((g) => g.season ?? 0));
+  const minLastSeason = game && currentSeason ? currentSeason - 1 : undefined;
 
   const list = useQuery({
-    queryKey: ["projections", sport, stat.key, search],
-    queryFn: () => api.playerProjections(sport, stat.key, { limit: 150, min_games: 16, q: search || undefined }),
+    queryKey: ["projections", sport, stat.key, search, teams, minLastSeason],
+    queryFn: () =>
+      api.playerProjections(sport, stat.key, {
+        limit: 150,
+        min_games: 16,
+        q: search || undefined,
+        teams,
+        min_last_season: minLastSeason,
+      }),
   });
 
   const rows = list.data?.projections ?? [];
@@ -119,6 +142,20 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
           <h2 className="font-medium text-sm">{stat.label}</h2>
           <span className="text-xs text-gray-500 ml-auto">{list.data?.count ?? 0} players</span>
         </div>
+        {sport === "nfl" && (
+          <select
+            value={gameId}
+            onChange={(e) => setGameId(e.target.value)}
+            className="w-full bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
+          >
+            <option value="">All games · all players</option>
+            {upcoming.map((g) => (
+              <option key={g.game_id} value={g.game_id}>
+                {g.away} @ {g.home}{g.week ? ` · wk ${g.week}` : ""}{g.date ? ` · ${g.date}` : ""}
+              </option>
+            ))}
+          </select>
+        )}
         <Input value={search} onChange={setSearch} placeholder="Search player…" className="w-full" />
         {list.isLoading && <Msg>Loading projections…</Msg>}
         {list.error && <Msg tone="error">{(list.error as Error).message}</Msg>}

@@ -84,8 +84,10 @@ export const api = {
     getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 100000, ...opts })}`),
 
   // --- projection-service (player/team models) ---
-  playerProjections: (sport: string, stat: string, opts: { limit?: number; min_games?: number; q?: string } = {}) =>
+  playerProjections: (sport: string, stat: string, opts: { limit?: number; min_games?: number; q?: string; teams?: string; min_last_season?: number } = {}) =>
     getJson<ProjectionList>(`/projection-service/projections/${sport}/${stat}?${qs(opts)}`),
+  games: (sport = "nfl", opts: { status?: string; season?: number; week?: string; limit?: number } = {}) =>
+    getJson<GamesList>(`/projection-service/games/${sport}?${qs(opts)}`),
   playerProjection: (sport: string, stat: string, playerId: string) =>
     getJson<ProjectionDetail>(`/projection-service/projections/${sport}/${stat}/${playerId}`),
   teamRatings: (sport = "nfl") => getJson<TeamRatings>(`/projection-service/teams/${sport}`),
@@ -172,6 +174,13 @@ export interface ProjectionDetail {
   projection: PlayerProjection;
   recent_games: { season: number; week: string; opponent: string; value: number | string | null }[];
 }
+export interface Game {
+  game_id: string; season: number | null; week: string | null; game_type: string | null;
+  date: string | null; home: string | null; away: string | null;
+  home_score: number | null; away_score: number | null;
+  spread_line: number | null; total_line: number | null; status: string | null;
+}
+export interface GamesList { count: number; games: Game[]; }
 export interface TeamRating { team: string; off: number; def: number; net: number; }
 export interface TeamRatings { model_id: string; count: number; teams: TeamRating[]; }
 export interface Matchup {
