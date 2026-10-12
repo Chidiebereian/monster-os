@@ -32,6 +32,13 @@ mod teams;
 
 const NFLVERSE_PLAYER_STATS: &str =
     "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv";
+// Current-season per-season files (newer nflverse schema: `team`,
+// `passing_interceptions`). The cumulative file above lags by ~a season, so we
+// merge these in. Override with NFLVERSE_CURRENT_URLS (comma-separated).
+const NFL_CURRENT_SEASON_URLS: &[&str] = &[
+    "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2025.csv",
+    "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv",
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Family {
@@ -247,57 +254,75 @@ async fn ingest_nfl(state: web::Data<State>, q: web::Query<IngestQuery>) -> impl
         }
     }
 
-    // 1. download
-    let bytes = match state.http.get(&state.nflverse_url).send().await.and_then(|r| r.error_for_status()) {
-        Ok(r) => match r.bytes().await { Ok(b) => b, Err(e) => return internal(format!("nflverse body: {e}")) },
-        Err(e) => return internal(format!("nflverse fetch: {e}")),
-    };
-
-    // 2. parse
-    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(bytes.as_ref());
-    let headers = match rdr.headers() { Ok(h) => h.clone(), Err(e) => return internal(format!("csv headers: {e}")) };
-    let col = |name: &str| headers.iter().position(|h| h == name);
-    let (Some(i_pid), Some(i_name), Some(i_pos), Some(i_team), Some(i_season), Some(i_week), Some(i_type), Some(i_opp)) = (
-        col("player_id"), col("player_display_name"), col("position"), col("recent_team"),
-        col("season"), col("week"), col("season_type"), col("opponent_team"),
-    ) else {
-        return internal("nflverse schema changed: a required dimension column is missing");
-    };
-    let mut col_idx: HashMap<&'static str, usize> = HashMap::new();
-    for &c in &need_cols {
-        match col(c) {
-            Some(i) => { col_idx.insert(c, i); }
-            None => return internal(format!("nflverse schema changed: column {c} missing")),
+    // 1. sources: cumulative 1999-2024 file (old schema) + current-season files
+    //    (newer schema). Parse each with alias-aware column lookup and merge.
+    let mut sources: Vec<String> = vec![state.nflverse_url.clone()];
+    match std::env::var("NFLVERSE_CURRENT_URLS") {
+        Ok(v) if !v.trim().is_empty() => sources.extend(v.split(',').map(|s| s.trim().to_string())),
+        _ => sources.extend(NFL_CURRENT_SEASON_URLS.iter().map(|s| s.to_string())),
+    }
+    // canonical need-column -> accepted header names (schema differences)
+    fn aliases(name: &str) -> Vec<&str> {
+        match name {
+            "interceptions" => vec!["interceptions", "passing_interceptions"],
+            other => vec![other],
         }
     }
 
     let mut players: HashMap<String, Player> = HashMap::new();
-    let getf = |r: &csv::StringRecord, i: usize| r.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    for rec in rdr.records() {
-        let r = match rec { Ok(r) => r, Err(e) => return internal(format!("csv row: {e}")) };
-        if r.get(i_type) != Some("REG") {
-            continue;
+    let getf = |r: &csv::StringRecord, i: Option<usize>| i.and_then(|i| r.get(i)).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+    for url in &sources {
+        let bytes = match state.http.get(url).send().await.and_then(|r| r.error_for_status()) {
+            Ok(r) => match r.bytes().await { Ok(b) => b, Err(e) => return internal(format!("fetch body {url}: {e}")) },
+            Err(e) => {
+                if url == &state.nflverse_url {
+                    return internal(format!("nflverse fetch: {e}"));
+                }
+                eprintln!("projection-service: skipping current-season source {url}: {e}");
+                continue;
+            }
+        };
+        let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(bytes.as_ref());
+        let headers = match rdr.headers() { Ok(h) => h.clone(), Err(e) => return internal(format!("csv headers {url}: {e}")) };
+        let find = |names: &[&str]| names.iter().find_map(|n| headers.iter().position(|h| h == *n));
+        let (Some(i_pid), Some(i_name), Some(i_pos), Some(i_team), Some(i_season), Some(i_week), Some(i_type), Some(i_opp)) = (
+            find(&["player_id"]), find(&["player_display_name"]), find(&["position"]),
+            find(&["recent_team", "team"]), find(&["season"]), find(&["week"]),
+            find(&["season_type"]), find(&["opponent_team", "opponent"]),
+        ) else {
+            return internal(format!("schema: a required dimension column is missing in {url}"));
+        };
+        let mut col_idx: HashMap<&'static str, Option<usize>> = HashMap::new();
+        for &c in &need_cols {
+            col_idx.insert(c, find(&aliases(c)));
         }
-        let pid = r.get(i_pid).unwrap_or("").to_string();
-        if pid.is_empty() {
-            continue;
+        for rec in rdr.records() {
+            let r = match rec { Ok(r) => r, Err(e) => return internal(format!("csv row {url}: {e}")) };
+            if r.get(i_type) != Some("REG") {
+                continue;
+            }
+            let pid = r.get(i_pid).unwrap_or("").to_string();
+            if pid.is_empty() {
+                continue;
+            }
+            let mut vals: HashMap<&'static str, f64> = HashMap::new();
+            for (&c, &i) in &col_idx {
+                vals.insert(c, getf(&r, i));
+            }
+            let season: i32 = r.get(i_season).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let week = r.get(i_week).unwrap_or("").to_string();
+            let week_sort = season as f64 * 100.0 + week.parse::<f64>().unwrap_or(0.0);
+            let entry = players.entry(pid).or_insert_with(|| Player {
+                display_name: r.get(i_name).unwrap_or("").to_string(),
+                position: r.get(i_pos).unwrap_or("").to_string(),
+                team: r.get(i_team).unwrap_or("").to_string(),
+                games: Vec::new(),
+            });
+            entry.position = r.get(i_pos).unwrap_or(&entry.position).to_string();
+            entry.team = r.get(i_team).unwrap_or(&entry.team).to_string();
+            entry.games.push(GameRow { season, week, week_sort, opponent: r.get(i_opp).unwrap_or("").to_string(), vals });
         }
-        let mut vals: HashMap<&'static str, f64> = HashMap::new();
-        for (&c, &i) in &col_idx {
-            vals.insert(c, getf(&r, i));
-        }
-        let season: i32 = r.get(i_season).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let week = r.get(i_week).unwrap_or("").to_string();
-        let week_sort = season as f64 * 100.0 + week.parse::<f64>().unwrap_or(0.0);
-        let entry = players.entry(pid).or_insert_with(|| Player {
-            display_name: r.get(i_name).unwrap_or("").to_string(),
-            position: r.get(i_pos).unwrap_or("").to_string(),
-            team: r.get(i_team).unwrap_or("").to_string(),
-            games: Vec::new(),
-        });
-        entry.position = r.get(i_pos).unwrap_or(&entry.position).to_string();
-        entry.team = r.get(i_team).unwrap_or(&entry.team).to_string();
-        entry.games.push(GameRow { season, week, week_sort, opponent: r.get(i_opp).unwrap_or("").to_string(), vals });
     }
     if players.is_empty() {
         return internal("no regular-season rows parsed");
