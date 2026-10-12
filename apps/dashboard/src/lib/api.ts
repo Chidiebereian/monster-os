@@ -1,0 +1,140 @@
+// Thin client for the MonsterOS api-gateway. Every call goes through /api,
+// which the Vite dev server proxies to the gateway (default http://localhost:8090).
+
+import type { LeaderboardRow, OddsScreenRow } from "../types/monster-os";
+
+async function getJson<T>(path: string): Promise<T> {
+  const res = await fetch(`/api${path}`, { headers: { accept: "application/json" } });
+  if (!res.ok) throw new Error(await errText(res));
+  return res.json() as Promise<T>;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errText(res));
+  return res.json() as Promise<T>;
+}
+
+async function errText(res: Response): Promise<string> {
+  const body = await res.text().catch(() => "");
+  return `${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ""}`;
+}
+
+export const qs = (o: Record<string, string | number | undefined>) => {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(o)) if (v !== undefined && v !== "") p.set(k, String(v));
+  return p.toString();
+};
+
+export const api = {
+  // --- odds-service ---
+  oddsScreen: (sportKey: string) => getJson<OddsScreenRow[]>(`/odds-service/screen/${sportKey}`),
+  oddsKeys: () => getJson<unknown[]>(`/odds-service/keys`),
+
+  // --- pricing-engine ---
+  implied: (odds: number) => getJson<{ odds: number; implied_probability: number }>(`/pricing-engine/implied?odds=${odds}`),
+  novig: (oddsA: number, oddsB: number) =>
+    getJson<NoVig>(`/pricing-engine/novig?${qs({ odds_a: oddsA, odds_b: oddsB })}`),
+
+  // --- kelly-service (calculators) ---
+  kelly: (probability: number, odds: number, fraction?: number) =>
+    getJson<Kelly>(`/kelly-service/kelly?${qs({ probability, odds, fraction })}`),
+  ev: (probability: number, odds: number, stake: number) =>
+    getJson<Ev>(`/kelly-service/ev?${qs({ probability, odds, stake })}`),
+  hedge: (oddsA: number, stakeA: number, oddsB: number) =>
+    getJson<Hedge>(`/kelly-service/hedge?${qs({ odds_a: oddsA, stake_a: stakeA, odds_b: oddsB })}`),
+  parlay: (odds: string) => getJson<Parlay>(`/kelly-service/parlay?${qs({ odds })}`),
+
+  // --- arbitrage-engine ---
+  scan: (sport: string, series: string, opts: { min_edge?: number; min_top?: number; min_depth?: number } = {}) =>
+    getJson<ScanResult>(`/arbitrage-engine/scan?${qs({ sport, series, ...opts })}`),
+
+  // --- sport-intelligence (Smart Signals) ---
+  signals: (opts: { mode?: string; category?: string; min_score?: number; include_venue?: boolean; limit?: number } = {}) =>
+    getJson<{ signals: Signal[]; count: number }>(
+      `/sport-intelligence/signals?${qs({ ...opts, include_venue: opts.include_venue ? "true" : undefined })}`,
+    ),
+  consensus: (opts: { category?: string; min_wallets?: number } = {}) =>
+    getJson<{ consensus: Consensus[]; count: number }>(`/sport-intelligence/consensus?${qs(opts)}`),
+  bestVenue: (polymarket: string, opts: { side?: string; min_top?: number; min_depth?: number } = {}) =>
+    getJson<BestVenue>(`/sport-intelligence/best-venue?${qs({ polymarket, ...opts })}`),
+  signalsActive: () => getJson<PersistedSignal[]>(`/sport-intelligence/signals/active`),
+  signalsHistory: () => getJson<PersistedSignal[]>(`/sport-intelligence/signals/history`),
+
+  // --- copy-trading (Top Traders) ---
+  leaderboard: (opts: { metric?: string; window?: string; category?: string; limit?: number } = {}) =>
+    getJson<LeaderboardRow[]>(`/copy-trading/leaderboard?${qs({ limit: opts.limit ?? 25, ...opts })}`),
+  trader: (wallet: string) => getJson<TraderDetail>(`/copy-trading/traders/${wallet}`),
+  copySize: (body: CopySizeReq) => postJson<CopySize>(`/copy-trading/copy/size`, body),
+
+  // --- whale-tracker ---
+  exposure: (wallet: string, limit = 25) => getJson<Exposure[]>(`/whale-tracker/exposure?${qs({ wallet, limit })}`),
+  walletTrades: (wallet: string, limit = 50) => getJson<WalletTrade[]>(`/whale-tracker/trades?${qs({ wallet, limit })}`),
+
+  // --- simulation-engine (projections) ---
+  simulate: (opts: { mean: number; sd: number; n?: number; seed?: number }) =>
+    getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 10000, ...opts })}`),
+
+  // --- monster-gpt ---
+  ask: (question: string, context?: unknown) =>
+    postJson<{ answer: string; model: string; retrieved: boolean }>(`/monster-gpt/ask`, { question, context }),
+  retrieve: (q: string) => getJson<unknown>(`/monster-gpt/retrieve?${qs({ q })}`),
+};
+
+// --- response shapes ---
+export interface NoVig {
+  odds_a: number; odds_b: number; overround: number; hold: number;
+  fair_probability_a: number; fair_probability_b: number; fair_odds_a: number; fair_odds_b: number;
+}
+export interface Kelly { full_kelly: number; stake_fraction: number; edge_per_unit: number; }
+export interface Ev { ev: number; roi: number; profit_if_win: number; loss_if_lose: number; }
+export interface Hedge { hedge_stake: number; total_outlay: number; guaranteed_return: number; guaranteed_profit: number; }
+export interface Parlay { combined_decimal: number; combined_odds: number | null; combined_probability: number; legs: number[]; }
+export interface ScanOpportunity {
+  market_id: string; outcome: string; game: string; side: string; price: number;
+  edge: number; est_fee: number; net_edge: number; net_roi: number; in_play: boolean;
+  top_size?: number | null; exec_depth_2c?: number | null; executable?: boolean;
+}
+export interface ScanResult { kalshi_markets: number; sportsbook_games: number; opportunities: ScanOpportunity[]; unmatched: unknown[]; }
+export interface Signal {
+  score: number; wallet: string; wallet_score: number; category: string; category_win_rate: number | null;
+  market_id: string; side: string; entry_price: number; current_price: number | null; slippage: number | null;
+  trade_size: number; position_value: number; relative_bet_size: number; tailable: boolean; ts: string;
+  components: Record<string, number>; venue?: VenueBlock;
+}
+export interface VenueBlock { best_venue: string; kalshi_ticker: string | null; polymarket_cost: number | null; kalshi_cost: number | null; entry_saving: number | null; }
+export interface Consensus {
+  score: number; market_id: string; side: string; category: string; num_wallets: number;
+  wallets: string[]; avg_wallet_score: number; avg_entry: number; current_price: number | null; tailable: boolean;
+}
+export interface BestVenue {
+  side: string; matched_kalshi: string | null; best_venue: string | null; entry_saving: number | null;
+  best_venue_executable?: boolean | null;
+  polymarket: VenueSide; kalshi: VenueSide;
+}
+export interface VenueSide {
+  available: boolean; entry_cost?: number | null; yes_bid?: number | null; yes_ask?: number | null;
+  spread?: number | null; ask_depth_2c?: number | null; top_size?: number | null; executable?: boolean; reason?: string;
+}
+export interface PersistedSignal {
+  id: number; wallet: string; market_id: string; side: string; category: string | null;
+  entry_price: number | null; current_price: number | null; score: number | null; status: string;
+  close_reason: string | null; first_seen: string; last_seen: string; closed_at: string | null;
+}
+export interface TraderDetail {
+  profile: { wallet: string; venue: string; label: string | null; category: string | null; first_seen: string };
+  performance: Array<{ as_of: string; win_rate: number | null; edge: number | null; pnl: number | null; risk: number | null; trades: number | null }>;
+  category_performance: Array<{ category: string; win_rate: number | null; roi: number | null; wins: number | null; resolved: number | null }>;
+}
+export interface CopySizeReq {
+  bankroll: number; budget?: number; max_position_fraction: number; slippage_tolerance: number;
+  reference_price: number; current_price: number; copy_ratio?: number; trader_size?: number; trader_bankroll?: number;
+}
+export interface CopySize { accepted: boolean; recommended_size: number; raw_size: number; slippage: number; caps_applied: string[]; reason: string | null; }
+export interface Exposure { market_id: string; outcome: string; net_shares: number; cost_basis: number; avg_entry: number | null; }
+export interface WalletTrade { ts: string; venue: string; wallet: string; market_id: string; side: string; price: number; size: number; }
+export interface Simulation { mean: number; median: number; p10: number; p90: number; seed: number; n: number; }
