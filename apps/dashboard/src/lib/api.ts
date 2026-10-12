@@ -91,7 +91,7 @@ export const api = {
   playerProjection: (sport: string, stat: string, playerId: string) =>
     getJson<ProjectionDetail>(`/projection-service/projections/${sport}/${stat}/${playerId}`),
   teamRatings: (sport = "nfl") => getJson<TeamRatings>(`/projection-service/teams/${sport}`),
-  matchup: (sport: string, home: string, away: string, opts: { spread?: number; total?: number; n?: number } = {}) =>
+  matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
 
   // --- monster-gpt ---
@@ -185,9 +185,11 @@ export interface TeamRating { team: string; off: number; def: number; net: numbe
 export interface TeamRatings { model_id: string; count: number; teams: TeamRating[]; }
 export interface Matchup {
   home: string; away: string; mu_home: number; mu_away: number; n: number;
-  proj_home_points: number; proj_away_points: number;
-  home_win_prob: number; away_win_prob: number; tie_prob: number;
-  proj_spread: number; median_margin: number; margin_p10: number; margin_p90: number;
+  // NFL uses *_points/proj_spread; NHL uses *_goals. Read whichever is present.
+  proj_home_points?: number; proj_away_points?: number; proj_spread?: number;
+  proj_home_goals?: number; proj_away_goals?: number;
+  home_win_prob: number; away_win_prob: number; tie_prob?: number;
+  median_margin: number; margin_p10: number; margin_p90: number;
   proj_total: number; median_total: number; total_p10: number; total_p90: number;
   cover_prob: number | null; over_prob: number | null;
   margin_hist: SimHistogram; total_hist: SimHistogram;

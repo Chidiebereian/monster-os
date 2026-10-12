@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
 mod nhl;
+mod nhl_teams;
 mod teams;
 
 const NFLVERSE_PLAYER_STATS: &str =
@@ -611,6 +612,9 @@ async fn main() -> std::io::Result<()> {
             .route("/stats/nhl", web::get().to(nhl::list_stats))
             .route("/projections/nhl/{stat}", web::get().to(nhl::list_stat))
             .route("/projections/nhl/{stat}/{player_id}", web::get().to(nhl::get_player_stat))
+            .route("/ingest/nhl/teams", web::post().to(nhl_teams::ingest_teams))
+            .route("/teams/nhl", web::get().to(nhl_teams::list_ratings))
+            .route("/matchup/nhl", web::get().to(nhl_teams::matchup))
     })
     .bind(("0.0.0.0", port))?
     .run()
