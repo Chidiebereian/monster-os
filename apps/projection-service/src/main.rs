@@ -28,6 +28,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
+mod teams;
+
 const NFLVERSE_PLAYER_STATS: &str =
     "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats.csv";
 
@@ -85,9 +87,9 @@ fn model_id(stat: &str) -> String {
     format!("nfl-{stat}-v1")
 }
 
-struct State {
-    db: Arc<tokio_postgres::Client>,
-    http: reqwest::Client,
+pub struct State {
+    pub db: Arc<tokio_postgres::Client>,
+    pub http: reqwest::Client,
     nflverse_url: String,
 }
 
@@ -549,6 +551,10 @@ async fn main() -> std::io::Result<()> {
             .route("/stats/nfl", web::get().to(list_stats))
             .route("/projections/nfl/{stat}", web::get().to(list_stat))
             .route("/projections/nfl/{stat}/{player_id}", web::get().to(get_player_stat))
+            .route("/ingest/nfl/teams", web::post().to(teams::ingest_teams))
+            .route("/teams/nfl", web::get().to(teams::list_ratings))
+            .route("/games/nfl", web::get().to(teams::list_games))
+            .route("/matchup/nfl", web::get().to(teams::matchup))
     })
     .bind(("0.0.0.0", port))?
     .run()

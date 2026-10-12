@@ -78,7 +78,11 @@ export function Projections() {
       </div>
 
       {tab === "game" ? (
-        <Msg>Game projections arrive with the team models (Elo / Bradley-Terry, Phase 2). Player projections are live now.</Msg>
+        sportKey === "nfl" ? (
+          <GameProjections />
+        ) : (
+          <Msg>{sport.label} team model is in the pipeline. NFL game projections are live now.</Msg>
+        )
       ) : sport.stats.length === 0 || !stat ? (
         <Msg>{sport.label} player models are in the pipeline. NFL passing TDs is live now — pick NFL above.</Msg>
       ) : (
@@ -284,6 +288,107 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
 
 function roundHalf(x: number) {
   return Math.round(x * 2) / 2;
+}
+
+// Game projections from the team model (log-linear Poisson, 100k simulation):
+// win probabilities, projected score, spread and total with distributions.
+function GameProjections() {
+  const ratings = useQuery({ queryKey: ["team-ratings"], queryFn: () => api.teamRatings("nfl") });
+  const teams = (ratings.data?.teams ?? []).map((t) => t.team).sort();
+  const [home, setHome] = useState<string>("");
+  const [away, setAway] = useState<string>("");
+  const [spread, setSpread] = useState("-2.5");
+  const [total, setTotal] = useState("47.5");
+
+  useEffect(() => {
+    if (teams.length && !home) {
+      setHome(teams.includes("BUF") ? "BUF" : teams[0]);
+      setAway(teams.includes("KC") ? "KC" : teams[1] ?? teams[0]);
+    }
+  }, [teams, home]);
+
+  const m = useQuery({
+    queryKey: ["matchup", home, away, spread, total],
+    queryFn: () => api.matchup("nfl", home, away, { spread: Number(spread) || undefined, total: Number(total) || undefined, n: 100000 }),
+    enabled: Boolean(home && away && home !== away),
+    placeholderData: keepPreviousData,
+  });
+  const d = m.data;
+
+  const teamSelect = (value: string, onChange: (v: string) => void, label: string) => (
+    <label className="text-xs text-gray-500">
+      {label}
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full mt-1 bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50">
+        {teams.map((t) => <option key={t} value={t}>{t}</option>)}
+      </select>
+    </label>
+  );
+
+  return (
+    <div className="space-y-4">
+      <Card className="space-y-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 items-end">
+          {teamSelect(away, setAway, "Away")}
+          {teamSelect(home, setHome, "Home")}
+          <label className="text-xs text-gray-500">Home spread<Input type="number" value={spread} onChange={setSpread} className="w-full mt-1" /></label>
+          <label className="text-xs text-gray-500">Total<Input type="number" value={total} onChange={setTotal} className="w-full mt-1" /></label>
+        </div>
+
+        {ratings.isLoading && <Msg>Loading team ratings…</Msg>}
+        {home === away && <Msg tone="error">Pick two different teams.</Msg>}
+        {m.error && <Msg tone="error">{(m.error as Error).message}</Msg>}
+
+        {d && (
+          <>
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="text-lg font-semibold">
+                {d.away} <span className="font-mono text-gray-300">{d.proj_away_points.toFixed(1)}</span>
+                <span className="text-gray-600 mx-2">@</span>
+                {d.home} <span className="font-mono text-gray-300">{d.proj_home_points.toFixed(1)}</span>
+              </div>
+              <div className="ml-auto text-xs text-gray-500">100k sim · log-linear Poisson</div>
+            </div>
+
+            {/* win probability bar */}
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-emerald-light">{d.away} {formatPct(d.away_win_prob)}</span>
+                <span className="text-gray-500">tie {formatPct(d.tie_prob)}</span>
+                <span className="text-violet-light">{d.home} {formatPct(d.home_win_prob)}</span>
+              </div>
+              <div className="h-3 rounded overflow-hidden flex bg-surface border border-glass">
+                <div className="bg-emerald/60" style={{ width: `${d.away_win_prob * 100}%` }} />
+                <div className="bg-gray-600" style={{ width: `${d.tie_prob * 100}%` }} />
+                <div className="bg-violet/60" style={{ width: `${d.home_win_prob * 100}%` }} />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-2 border-t border-glass">
+              <Stat label={`${d.home} win`} value={formatPct(d.home_win_prob)} tone="pos" />
+              <Stat label="Proj spread (home)" value={d.proj_spread.toFixed(1)} />
+              <Stat label="Proj total" value={d.proj_total.toFixed(1)} />
+              <Stat label="Cover / Over" value={`${d.cover_prob != null ? formatPct(d.cover_prob) : "—"} / ${d.over_prob != null ? formatPct(d.over_prob) : "—"}`} />
+            </div>
+          </>
+        )}
+      </Card>
+
+      {d && (
+        <div className="grid md:grid-cols-2 gap-4">
+          <Card>
+            <h3 className="font-medium text-sm mb-1">Margin ({d.home} − {d.away})</h3>
+            <div className="text-[11px] text-gray-500 mb-1">median {d.median_margin} · [{d.margin_p10}, {d.margin_p90}] · line at home spread</div>
+            <HistCurve hist={d.margin_hist} line={-(Number(spread) || 0)} loading={false} />
+          </Card>
+          <Card>
+            <h3 className="font-medium text-sm mb-1">Total points</h3>
+            <div className="text-[11px] text-gray-500 mb-1">median {d.median_total} · [{d.total_p10}, {d.total_p90}] · line at total</div>
+            <HistCurve hist={d.total_hist} line={Number(total) || 0} loading={false} />
+          </Card>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Draws the real simulated predictive distribution (histogram density from the
