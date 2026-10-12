@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
 mod nba;
+mod nba_teams;
 mod nhl;
 mod nhl_teams;
 mod teams;
@@ -623,6 +624,10 @@ async fn main() -> std::io::Result<()> {
             .route("/stats/nba", web::get().to(nba::list_stats))
             .route("/projections/nba/{stat}", web::get().to(nba::list_stat))
             .route("/projections/nba/{stat}/{player_id}", web::get().to(nba::get_player_stat))
+            .route("/fit/nba/teams", web::post().to(nba_teams::fit_teams))
+            .route("/teams/nba", web::get().to(nba_teams::list_ratings))
+            .route("/games/nba", web::get().to(nba_teams::list_games))
+            .route("/matchup/nba", web::get().to(nba_teams::matchup))
     })
     .bind(("0.0.0.0", port))?
     .run()

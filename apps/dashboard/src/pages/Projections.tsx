@@ -110,10 +110,10 @@ export function Projections() {
       </div>
 
       {tab === "game" ? (
-        sportKey === "nfl" || sportKey === "nhl" ? (
+        sportKey === "nfl" || sportKey === "nhl" || sportKey === "nba" ? (
           <GameProjections sport={sportKey} />
         ) : (
-          <Msg>{sport.label} team model is in the pipeline. NFL and NHL game projections are live now.</Msg>
+          <Msg>{sport.label} team model is in the pipeline. NFL, NHL and NBA game projections are live now.</Msg>
         )
       ) : sport.stats.length === 0 || !stat ? (
         <Msg>{sport.label} player models are in the pipeline. NFL passing TDs is live now — pick NFL above.</Msg>
@@ -129,7 +129,7 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [gameId, setGameId] = useState("");
 
-  const hasSchedule = sport === "nfl" || sport === "nhl";
+  const hasSchedule = sport === "nfl" || sport === "nhl" || sport === "nba";
   const games = useQuery({
     queryKey: ["games", sport, "scheduled"],
     queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }),
@@ -358,24 +358,30 @@ function roundHalf(x: number) {
 
 // Game projections from the team model (log-linear Poisson, 100k simulation):
 // win probabilities, projected score, spread/puckline and total with distributions.
+const GAME_DEFAULTS: Record<string, { spread: string; total: string; home: string; away: string; unit: string }> = {
+  nfl: { spread: "-2.5", total: "47.5", home: "BUF", away: "KC", unit: "points" },
+  nhl: { spread: "-1.5", total: "6.5", home: "EDM", away: "COL", unit: "goals" },
+  nba: { spread: "-5.5", total: "225.5", home: "BOS", away: "LAL", unit: "points" },
+};
+
 function GameProjections({ sport }: { sport: string }) {
   const nhl = sport === "nhl";
-  const scoreUnit = nhl ? "goals" : "points";
+  const def = GAME_DEFAULTS[sport] ?? GAME_DEFAULTS.nfl;
+  const scoreUnit = def.unit;
   const lineLabel = nhl ? "Home puckline" : "Home spread";
   const ratings = useQuery({ queryKey: ["team-ratings", sport], queryFn: () => api.teamRatings(sport) });
   const teams = (ratings.data?.teams ?? []).map((t) => t.team).sort();
   const [home, setHome] = useState<string>("");
   const [away, setAway] = useState<string>("");
-  const [spread, setSpread] = useState(nhl ? "-1.5" : "-2.5");
-  const [total, setTotal] = useState(nhl ? "6.5" : "47.5");
+  const [spread, setSpread] = useState(def.spread);
+  const [total, setTotal] = useState(def.total);
 
   useEffect(() => {
     if (teams.length && !home) {
-      const [h, a] = nhl ? ["EDM", "COL"] : ["BUF", "KC"];
-      setHome(teams.includes(h) ? h : teams[0]);
-      setAway(teams.includes(a) ? a : teams[1] ?? teams[0]);
+      setHome(teams.includes(def.home) ? def.home : teams[0]);
+      setAway(teams.includes(def.away) ? def.away : teams[1] ?? teams[0]);
     }
-  }, [teams, home, nhl]);
+  }, [teams, home, def]);
 
   const m = useQuery({
     queryKey: ["matchup", sport, home, away, spread, total],

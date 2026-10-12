@@ -14,3 +14,12 @@ Flow:
    `player_projections` + `posterior_features`; simulation-engine then draws 100k.
 
 Re-run step 1-3 to refresh (current season included).
+
+## Team model + schedule
+4. `python scripts/nba/nba_games_ingest.py <out_dir> <from_year> <to_year>`
+   Team scores (leaguegamelog PlayerOrTeam=T) + upcoming schedule (cdn.nba.com)
+   -> `nba_games.csv`.
+5. `bash scripts/nba/nba_games_load.sh <out_dir>`  -> loads into `sports_games` (sport='nba').
+6. `curl -X POST localhost:8121/fit/nba/teams`  -> fits the log-linear Poisson
+   team model -> `team_components` + `team_model_params`.
+   Then `/teams/nba`, `/games/nba`, `/matchup/nba?home=&away=&spread=&total=`.
