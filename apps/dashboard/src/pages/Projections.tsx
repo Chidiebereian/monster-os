@@ -33,9 +33,21 @@ const PROJ_SPORTS: SportDef[] = [
       nflStat("rec_td", "Receiving TDs", "TDs"),
     ],
   },
+  {
+    sport: "nhl",
+    label: "NHL",
+    stats: [
+      { key: "shots", label: "Shots on Goal", unit: "SOG", model: "nhl-shots-v1" },
+      { key: "points", label: "Points", unit: "P", model: "nhl-points-v1" },
+      { key: "goals", label: "Goals", unit: "G", model: "nhl-goals-v1" },
+      { key: "assists", label: "Assists", unit: "A", model: "nhl-assists-v1" },
+      { key: "hits", label: "Hits", unit: "hits", model: "nhl-hits-v1" },
+      { key: "pim", label: "Penalty Minutes", unit: "PIM", model: "nhl-pim-v1" },
+      { key: "toi", label: "Time on Ice", unit: "min", model: "nhl-toi-v1" },
+    ],
+  },
   { sport: "nba", label: "NBA", stats: [] },
   { sport: "mlb", label: "MLB", stats: [] },
-  { sport: "nhl", label: "NHL", stats: [] },
 ];
 
 export function Projections() {

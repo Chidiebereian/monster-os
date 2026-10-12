@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
+mod nhl;
 mod teams;
 
 const NFLVERSE_PLAYER_STATS: &str =
@@ -41,18 +42,18 @@ const NFL_CURRENT_SEASON_URLS: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, PartialEq)]
-enum Family {
+pub(crate) enum Family {
     Count,
     Continuous,
 }
 impl Family {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Family::Count => "count",
             Family::Continuous => "continuous",
         }
     }
-    fn model_type(&self) -> &'static str {
+    pub(crate) fn model_type(&self) -> &'static str {
         match self {
             Family::Count => "negative_binomial",
             Family::Continuous => "bayesian",
@@ -63,13 +64,13 @@ impl Family {
 /// One projectable stat. `column` is the nflverse value; `opportunity` is the
 /// column whose value must be >= 1 for a game to count (so a QB's rushing isn't
 /// modeled from games he never ran, etc.).
-struct StatDef {
-    key: &'static str,
-    label: &'static str,
-    column: &'static str,
-    opportunity: &'static str,
-    family: Family,
-    unit: &'static str,
+pub(crate) struct StatDef {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) column: &'static str,
+    pub(crate) opportunity: &'static str,
+    pub(crate) family: Family,
+    pub(crate) unit: &'static str,
 }
 
 const NFL_STATS: &[StatDef] = &[
@@ -113,13 +114,13 @@ fn round3(x: f64) -> f64 { (x * 1000.0).round() / 1000.0 }
 // Models
 // --------------------------------------------------------------------------
 
-struct Projection {
-    proj_mean: f64,
-    proj_sd: f64,
-    dispersion: f64,
-    career_mean: f64,
-    recent_mean: f64,
-    sample_games: i32,
+pub(crate) struct Projection {
+    pub(crate) proj_mean: f64,
+    pub(crate) proj_sd: f64,
+    pub(crate) dispersion: f64,
+    pub(crate) career_mean: f64,
+    pub(crate) recent_mean: f64,
+    pub(crate) sample_games: i32,
 }
 
 /// Recency weight for a game `age` games back from the most recent, given the
@@ -130,7 +131,7 @@ fn recency_weight(age: f64, halflife: f64) -> f64 {
 
 /// COUNT: empirical-Bayes Gamma-Poisson. Posterior predictive is Negative-Binomial
 /// (mean = posterior rate, var = rate*(1 + 1/beta)).
-fn fit_count(values_oldest_first: &[f64], league_rate: f64, prior_k: f64, halflife: f64) -> Projection {
+pub(crate) fn fit_count(values_oldest_first: &[f64], league_rate: f64, prior_k: f64, halflife: f64) -> Projection {
     let n = values_oldest_first.len();
     let newest = (n - 1) as f64;
     let (mut sw, mut swy) = (0.0f64, 0.0f64);
@@ -156,7 +157,7 @@ fn fit_count(values_oldest_first: &[f64], league_rate: f64, prior_k: f64, halfli
 /// CONTINUOUS: recency-weighted Gamma. Mean EB-shrunk toward the league mean,
 /// game-to-game spread from the weighted variance, predictive sd inflated by the
 /// parameter uncertainty 1/(prior_k + effective n). dispersion = Gamma shape.
-fn fit_continuous(values_oldest_first: &[f64], league_mean: f64, prior_k: f64, halflife: f64) -> Projection {
+pub(crate) fn fit_continuous(values_oldest_first: &[f64], league_mean: f64, prior_k: f64, halflife: f64) -> Projection {
     let n = values_oldest_first.len();
     let newest = (n - 1) as f64;
     let (mut sw, mut swy) = (0.0f64, 0.0f64);
@@ -189,7 +190,7 @@ fn fit_continuous(values_oldest_first: &[f64], league_mean: f64, prior_k: f64, h
     }
 }
 
-fn recent_mean(values: &[f64]) -> f64 {
+pub(crate) fn recent_mean(values: &[f64]) -> f64 {
     let n = values.len();
     let k = n.min(17);
     values[n - k..].iter().sum::<f64>() / k as f64
@@ -586,7 +587,8 @@ async fn main() -> std::io::Result<()> {
     });
     let state = web::Data::new(State {
         db: Arc::new(client),
-        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()
+        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120))
+            .user_agent("Mozilla/5.0 (MonsterOS projection-service)").build()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
         nflverse_url: std::env::var("NFLVERSE_PLAYER_STATS_URL").ok().filter(|v| !v.is_empty())
             .unwrap_or_else(|| NFLVERSE_PLAYER_STATS.to_string()),
@@ -604,6 +606,10 @@ async fn main() -> std::io::Result<()> {
             .route("/teams/nfl", web::get().to(teams::list_ratings))
             .route("/games/nfl", web::get().to(teams::list_games))
             .route("/matchup/nfl", web::get().to(teams::matchup))
+            .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
+            .route("/stats/nhl", web::get().to(nhl::list_stats))
+            .route("/projections/nhl/{stat}", web::get().to(nhl::list_stat))
+            .route("/projections/nhl/{stat}/{player_id}", web::get().to(nhl::get_player_stat))
     })
     .bind(("0.0.0.0", port))?
     .run()
