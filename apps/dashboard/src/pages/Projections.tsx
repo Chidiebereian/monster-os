@@ -49,7 +49,24 @@ const PROJ_SPORTS: SportDef[] = [
       { key: "goals_against", label: "Goals Against (G)", unit: "GA", model: "nhl-goals_against-v1" },
     ],
   },
-  { sport: "nba", label: "NBA", stats: [] },
+  {
+    sport: "nba",
+    label: "NBA",
+    stats: [
+      { key: "points", label: "Points", unit: "PTS", model: "nba-points-v1" },
+      { key: "rebounds", label: "Rebounds", unit: "REB", model: "nba-rebounds-v1" },
+      { key: "assists", label: "Assists", unit: "AST", model: "nba-assists-v1" },
+      { key: "pra", label: "Pts+Reb+Ast", unit: "PRA", model: "nba-pra-v1" },
+      { key: "threes", label: "3-Pointers", unit: "3PM", model: "nba-threes-v1" },
+      { key: "steals", label: "Steals", unit: "STL", model: "nba-steals-v1" },
+      { key: "blocks", label: "Blocks", unit: "BLK", model: "nba-blocks-v1" },
+      { key: "turnovers", label: "Turnovers", unit: "TOV", model: "nba-turnovers-v1" },
+      { key: "minutes", label: "Minutes", unit: "MIN", model: "nba-minutes-v1" },
+      { key: "pr", label: "Pts+Reb", unit: "P+R", model: "nba-pr-v1" },
+      { key: "pa", label: "Pts+Ast", unit: "P+A", model: "nba-pa-v1" },
+      { key: "ra", label: "Reb+Ast", unit: "R+A", model: "nba-ra-v1" },
+    ],
+  },
   { sport: "mlb", label: "MLB", stats: [] },
 ];
 

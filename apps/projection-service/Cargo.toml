@@ -14,3 +14,4 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 csv = "1"
 futures = "0.3"
+flate2 = "1"
