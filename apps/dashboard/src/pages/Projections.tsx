@@ -108,19 +108,15 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
     .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
   const game = upcoming.find((g) => g.game_id === gameId);
   const teams = game ? `${game.away},${game.home}` : undefined;
-  // when a game is picked, restrict to current-roster players (last season near now)
-  const currentSeason = Math.max(0, ...upcoming.map((g) => g.season ?? 0));
-  const minLastSeason = game && currentSeason ? currentSeason - 1 : undefined;
 
   const list = useQuery({
-    queryKey: ["projections", sport, stat.key, search, teams, minLastSeason],
+    queryKey: ["projections", sport, stat.key, search, teams],
     queryFn: () =>
       api.playerProjections(sport, stat.key, {
         limit: 150,
         min_games: 16,
         q: search || undefined,
-        teams,
-        min_last_season: minLastSeason,
+        teams, // when set, backend restricts to the current roster automatically
       }),
   });
 

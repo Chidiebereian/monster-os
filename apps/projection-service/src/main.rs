@@ -464,6 +464,20 @@ async fn list_stat(state: web::Data<State>, path: web::Path<String>, query: web:
         let v: Vec<String> = s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
         if v.is_empty() { None } else { Some(v) }
     });
+    // When filtering to a game's teams, default to the current roster relative to
+    // the freshest player data we hold (max last_season - 1), since the player
+    // feed can lag the schedule feed.
+    let min_last_season: Option<i32> = match (query.min_last_season, &teams) {
+        (Some(s), _) => Some(s),
+        (None, Some(_)) => state
+            .db
+            .query_opt("SELECT max(last_season)::int - 1 AS cutoff FROM sports_players WHERE sport='nfl'", &[])
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.get::<_, Option<i32>>("cutoff")),
+        (None, None) => None,
+    };
     let sql = "SELECT p.player_id, pl.display_name, pl.team, pl.position, pl.last_season, \
                       p.proj_mean, p.proj_sd, p.dispersion, p.sample_games, p.career_mean, p.recent_mean, \
                       p.market_line, p.market_implied, p.model_id, p.family, p.unit \
@@ -472,7 +486,7 @@ async fn list_stat(state: web::Data<State>, path: web::Path<String>, query: web:
                  AND ($5::text[] IS NULL OR pl.team = ANY($5)) \
                  AND ($6::int IS NULL OR pl.last_season >= $6) \
                ORDER BY p.proj_mean DESC LIMIT $4";
-    match state.db.query(sql, &[&def.key, &min_games, &search, &limit, &teams, &query.min_last_season]).await {
+    match state.db.query(sql, &[&def.key, &min_games, &search, &limit, &teams, &min_last_season]).await {
         Ok(rows) => {
             let out: Vec<Value> = rows.iter().map(proj_row_json).collect();
             HttpResponse::Ok().json(json!({ "sport": "nfl", "stat": def.key, "label": def.label, "unit": def.unit, "family": def.family.as_str(), "model_id": model_id(def.key), "count": out.len(), "projections": out }))
