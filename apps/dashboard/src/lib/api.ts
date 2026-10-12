@@ -80,7 +80,7 @@ export const api = {
   // --- simulation-engine (projections) ---
   simulate: (opts: { mean: number; sd: number; n?: number; seed?: number }) =>
     getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 10000, ...opts })}`),
-  simulateModel: (opts: { model_id: string; parameter: string; n?: number; seed?: number }) =>
+  simulateModel: (opts: { model_id: string; parameter: string; n?: number; seed?: number; family?: string; dispersion?: number; line?: number; hist?: number }) =>
     getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 100000, ...opts })}`),
 
   // --- projection-service (player/team models) ---
@@ -147,8 +147,12 @@ export interface CopySizeReq {
 export interface CopySize { accepted: boolean; recommended_size: number; raw_size: number; slippage: number; caps_applied: string[]; reason: string | null; }
 export interface Exposure { market_id: string; outcome: string; net_shares: number; cost_basis: number; avg_entry: number | null; }
 export interface WalletTrade { ts: string; venue: string; wallet: string; market_id: string; side: string; price: number; size: number; }
+export interface SimHistogram { lo: number; hi: number; bin_width: number; density: number[]; }
 export interface Simulation {
   mean: number; median: number; p10: number; p90: number; seed: number; n: number;
+  family?: string;
+  p_over?: number; p_under?: number; p_push?: number;
+  hist?: SimHistogram;
   posterior?: { parameter: string; mean: number; sd: number; q05?: number | null; q95?: number | null; rhat?: number | null };
 }
 export interface PlayerProjection {
@@ -156,6 +160,7 @@ export interface PlayerProjection {
   proj_mean: number; proj_sd: number; dispersion: number | null; sample_games: number | null;
   career_mean: number | null; recent_mean: number | null;
   market_line: number | null; market_implied: number | null; model_id: string | null;
+  family: string | null; unit: string | null;
 }
 export interface ProjectionList { sport: string; stat: string; model_id: string; count: number; projections: PlayerProjection[]; }
 export interface ProjectionDetail {

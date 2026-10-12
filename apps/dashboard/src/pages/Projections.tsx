@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
-import { api, type PlayerProjection } from "../lib/api";
-import { normalPdf, probOver } from "../lib/stats";
+import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
 import { americanToImpliedProb, formatPct } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
@@ -153,25 +152,44 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
 
 function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; player: PlayerProjection }) {
   const mean = player.proj_mean;
-  const sd = Math.max(player.proj_sd, 0.05);
   const [line, setLine] = useState(roundHalf(mean));
   const [marketOdds, setMarketOdds] = useState("-110");
 
   // reset the line when the player changes
   useEffect(() => setLine(roundHalf(mean)), [player.player_id, mean]);
 
-  const sim = useQuery({
-    queryKey: ["sim-model", stat.model, player.player_id],
-    queryFn: () => api.simulateModel({ model_id: stat.model, parameter: `${stat.key}:${player.player_id}`, n: 100000 }),
+  const base = {
+    model_id: stat.model,
+    parameter: `${stat.key}:${player.player_id}`,
+    family: player.family ?? undefined,
+    dispersion: player.dispersion ?? undefined,
+    n: 100000,
+  };
+
+  // Stable histogram of the real simulated distribution (one draw per player).
+  const hist = useQuery({
+    queryKey: ["sim-hist", stat.model, player.player_id],
+    queryFn: () => api.simulateModel({ ...base, hist: 64 }),
+  });
+  // Exact Over/Under/Push at the (rounded) line, from the backend draws.
+  const qline = roundHalf(line);
+  const prob = useQuery({
+    queryKey: ["sim-prob", stat.model, player.player_id, qline],
+    queryFn: () => api.simulateModel({ ...base, line: qline }),
+    placeholderData: keepPreviousData,
   });
   const detail = useQuery({
     queryKey: ["proj-detail", sport, stat.key, player.player_id],
     queryFn: () => api.playerProjection(sport, stat.key, player.player_id),
   });
 
-  const pOver = probOver(line, mean, sd);
+  const pOver = prob.data?.p_over ?? 0;
+  const pUnder = prob.data?.p_under ?? 0;
+  const pPush = prob.data?.p_push ?? 0;
   const marketImplied = americanToImpliedProb(Number(marketOdds) || 0);
   const edge = pOver - marketImplied;
+  const s = hist.data;
+  const sd = Math.max(player.proj_sd, 0.05);
 
   return (
     <div className="space-y-4">
@@ -182,6 +200,7 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
           <span className="ml-auto text-xs text-gray-500">
             career <span className="font-mono text-gray-300">{player.career_mean?.toFixed(2)}</span> ·
             recent <span className="font-mono text-gray-300"> {player.recent_mean?.toFixed(2)}</span>
+            <span className="ml-2 px-1.5 py-0.5 rounded bg-white/5 text-[10px]">{s?.family ?? player.family}</span>
           </span>
         </div>
 
@@ -192,12 +211,12 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
           <Stat label="Edge (Over)" value={`${edge >= 0 ? "+" : ""}${formatPct(edge)}`} tone={edge >= 0 ? "pos" : "neg"} />
         </div>
 
-        <Curve mean={mean} sd={sd} line={line} />
+        <HistCurve hist={s?.hist} line={line} loading={hist.isLoading} />
 
         <div>
           <div className="flex justify-between text-xs text-gray-500 mb-1">
             <span>Line: <span className="text-gray-200 font-mono">{line.toFixed(1)}</span> {stat.unit}</span>
-            <span>drag to recompute</span>
+            <span>drag to recompute · exact from 100k draws</span>
           </div>
           <input
             type="range"
@@ -211,24 +230,24 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-3 border-t border-glass">
-          <Stat label={`P(Over ${line.toFixed(1)})`} value={formatPct(pOver)} tone="pos" />
-          <Stat label="P(Under)" value={formatPct(1 - pOver)} tone="neg" />
+          <Stat label={`P(Over ${qline.toFixed(1)})`} value={formatPct(pOver)} tone="pos" />
+          <Stat label="P(Under)" value={formatPct(pUnder)} tone="neg" />
+          <Stat label="P(Push)" value={pPush > 0.0005 ? formatPct(pPush) : "—"} />
           <Stat label="Market implied" value={formatPct(marketImplied)} />
-          <Stat label="Proj SD" value={sd.toFixed(2)} />
         </div>
       </Card>
 
       <div className="grid md:grid-cols-2 gap-4">
         <Card>
-          <h3 className="font-medium text-sm mb-2">Monte Carlo (n=100k, model posterior)</h3>
-          {sim.isLoading && <Msg>Simulating…</Msg>}
-          {sim.error && <Msg tone="error">{(sim.error as Error).message}</Msg>}
-          {sim.data && (
+          <h3 className="font-medium text-sm mb-2">Monte Carlo (n=100k, {s?.family ?? "model"} posterior)</h3>
+          {hist.isLoading && <Msg>Simulating…</Msg>}
+          {hist.error && <Msg tone="error">{(hist.error as Error).message}</Msg>}
+          {s && (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <Stat label="Mean" value={sim.data.mean.toFixed(2)} />
-              <Stat label="Median" value={sim.data.median.toFixed(2)} />
-              <Stat label="p10" value={sim.data.p10.toFixed(2)} />
-              <Stat label="p90" value={sim.data.p90.toFixed(2)} />
+              <Stat label="Mean" value={s.mean.toFixed(2)} />
+              <Stat label="Median" value={s.median.toFixed(2)} />
+              <Stat label="p10" value={s.p10.toFixed(2)} />
+              <Stat label="p90" value={s.p90.toFixed(2)} />
             </div>
           )}
         </Card>
@@ -267,36 +286,40 @@ function roundHalf(x: number) {
   return Math.round(x * 2) / 2;
 }
 
-function Curve({ mean, sd, line }: { mean: number; sd: number; line: number }) {
+// Draws the real simulated predictive distribution (histogram density from the
+// backend's 100k draws). Bins right of the line are shaded as the Over region.
+function HistCurve({ hist, line, loading }: { hist?: SimHistogram; line: number; loading: boolean }) {
   const W = 640;
   const H = 180;
-  const lo = Math.max(0, mean - 3.5 * sd);
-  const hi = mean + 3.5 * sd;
-  const peak = normalPdf(mean, mean, sd);
-  const x = (v: number) => ((v - lo) / (hi - lo)) * W;
-  const y = (p: number) => H - (p / peak) * (H - 16) - 4;
-
-  const pts: string[] = [];
-  const over: string[] = [];
-  for (let i = 0; i <= 200; i++) {
-    const v = lo + ((hi - lo) * i) / 200;
-    const px = x(v);
-    const py = y(normalPdf(v, mean, sd));
-    pts.push(`${px},${py}`);
-    if (v >= line) over.push(`${px},${py}`);
+  if (!hist) {
+    return <div className="h-44 flex items-center justify-center text-xs text-gray-600">{loading ? "Simulating…" : "No distribution"}</div>;
   }
-  const lineX = x(line);
+  const bins = hist.density.length;
+  const maxD = Math.max(...hist.density, 1e-9);
+  const barW = W / bins;
+  const span = hist.hi - hist.lo || 1;
+  const xAt = (v: number) => ((v - hist.lo) / span) * W;
+  const lineX = Math.max(0, Math.min(W, xAt(line)));
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-44">
-      {over.length > 1 && (
-        <polygon points={`${lineX},${H} ${over.join(" ")} ${x(hi)},${H}`} fill="rgba(16,185,129,0.18)" />
-      )}
-      <polyline points={pts.join(" ")} fill="none" stroke="#8B5CF6" strokeWidth={2} />
-      <line x1={lineX} y1={6} x2={lineX} y2={H} stroke="#F59E0B" strokeWidth={1.5} strokeDasharray="4 3" />
-      <line x1={x(mean)} y1={14} x2={x(mean)} y2={H} stroke="rgba(255,255,255,0.25)" strokeWidth={1} />
-      <text x={x(mean)} y={11} fill="rgba(255,255,255,0.4)" fontSize="9" textAnchor="middle">proj</text>
-      <text x={lineX} y={11} fill="#F59E0B" fontSize="9" textAnchor="middle">line</text>
+      {hist.density.map((d, i) => {
+        const h = (d / maxD) * (H - 18);
+        const center = hist.lo + (i + 0.5) * hist.bin_width;
+        const isOver = center >= line;
+        return (
+          <rect
+            key={i}
+            x={i * barW + 0.5}
+            y={H - h}
+            width={Math.max(0.5, barW - 1)}
+            height={h}
+            fill={isOver ? "rgba(16,185,129,0.55)" : "rgba(139,92,246,0.5)"}
+          />
+        );
+      })}
+      <line x1={lineX} y1={2} x2={lineX} y2={H} stroke="#F59E0B" strokeWidth={1.5} strokeDasharray="4 3" />
+      <text x={Math.min(lineX, W - 14)} y={10} fill="#F59E0B" fontSize="9" textAnchor="middle">line</text>
     </svg>
   );
 }

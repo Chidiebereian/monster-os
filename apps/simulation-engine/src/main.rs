@@ -18,7 +18,7 @@ use std::time::Duration;
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use common::{healthz, PosteriorSummary, SimulationOutput};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 const MAX_DRAWS: usize = 1_000_000;
 /// Vehtari et al. (2021) recommend R-hat < 1.01 before trusting a posterior.
@@ -31,9 +31,44 @@ struct SimQuery {
     model_id: Option<String>,
     parameter: Option<String>,
     event_id: Option<String>,
+    /// Distribution to draw from: normal (default), gamma/continuous,
+    /// negbin/negative_binomial/count, or poisson. Lets a count stat draw
+    /// non-negative integers and a yardage stat draw a true Gamma instead of a
+    /// Normal approximation.
+    family: Option<String>,
+    /// Negative-Binomial size (Gamma shape) when family is a count; ignored otherwise.
+    dispersion: Option<f64>,
+    /// If set, return exact Over/Under/Push probabilities at this line from the draws.
+    line: Option<f64>,
+    /// If set (>0), return a density histogram with this many bins.
+    hist: Option<usize>,
     #[serde(default = "default_n")]
     n: usize,
     seed: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Fam {
+    Normal,
+    Gamma,
+    NegBin,
+    Poisson,
+}
+fn parse_family(s: Option<&str>) -> Fam {
+    match s.map(|x| x.to_ascii_lowercase()).as_deref() {
+        Some("gamma") | Some("continuous") => Fam::Gamma,
+        Some("negbin") | Some("negative_binomial") | Some("count") => Fam::NegBin,
+        Some("poisson") => Fam::Poisson,
+        _ => Fam::Normal,
+    }
+}
+fn fam_name(f: Fam) -> &'static str {
+    match f {
+        Fam::Normal => "normal",
+        Fam::Gamma => "gamma",
+        Fam::NegBin => "negative_binomial",
+        Fam::Poisson => "poisson",
+    }
 }
 
 #[derive(Serialize)]
@@ -42,6 +77,15 @@ struct SimResponse {
     summary: SimulationOutput,
     seed: u64,
     n: usize,
+    family: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p_over: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p_under: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p_push: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hist: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     posterior: Option<PosteriorSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,6 +123,77 @@ impl Rng {
         let (u1, u2) = (self.uniform(), self.uniform());
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
+
+    /// Gamma(shape, scale) via Marsaglia-Tsang (with boosting for shape < 1).
+    fn gamma(&mut self, shape: f64, scale: f64) -> f64 {
+        if shape < 1.0 {
+            let g = self.gamma(shape + 1.0, 1.0);
+            return scale * g * self.uniform().powf(1.0 / shape);
+        }
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.normal();
+            let v = (1.0 + c * x).powi(3);
+            if v <= 0.0 {
+                continue;
+            }
+            let u = self.uniform();
+            if u.ln() < 0.5 * x * x + d - d * v + d * v.ln() {
+                return scale * d * v;
+            }
+        }
+    }
+
+    /// Poisson(lambda): Knuth for small lambda, a rounded normal approximation
+    /// for large lambda (where Knuth underflows).
+    fn poisson(&mut self, lambda: f64) -> f64 {
+        if lambda <= 0.0 {
+            return 0.0;
+        }
+        if lambda > 30.0 {
+            return (lambda + lambda.sqrt() * self.normal()).round().max(0.0);
+        }
+        let l = (-lambda).exp();
+        let (mut k, mut p) = (0.0f64, 1.0f64);
+        loop {
+            k += 1.0;
+            p *= self.uniform();
+            if p <= l {
+                return k - 1.0;
+            }
+        }
+    }
+}
+
+/// Draw one sample from the chosen family. mean/sd define the predictive;
+/// dispersion is the Negative-Binomial size (Gamma shape) for counts.
+fn sample(rng: &mut Rng, fam: Fam, mean: f64, sd: f64, dispersion: Option<f64>) -> f64 {
+    match fam {
+        Fam::Normal => mean + sd * rng.normal(),
+        Fam::Poisson => rng.poisson(mean),
+        Fam::Gamma => {
+            if mean <= 0.0 || sd <= 0.0 {
+                return mean.max(0.0);
+            }
+            let shape = (mean / sd).powi(2);
+            let scale = sd * sd / mean;
+            rng.gamma(shape, scale)
+        }
+        Fam::NegBin => {
+            if mean <= 0.0 {
+                return 0.0;
+            }
+            // r from stored dispersion, else from mean/variance; falls back to
+            // near-Poisson when the data isn't overdispersed.
+            let r = dispersion.filter(|r| *r > 0.0).unwrap_or_else(|| {
+                let v = sd * sd;
+                if v > mean { mean * mean / (v - mean) } else { 1e6 }
+            });
+            let lambda = rng.gamma(r, mean / r); // Gamma-Poisson mixture = NB
+            rng.poisson(lambda)
+        }
+    }
 }
 
 /// Linear-interpolated quantile of an already-sorted slice.
@@ -88,16 +203,69 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
 }
 
-fn run(mean: f64, sd: f64, n: usize, seed: u64) -> SimulationOutput {
+/// Draw `n` samples and return them sorted ascending.
+fn draw_sorted(fam: Fam, mean: f64, sd: f64, dispersion: Option<f64>, n: usize, seed: u64) -> Vec<f64> {
     let mut rng = Rng(seed);
-    let mut draws: Vec<f64> = (0..n).map(|_| mean + sd * rng.normal()).collect();
+    let mut draws: Vec<f64> = (0..n).map(|_| sample(&mut rng, fam, mean, sd, dispersion)).collect();
     draws.sort_by(|a, b| a.total_cmp(b));
+    draws
+}
+
+fn summarize(draws: &[f64]) -> SimulationOutput {
     SimulationOutput {
-        mean: draws.iter().sum::<f64>() / n as f64,
-        median: quantile(&draws, 0.5),
-        p10: quantile(&draws, 0.1),
-        p90: quantile(&draws, 0.9),
+        mean: draws.iter().sum::<f64>() / draws.len() as f64,
+        median: quantile(draws, 0.5),
+        p10: quantile(draws, 0.1),
+        p90: quantile(draws, 0.9),
     }
+}
+
+/// Exact Over/Under/Push fractions from the simulated draws. Push is the share
+/// of draws exactly on the line (meaningful only for integer lines on counts).
+fn line_probs(draws: &[f64], line: f64) -> (f64, f64, f64) {
+    let n = draws.len() as f64;
+    let (mut over, mut under, mut push) = (0.0, 0.0, 0.0);
+    for &x in draws {
+        if x > line {
+            over += 1.0;
+        } else if x < line {
+            under += 1.0;
+        } else {
+            push += 1.0;
+        }
+    }
+    (over / n, under / n, push / n)
+}
+
+/// Compact histogram (density per bin) over [p01, p99] for drawing the true
+/// predictive shape without shipping every draw.
+fn histogram(sorted: &[f64], bins: usize) -> Value {
+    let lo = quantile(sorted, 0.005);
+    let hi = quantile(sorted, 0.995);
+    let span = (hi - lo).max(1e-9);
+    let w = span / bins as f64;
+    let mut counts = vec![0u32; bins];
+    for &x in sorted {
+        if x < lo || x > hi {
+            continue;
+        }
+        let mut b = ((x - lo) / w) as usize;
+        if b >= bins {
+            b = bins - 1;
+        }
+        counts[b] += 1;
+    }
+    let total: u32 = counts.iter().sum();
+    let density: Vec<f64> = counts
+        .iter()
+        .map(|&c| if total > 0 { c as f64 / total as f64 } else { 0.0 })
+        .collect();
+    json!({ "lo": lo, "hi": hi, "bin_width": w, "density": density })
+}
+
+/// Back-compat summary-only entry point (used by tests).
+fn run(fam: Fam, mean: f64, sd: f64, dispersion: Option<f64>, n: usize, seed: u64) -> SimulationOutput {
+    summarize(&draw_sorted(fam, mean, sd, dispersion, n, seed))
 }
 
 fn error(status: actix_web::http::StatusCode, msg: impl std::fmt::Display) -> HttpResponse {
@@ -199,10 +367,22 @@ async fn simulate(fs: web::Data<FeatureStore>, q: web::Query<SimQuery>) -> impl 
             .unwrap_or(0)
     });
     let n = q.n;
-    let summary = match web::block(move || run(mean, sd, n, seed)).await {
-        Ok(out) => out,
+    let fam = parse_family(q.family.as_deref());
+    let dispersion = q.dispersion;
+    let (line, bins) = (q.line, q.hist);
+    let draws = match web::block(move || draw_sorted(fam, mean, sd, dispersion, n, seed)).await {
+        Ok(d) => d,
         Err(_) => return HttpResponse::InternalServerError().finish(),
     };
+    let summary = summarize(&draws);
+    let (p_over, p_under, p_push) = match line {
+        Some(l) => {
+            let (o, u, p) = line_probs(&draws, l);
+            (Some(o), Some(u), Some(p))
+        }
+        None => (None, None, None),
+    };
+    let hist = bins.filter(|b| *b > 0).map(|b| histogram(&draws, b.min(200)));
 
     let simulation_id = match &q.event_id {
         Some(event_id) => {
@@ -219,7 +399,10 @@ async fn simulate(fs: web::Data<FeatureStore>, q: web::Query<SimQuery>) -> impl 
         }
         None => None,
     };
-    HttpResponse::Ok().json(SimResponse { summary, seed, n, posterior, simulation_id })
+    HttpResponse::Ok().json(SimResponse {
+        summary, seed, n, family: fam_name(fam),
+        p_over, p_under, p_push, hist, posterior, simulation_id,
+    })
 }
 
 #[actix_web::main]
@@ -253,7 +436,7 @@ mod tests {
 
     #[test]
     fn normal_summary_matches_theory() {
-        let out = run(117.0, 10.0, 200_000, 42);
+        let out = run(Fam::Normal, 117.0, 10.0, None, 200_000, 42);
         assert!((out.mean - 117.0).abs() < 0.1);
         assert!((out.median - 117.0).abs() < 0.15);
         // z(0.9) = 1.2816
@@ -263,9 +446,28 @@ mod tests {
 
     #[test]
     fn same_seed_is_deterministic() {
-        let (a, b) = (run(0.0, 1.0, 1000, 7), run(0.0, 1.0, 1000, 7));
+        let (a, b) = (
+            run(Fam::Normal, 0.0, 1.0, None, 1000, 7),
+            run(Fam::Normal, 0.0, 1.0, None, 1000, 7),
+        );
         assert_eq!(a.mean, b.mean);
         assert_eq!(a.p90, b.p90);
+    }
+
+    #[test]
+    fn negbin_is_nonnegative_and_matches_moments() {
+        // mean 1.88, dispersion r=... var = mean + mean^2/r; pick r so sd~1.39
+        let r = 1.88 * 1.88 / (1.39 * 1.39 - 1.88);
+        let out = run(Fam::NegBin, 1.88, 1.39, Some(r), 200_000, 11);
+        assert!(out.p10 >= 0.0, "counts must be non-negative");
+        assert!((out.mean - 1.88).abs() < 0.05);
+    }
+
+    #[test]
+    fn gamma_is_positive_and_matches_mean() {
+        let out = run(Fam::Gamma, 265.0, 80.0, None, 200_000, 5);
+        assert!(out.p10 > 0.0, "gamma draws are positive");
+        assert!((out.mean - 265.0).abs() < 2.0);
     }
 
     #[test]
