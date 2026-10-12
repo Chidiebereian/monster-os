@@ -80,6 +80,14 @@ export const api = {
   // --- simulation-engine (projections) ---
   simulate: (opts: { mean: number; sd: number; n?: number; seed?: number }) =>
     getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 10000, ...opts })}`),
+  simulateModel: (opts: { model_id: string; parameter: string; n?: number; seed?: number }) =>
+    getJson<Simulation>(`/simulation-engine/simulate?${qs({ n: 100000, ...opts })}`),
+
+  // --- projection-service (player/team models) ---
+  playerProjections: (sport: string, stat: string, opts: { limit?: number; min_games?: number; q?: string } = {}) =>
+    getJson<ProjectionList>(`/projection-service/projections/${sport}/${stat}?${qs(opts)}`),
+  playerProjection: (sport: string, stat: string, playerId: string) =>
+    getJson<ProjectionDetail>(`/projection-service/projections/${sport}/${stat}/${playerId}`),
 
   // --- monster-gpt ---
   ask: (question: string, context?: unknown) =>
@@ -139,6 +147,20 @@ export interface CopySizeReq {
 export interface CopySize { accepted: boolean; recommended_size: number; raw_size: number; slippage: number; caps_applied: string[]; reason: string | null; }
 export interface Exposure { market_id: string; outcome: string; net_shares: number; cost_basis: number; avg_entry: number | null; }
 export interface WalletTrade { ts: string; venue: string; wallet: string; market_id: string; side: string; price: number; size: number; }
-export interface Simulation { mean: number; median: number; p10: number; p90: number; seed: number; n: number; }
+export interface Simulation {
+  mean: number; median: number; p10: number; p90: number; seed: number; n: number;
+  posterior?: { parameter: string; mean: number; sd: number; q05?: number | null; q95?: number | null; rhat?: number | null };
+}
+export interface PlayerProjection {
+  player_id: string; name: string; team: string | null; last_season: number | null;
+  proj_mean: number; proj_sd: number; dispersion: number | null; sample_games: number | null;
+  career_mean: number | null; recent_mean: number | null;
+  market_line: number | null; market_implied: number | null; model_id: string | null;
+}
+export interface ProjectionList { sport: string; stat: string; model_id: string; count: number; projections: PlayerProjection[]; }
+export interface ProjectionDetail {
+  projection: PlayerProjection;
+  recent_games: { season: number; week: string; opponent: string; passing_tds: number | string }[];
+}
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number; }
 export interface Candles { market_id: string | null; outcome_index: number | null; interval_secs: number; candles: Candle[]; }

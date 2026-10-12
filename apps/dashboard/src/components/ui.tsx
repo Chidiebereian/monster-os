@@ -99,16 +99,19 @@ export function Input({
   onChange,
   className,
   type = "text",
+  placeholder,
 }: {
   value: string | number;
   onChange: (v: string) => void;
   className?: string;
   type?: string;
+  placeholder?: string;
 }) {
   return (
     <input
       type={type}
       value={value}
+      placeholder={placeholder}
       onChange={(e) => onChange(e.target.value)}
       className={clsx(
         "bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50",
