@@ -607,6 +607,7 @@ async fn main() -> std::io::Result<()> {
             .route("/games/nfl", web::get().to(teams::list_games))
             .route("/matchup/nfl", web::get().to(teams::matchup))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
+            .route("/ingest/nhl/goalies", web::post().to(nhl::ingest_goalies))
             .route("/stats/nhl", web::get().to(nhl::list_stats))
             .route("/projections/nhl/{stat}", web::get().to(nhl::list_stat))
             .route("/projections/nhl/{stat}/{player_id}", web::get().to(nhl::get_player_stat))

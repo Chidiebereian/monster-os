@@ -40,8 +40,16 @@ pub(crate) const NHL_STATS: &[StatDef] = &[
     StatDef { key: "toi",     label: "Time on Ice",     column: "toi",     opportunity: "toi_seconds", family: Family::Continuous, unit: "min" },
 ];
 
+// Goalie props. saves = shots-on-goal faced minus goals allowed; a game counts
+// only if the goalie played a meaningful share (toi_seconds filter at parse).
+pub(crate) const GOALIE_STATS: &[StatDef] = &[
+    StatDef { key: "saves",         label: "Saves",         column: "saves",         opportunity: "toi_seconds", family: Family::Count, unit: "SV" },
+    StatDef { key: "shots_against", label: "Shots Against", column: "shots_against", opportunity: "toi_seconds", family: Family::Count, unit: "SA" },
+    StatDef { key: "goals_against", label: "Goals Against", column: "goals_against", opportunity: "toi_seconds", family: Family::Count, unit: "GA" },
+];
+
 fn stat_def(key: &str) -> Option<&'static StatDef> {
-    NHL_STATS.iter().find(|s| s.key == key)
+    NHL_STATS.iter().chain(GOALIE_STATS).find(|s| s.key == key)
 }
 fn model_id(stat: &str) -> String {
     format!("nhl-{stat}-v1")
@@ -293,6 +301,131 @@ fn parse_moneypuck(text: &str, sk: &Skater) -> Option<Player> {
     Some(Player { name: sk.name.clone(), position: sk.position.clone(), team: sk.team.clone(), games })
 }
 
+/// Enumerate goalies from current rosters, pull their MoneyPuck game logs, and
+/// fit the goalie prop models (saves / shots-against / goals-against).
+pub async fn ingest_goalies(state: web::Data<State>, q: web::Query<IngestQuery>) -> impl Responder {
+    let q = q.into_inner();
+    let http = &state.http;
+    let standings: Value = match http.get(format!("{NHL_API}/standings/now")).send().await.and_then(|r| r.error_for_status()) {
+        Ok(r) => match r.json().await { Ok(v) => v, Err(e) => return internal(format!("standings json: {e}")) },
+        Err(e) => return internal(format!("standings fetch: {e}")),
+    };
+    let teams: Vec<String> = standings["standings"].as_array().map(|a| {
+        a.iter().filter_map(|t| t["teamAbbrev"]["default"].as_str().map(|s| s.to_string())).collect()
+    }).unwrap_or_default();
+
+    let roster_results: Vec<Vec<Skater>> = stream::iter(teams)
+        .map(|abbr| {
+            let http = http.clone();
+            async move {
+                let Ok(resp) = http.get(format!("{NHL_API}/roster/{abbr}/current")).send().await else { return Vec::new() };
+                let Ok(v) = resp.json::<Value>().await else { return Vec::new() };
+                v["goalies"].as_array().map(|arr| arr.iter().filter_map(|p| {
+                    let id = p["id"].as_i64()?;
+                    let fname = p["firstName"]["default"].as_str().unwrap_or("");
+                    let lname = p["lastName"]["default"].as_str().unwrap_or("");
+                    Some(Skater { id, name: format!("{fname} {lname}").trim().to_string(), position: "G".into(), team: abbr.clone() })
+                }).collect()).unwrap_or_default()
+            }
+        })
+        .buffer_unordered(q.concurrency).collect().await;
+    let mut goalies: Vec<Skater> = roster_results.into_iter().flatten().collect();
+    goalies.sort_by_key(|s| s.id);
+    goalies.dedup_by_key(|s| s.id);
+    if q.limit > 0 && goalies.len() > q.limit { goalies.truncate(q.limit); }
+    let total = goalies.len();
+
+    let players: Vec<(i64, Player)> = stream::iter(goalies)
+        .map(|sk| {
+            let http = http.clone();
+            async move {
+                let url = format!("https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/goalies/{}.csv", sk.id);
+                let Ok(resp) = http.get(&url).send().await else { return None };
+                let Ok(resp) = resp.error_for_status() else { return None };
+                let Ok(text) = resp.text().await else { return None };
+                parse_goalie(&text, &sk).map(|p| (sk.id, p))
+            }
+        })
+        .buffer_unordered(q.concurrency).collect::<Vec<_>>().await.into_iter().flatten().collect();
+
+    let mut league: HashMap<&str, f64> = HashMap::new();
+    for s in GOALIE_STATS {
+        let (mut sum, mut cnt) = (0.0, 0.0);
+        for (_, p) in &players {
+            for g in &p.games {
+                if *g.vals.get(s.opportunity).unwrap_or(&0.0) >= 1.0 {
+                    sum += *g.vals.get(s.column).unwrap_or(&0.0);
+                    cnt += 1.0;
+                }
+            }
+        }
+        league.insert(s.key, if cnt > 0.0 { sum / cnt } else { 0.0 });
+    }
+    for s in GOALIE_STATS {
+        if let Err(e) = state.db.execute(
+            "INSERT INTO models (id, name, sport, version, type, status) VALUES ($1, $2, 'nhl', '1', $3, 'active') ON CONFLICT (id) DO NOTHING",
+            &[&model_id(s.key), &format!("NHL {} (EB, recency-weighted)", s.label), &s.family.model_type()],
+        ).await { return internal(format!("register model {}: {e}", s.key)); }
+    }
+
+    let mut fitted = 0usize;
+    let mut by_stat: HashMap<&str, usize> = HashMap::new();
+    for (pid, mut p) in players {
+        p.games.sort_by(|a, b| a.sort.total_cmp(&b.sort));
+        if p.games.is_empty() { continue; }
+        let (first, last) = (p.games.first().unwrap().season, p.games.last().unwrap().season);
+        if let Err(e) = persist_player(&state.db, pid, &p, p.games.len() as i32, first, last).await { return internal(e); }
+        if let Err(e) = persist_game_logs(&state.db, pid, &p).await { return internal(e); }
+        for s in GOALIE_STATS {
+            let vals: Vec<f64> = p.games.iter().filter(|g| *g.vals.get(s.opportunity).unwrap_or(&0.0) >= 1.0).map(|g| *g.vals.get(s.column).unwrap_or(&0.0)).collect();
+            if vals.len() < q.min_games { continue; }
+            let base = *league.get(s.key).unwrap_or(&0.0);
+            let proj = fit_count(&vals, base, q.prior_k, q.halflife);
+            if let Err(e) = persist_projection(&state.db, pid, s, &proj).await { return internal(e); }
+            *by_stat.entry(s.key).or_insert(0) += 1;
+        }
+        fitted += 1;
+    }
+    let summary: Vec<Value> = GOALIE_STATS.iter().map(|s| json!({
+        "stat": s.key, "label": s.label, "league_mean": (league.get(s.key).unwrap_or(&0.0)*1000.0).round()/1000.0,
+        "players_fitted": by_stat.get(s.key).copied().unwrap_or(0),
+    })).collect();
+    HttpResponse::Ok().json(json!({ "sport": "nhl", "goalies_rostered": total, "goalies_with_logs": fitted, "stats": summary }))
+}
+
+/// Parse a MoneyPuck goalie gameByGame CSV into per-game saves/shots/goals.
+/// Only games with >= 25 min of ice time count (approximate starts).
+fn parse_goalie(text: &str, sk: &Skater) -> Option<Player> {
+    let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(text.as_bytes());
+    let headers = rdr.headers().ok()?.clone();
+    let idx = |n: &str| headers.iter().position(|h| h == n);
+    let (i_sit, i_season, i_date, i_opp, i_toi, i_ongoal, i_goals) =
+        (idx("situation")?, idx("season")?, idx("gameDate")?, idx("opposingTeam")?, idx("icetime")?, idx("ongoal")?, idx("goals")?);
+    let getf = |r: &csv::StringRecord, i: usize| r.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let mut games = Vec::new();
+    for rec in rdr.records().flatten() {
+        if rec.get(i_sit) != Some("all") { continue; }
+        let toi = getf(&rec, i_toi);
+        if toi < 1500.0 { continue; } // ~25+ min => a real appearance / start
+        let ongoal = getf(&rec, i_ongoal);
+        let goals = getf(&rec, i_goals);
+        let season: i32 = rec.get(i_season).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let date_str = rec.get(i_date).unwrap_or("");
+        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y%m%d").ok();
+        let mut vals: HashMap<&'static str, f64> = HashMap::new();
+        vals.insert("saves", (ongoal - goals).max(0.0));
+        vals.insert("shots_against", ongoal);
+        vals.insert("goals_against", goals);
+        vals.insert("toi_seconds", toi);
+        games.push(GameRow {
+            season, game_id: format!("{season}-{date_str}"), date, sort: date_str.parse().unwrap_or(season as f64),
+            opponent: rec.get(i_opp).unwrap_or("").to_string(), vals,
+        });
+    }
+    if games.is_empty() { return None; }
+    Some(Player { name: sk.name.clone(), position: "G".into(), team: sk.team.clone(), games })
+}
+
 async fn persist_player(db: &tokio_postgres::Client, pid: i64, p: &Player, games: i32, first: i32, last: i32) -> Result<(), String> {
     db.execute(
         "INSERT INTO sports_players (sport, player_id, display_name, position, team, first_season, last_season, games) \
@@ -409,7 +542,7 @@ pub async fn get_player_stat(state: web::Data<State>, path: web::Path<(String, S
 }
 
 pub async fn list_stats(_state: web::Data<State>) -> impl Responder {
-    let out: Vec<Value> = NHL_STATS.iter().map(|s| json!({
+    let out: Vec<Value> = NHL_STATS.iter().chain(GOALIE_STATS).map(|s| json!({
         "key": s.key, "label": s.label, "unit": s.unit, "family": s.family.as_str(), "model_id": model_id(s.key),
     })).collect();
     HttpResponse::Ok().json(json!({ "sport": "nhl", "stats": out }))
