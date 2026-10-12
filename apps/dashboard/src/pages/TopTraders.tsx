@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { api } from "../lib/api";
 import { formatPct, formatUsd } from "../lib/odds";
+import { MarketCandles } from "../components/MarketCandles";
 
 // Module 5 (partial): Top Traders leaderboard over copy-trading /leaderboard —
 // real Polymarket profit/volume per time window, with reconstructed win-rate.
@@ -16,6 +18,7 @@ const METRICS = [
 export function TopTraders() {
   const [window, setWindow] = useState("all");
   const [metric, setMetric] = useState("pnl");
+  const [open, setOpen] = useState<string | null>(null);
   const { data, isLoading, error } = useQuery({
     queryKey: ["leaderboard", window, metric],
     queryFn: () => api.leaderboard({ window, metric, limit: 25 }),
@@ -40,6 +43,7 @@ export function TopTraders() {
           <table className="w-full text-sm">
             <thead className="bg-surface text-gray-400">
               <tr>
+                <th className="w-6 px-2 py-2"></th>
                 <th className="text-left px-3 py-2 text-xs uppercase">#</th>
                 <th className="text-left px-3 py-2 text-xs uppercase">Trader</th>
                 <th className="text-right px-3 py-2 text-xs uppercase">PnL</th>
@@ -50,22 +54,44 @@ export function TopTraders() {
               </tr>
             </thead>
             <tbody>
-              {data.map((t, i) => (
-                <tr key={t.wallet} className="border-t border-glass hover:bg-white/[0.03]">
-                  <td className="px-3 py-2 text-gray-500">{i + 1}</td>
-                  <td className="px-3 py-2">
-                    <span className="font-medium">{t.label ?? "—"}</span>{" "}
-                    <span className="text-gray-600 font-mono text-xs">
-                      {t.wallet.slice(0, 6)}…{t.wallet.slice(-4)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-right font-mono text-emerald-light">{formatUsd(t.pnl)}</td>
-                  <td className="px-3 py-2 text-right font-mono text-gray-300">{formatUsd(t.volume)}</td>
-                  <td className="px-3 py-2 text-right font-mono text-gray-300">{formatPct(t.win_rate)}</td>
-                  <td className="px-3 py-2 text-right font-mono text-gray-400">{formatPct(t.edge)}</td>
-                  <td className="px-3 py-2 text-gray-400">{t.category ?? "—"}</td>
-                </tr>
-              ))}
+              {data.map((t, i) => {
+                const isOpen = open === t.wallet;
+                return (
+                  <Fragment key={t.wallet}>
+                    <tr
+                      onClick={() => setOpen(isOpen ? null : t.wallet)}
+                      className="border-t border-glass hover:bg-white/[0.03] cursor-pointer"
+                      title="Show top-position price action"
+                    >
+                      <td className="px-2 py-2 text-gray-500">
+                        {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </td>
+                      <td className="px-3 py-2 text-gray-500">{i + 1}</td>
+                      <td className="px-3 py-2">
+                        <span className="font-medium">{t.label ?? "—"}</span>{" "}
+                        <span className="text-gray-600 font-mono text-xs">
+                          {t.wallet.slice(0, 6)}…{t.wallet.slice(-4)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono text-emerald-light">{formatUsd(t.pnl)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-gray-300">{formatUsd(t.volume)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-gray-300">{formatPct(t.win_rate)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-gray-400">{formatPct(t.edge)}</td>
+                      <td className="px-3 py-2 text-gray-400">{t.category ?? "—"}</td>
+                    </tr>
+                    {isOpen && (
+                      <tr className="border-t border-glass bg-obsidian/40">
+                        <td colSpan={8} className="px-4 py-3">
+                          <div className="text-[11px] text-gray-500 mb-1">
+                            Most-traded market · daily fills (price at which this wallet's money moved)
+                          </div>
+                          <MarketCandles wallet={t.wallet} interval={86400} limit={90} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>

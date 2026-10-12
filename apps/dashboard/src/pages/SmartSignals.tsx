@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
+import { CandlestickChart as ChartIcon } from "lucide-react";
 import { api, type Signal, type PersistedSignal } from "../lib/api";
 import { formatPct } from "../lib/odds";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
+import { MarketCandles } from "../components/MarketCandles";
 
 // Module 5: Smart Signals — score tracked sharp wallets' trades (Sharp) and
 // find clusters (Consensus), from sport-intelligence.
@@ -50,6 +52,7 @@ function Sharp({ mode }: { mode: string }) {
 }
 
 function SignalCard({ s }: { s: Signal }) {
+  const [showChart, setShowChart] = useState(false);
   const slipPct = s.slippage != null ? `${s.slippage > 0 ? "+" : ""}${(s.slippage * 100).toFixed(1)}c` : "stale";
   return (
     <Card className="space-y-2">
@@ -59,8 +62,20 @@ function SignalCard({ s }: { s: Signal }) {
           <div className="text-[10px] uppercase tracking-wide text-gray-500">score · {s.category}</div>
           <div className="text-sm font-medium truncate">{s.market_id}</div>
         </div>
-        <span className={clsx("ml-auto text-[10px] px-1.5 py-0.5 rounded uppercase", s.side === "buy" ? "bg-emerald/15 text-emerald-light" : "bg-crimson/15 text-crimson-light")}>{s.side}</span>
+        <button
+          onClick={() => setShowChart((v) => !v)}
+          title="Price action from tracked-wallet fills"
+          className={clsx("ml-auto p-1 rounded transition-colors", showChart ? "text-violet-light bg-violet/15" : "text-gray-500 hover:text-gray-200")}
+        >
+          <ChartIcon size={14} />
+        </button>
+        <span className={clsx("text-[10px] px-1.5 py-0.5 rounded uppercase", s.side === "buy" ? "bg-emerald/15 text-emerald-light" : "bg-crimson/15 text-crimson-light")}>{s.side}</span>
       </div>
+      {showChart && (
+        <div className="pt-1 border-t border-glass">
+          <MarketCandles marketId={s.market_id} refPrice={s.entry_price} refLabel="entry" />
+        </div>
+      )}
       <div className="grid grid-cols-3 gap-2 text-xs">
         <Mini label="Entry" value={s.entry_price.toFixed(2)} />
         <Mini label="Current" value={s.current_price != null ? s.current_price.toFixed(2) : "—"} />

@@ -731,6 +731,98 @@ async fn exposure(state: web::Data<State>, q: web::Query<ExposureQuery>) -> impl
     }
 }
 
+#[derive(Deserialize)]
+struct CandlesQuery {
+    /// Polymarket market slug to chart. Optional if `wallet` is given.
+    market_id: Option<String>,
+    /// Restrict to one outcome (e.g. 0 = YES). Omit to pool all outcomes.
+    outcome_index: Option<i8>,
+    /// If no market_id, chart this wallet's most-traded market.
+    wallet: Option<String>,
+    /// Bucket width in seconds (default 1h; clamped 60s..7d).
+    interval: Option<i64>,
+    /// Max number of (most recent) candles (default 120; clamped 1..1000).
+    limit: Option<u32>,
+}
+
+/// ClickHouse emits 64-bit ints as JSON strings to preserve precision; accept
+/// either a JSON number or a numeric string.
+fn num(v: &Value) -> f64 {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0)
+}
+
+/// OHLC candles for a market, aggregated from the real fills we've stored in
+/// `wallet_trades` (open = first fill in the bucket, high/low = extremes, close
+/// = last fill, v = shares traded, n = fill count). These are tracked-wallet
+/// fills, not the full book — a true sample of the price at which money moved.
+async fn candles(state: web::Data<State>, q: web::Query<CandlesQuery>) -> impl Responder {
+    let interval = q.interval.unwrap_or(3600).clamp(60, 604_800);
+    let limit = q.limit.unwrap_or(120).clamp(1, 1000);
+
+    // Resolve the market: explicit slug, else the wallet's most-active market.
+    let market = match &q.market_id {
+        Some(m) if !m.trim().is_empty() => m.clone(),
+        _ => {
+            let Some(wallet) = q.wallet.as_ref() else {
+                return bad_request("provide market_id or wallet");
+            };
+            if !(wallet.starts_with("0x") && wallet.len() == 42) {
+                return bad_request("invalid wallet");
+            }
+            let sql = format!(
+                "SELECT market_id FROM monster.wallet_trades WHERE wallet = '{}' \
+                 GROUP BY market_id ORDER BY count() DESC LIMIT 1 FORMAT TabSeparated",
+                wallet.replace('\'', "")
+            );
+            match state.ch(sql).await {
+                Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+                Ok(_) => return HttpResponse::Ok().json(json!({ "market_id": null, "candles": [] })),
+                Err(e) => return internal(e),
+            }
+        }
+    };
+
+    let outcome_filter = match q.outcome_index {
+        Some(i) => format!(" AND outcome_index = {i}"),
+        None => String::new(),
+    };
+    // Order DESC + LIMIT to get the most recent buckets, then reverse to
+    // chronological order for charting.
+    let sql = format!(
+        "SELECT toInt64(toStartOfInterval(ts, INTERVAL {interval} SECOND)) AS t, \
+                argMin(price, ts) AS o, max(price) AS h, min(price) AS l, \
+                argMax(price, ts) AS c, sum(size) AS v, toInt64(count()) AS n \
+         FROM monster.wallet_trades WHERE market_id = '{}'{outcome_filter} \
+         GROUP BY t ORDER BY t DESC LIMIT {limit} FORMAT JSONEachRow",
+        market.replace('\'', "")
+    );
+    match state.ch(sql).await {
+        Ok(text) => {
+            let mut rows: Vec<Value> = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .map(|v| {
+                    json!({
+                        "t": num(&v["t"]) as i64,
+                        "o": num(&v["o"]), "h": num(&v["h"]),
+                        "l": num(&v["l"]), "c": num(&v["c"]),
+                        "v": num(&v["v"]), "n": num(&v["n"]) as i64,
+                    })
+                })
+                .collect();
+            rows.reverse();
+            HttpResponse::Ok().json(json!({
+                "market_id": market,
+                "outcome_index": q.outcome_index,
+                "interval_secs": interval,
+                "candles": rows,
+            }))
+        }
+        Err(e) => internal(e),
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8116);
@@ -779,6 +871,7 @@ async fn main() -> std::io::Result<()> {
             .route("/compute-performance", web::post().to(compute_performance))
             .route("/exposure", web::get().to(exposure))
             .route("/trades", web::get().to(trades))
+            .route("/candles", web::get().to(candles))
     })
     .bind(("0.0.0.0", port))?
     .run()

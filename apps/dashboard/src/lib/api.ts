@@ -74,6 +74,8 @@ export const api = {
   // --- whale-tracker ---
   exposure: (wallet: string, limit = 25) => getJson<Exposure[]>(`/whale-tracker/exposure?${qs({ wallet, limit })}`),
   walletTrades: (wallet: string, limit = 50) => getJson<WalletTrade[]>(`/whale-tracker/trades?${qs({ wallet, limit })}`),
+  candles: (opts: { market_id?: string; wallet?: string; outcome_index?: number; interval?: number; limit?: number }) =>
+    getJson<Candles>(`/whale-tracker/candles?${qs(opts)}`),
 
   // --- simulation-engine (projections) ---
   simulate: (opts: { mean: number; sd: number; n?: number; seed?: number }) =>
@@ -138,3 +140,5 @@ export interface CopySize { accepted: boolean; recommended_size: number; raw_siz
 export interface Exposure { market_id: string; outcome: string; net_shares: number; cost_basis: number; avg_entry: number | null; }
 export interface WalletTrade { ts: string; venue: string; wallet: string; market_id: string; side: string; price: number; size: number; }
 export interface Simulation { mean: number; median: number; p10: number; p90: number; seed: number; n: number; }
+export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number; }
+export interface Candles { market_id: string | null; outcome_index: number | null; interval_secs: number; candles: Candle[]; }
