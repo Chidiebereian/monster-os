@@ -112,10 +112,11 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [gameId, setGameId] = useState("");
 
+  const hasSchedule = sport === "nfl" || sport === "nhl";
   const games = useQuery({
     queryKey: ["games", sport, "scheduled"],
     queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }),
-    enabled: sport === "nfl",
+    enabled: hasSchedule,
   });
   // upcoming games sorted by date, soonest first
   const upcoming = [...(games.data?.games ?? [])]
@@ -153,7 +154,7 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
           <h2 className="font-medium text-sm">{stat.label}</h2>
           <span className="text-xs text-gray-500 ml-auto">{list.data?.count ?? 0} players</span>
         </div>
-        {sport === "nfl" && (
+        {hasSchedule && (
           <select
             value={gameId}
             onChange={(e) => setGameId(e.target.value)}
@@ -162,7 +163,7 @@ function PlayerProjections({ sport, stat }: { sport: string; stat: StatDef }) {
             <option value="">All games · all players</option>
             {upcoming.map((g) => (
               <option key={g.game_id} value={g.game_id}>
-                {g.away} @ {g.home}{g.week ? ` · wk ${g.week}` : ""}{g.date ? ` · ${g.date}` : ""}
+                {g.away} @ {g.home}{sport === "nfl" && g.week ? ` · wk ${g.week}` : ""}{g.date ? ` · ${g.date}` : ""}
               </option>
             ))}
           </select>

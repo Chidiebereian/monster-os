@@ -226,6 +226,93 @@ async fn store(db: &tokio_postgres::Client, names: &[String], off: &[f64], def: 
     Ok(())
 }
 
+/// Ingest the NHL schedule (per-team club schedule) into sports_games so the
+/// Player tab can filter by upcoming game.
+pub async fn ingest_schedule(state: web::Data<State>) -> impl Responder {
+    let http = &state.http;
+    let standings: Value = match http.get(format!("{NHL_API}/standings/now")).send().await.and_then(|r| r.error_for_status()) {
+        Ok(r) => r.json().await.unwrap_or(Value::Null),
+        Err(e) => return internal(format!("standings: {e}")),
+    };
+    let teams: Vec<String> = standings["standings"].as_array().map(|a| {
+        a.iter().filter_map(|t| t["teamAbbrev"]["default"].as_str().map(|s| s.to_string())).collect()
+    }).unwrap_or_default();
+
+    let per_team: Vec<Vec<Value>> = stream::iter(teams)
+        .map(|abbr| {
+            let http = http.clone();
+            async move {
+                let Ok(resp) = http.get(format!("{NHL_API}/club-schedule-season/{abbr}/now")).send().await else { return Vec::new() };
+                let Ok(v) = resp.json::<Value>().await else { return Vec::new() };
+                v["games"].as_array().cloned().unwrap_or_default()
+            }
+        })
+        .buffer_unordered(12).collect::<Vec<_>>().await;
+
+    // dedupe by game id
+    let mut seen: HashMap<String, Value> = HashMap::new();
+    for g in per_team.into_iter().flatten() {
+        if let Some(id) = g["id"].as_i64() {
+            seen.entry(id.to_string()).or_insert(g);
+        }
+    }
+    if seen.is_empty() { return internal("no schedule games"); }
+
+    let (mut gid, mut season, mut week, mut gtype, mut date, mut home, mut away, mut hs, mut as_, mut status) =
+        (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    for (id, g) in &seen {
+        let state_str = g["gameState"].as_str().unwrap_or("");
+        let is_final = state_str == "FINAL" || state_str == "OFF";
+        let gd = g["gameDate"].as_str().unwrap_or("");
+        gid.push(id.clone());
+        // season like 20262027 -> start year 2026
+        season.push(g["season"].as_i64().map(|s| (s / 10000) as i32).unwrap_or(0));
+        week.push(gd.to_string()); // NHL has no weeks; use the date as the per-game key suffix
+        gtype.push(match g["gameType"].as_i64() { Some(3) => "POST".to_string(), _ => "REG".to_string() });
+        date.push(chrono::NaiveDate::parse_from_str(gd, "%Y-%m-%d").ok());
+        home.push(g["homeTeam"]["abbrev"].as_str().unwrap_or("").to_string());
+        away.push(g["awayTeam"]["abbrev"].as_str().unwrap_or("").to_string());
+        hs.push(if is_final { g["homeTeam"]["score"].as_i64().map(|x| x as i32) } else { None });
+        as_.push(if is_final { g["awayTeam"]["score"].as_i64().map(|x| x as i32) } else { None });
+        status.push(if is_final { "final".to_string() } else { "scheduled".to_string() });
+    }
+    let r = state.db.execute(
+        "INSERT INTO sports_games (sport, game_id, season, week, game_type, game_date, home_team, away_team, home_score, away_score, status) \
+         SELECT 'nhl', * FROM UNNEST($1::text[],$2::int[],$3::text[],$4::text[],$5::date[],$6::text[],$7::text[],$8::int[],$9::int[],$10::text[]) \
+         ON CONFLICT (sport, game_id) DO UPDATE SET season=EXCLUDED.season, week=EXCLUDED.week, game_type=EXCLUDED.game_type, \
+           game_date=EXCLUDED.game_date, home_team=EXCLUDED.home_team, away_team=EXCLUDED.away_team, home_score=EXCLUDED.home_score, \
+           away_score=EXCLUDED.away_score, status=EXCLUDED.status, updated_at=now()",
+        &[&gid, &season, &week, &gtype, &date, &home, &away, &hs, &as_, &status],
+    ).await;
+    match r {
+        Ok(_) => HttpResponse::Ok().json(json!({ "sport": "nhl", "games_ingested": seen.len() })),
+        Err(e) => internal(format!("store schedule: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GamesQuery { season: Option<i32>, status: Option<String>, limit: Option<i64> }
+pub async fn list_games(state: web::Data<State>, q: web::Query<GamesQuery>) -> impl Responder {
+    let limit = q.limit.unwrap_or(400).clamp(1, 2000);
+    let sql = "SELECT game_id, season, week, game_type, game_date, home_team, away_team, home_score, away_score, status \
+               FROM sports_games WHERE sport='nhl' AND ($1::int IS NULL OR season=$1) AND ($2::text IS NULL OR status=$2) \
+               ORDER BY game_date ASC NULLS LAST, game_id LIMIT $3";
+    match state.db.query(sql, &[&q.season, &q.status, &limit]).await {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(|r| json!({
+                "game_id": r.get::<_, String>("game_id"), "season": r.get::<_, Option<i32>>("season"),
+                "week": r.get::<_, Option<String>>("week"), "game_type": r.get::<_, Option<String>>("game_type"),
+                "date": r.get::<_, Option<chrono::NaiveDate>>("game_date").map(|d| d.to_string()),
+                "home": r.get::<_, Option<String>>("home_team"), "away": r.get::<_, Option<String>>("away_team"),
+                "home_score": r.get::<_, Option<i32>>("home_score"), "away_score": r.get::<_, Option<i32>>("away_score"),
+                "status": r.get::<_, Option<String>>("status"),
+            })).collect();
+            HttpResponse::Ok().json(json!({ "count": out.len(), "games": out }))
+        }
+        Err(e) => internal(e),
+    }
+}
+
 pub async fn list_ratings(state: web::Data<State>) -> impl Responder {
     let sql = "SELECT o.team, o.rating AS off, d.rating AS def FROM team_components o \
                JOIN team_components d ON d.sport=o.sport AND d.team=o.team AND d.component='goals_def' AND d.model_id=o.model_id \
