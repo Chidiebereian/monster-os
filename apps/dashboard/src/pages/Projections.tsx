@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
-import { americanToDecimal, americanToImpliedProb, formatPct } from "../lib/odds";
+import { americanToDecimal, americanToImpliedProb, formatAmerican, formatPct } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
 // AI Picks & Projections. Filter sport -> stat -> player, then see that player's
@@ -252,6 +252,18 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
     queryKey: ["proj-detail", sport, stat.key, player.player_id],
     queryFn: () => api.playerProjection(sport, stat.key, player.player_id),
   });
+  // live market line for this player+stat (SportsGameOdds), if available
+  const marketQ = useQuery({
+    queryKey: ["mkt-prop", sport, stat.key],
+    queryFn: () => api.marketProps(sport, stat.key),
+    retry: 0,
+    staleTime: 60_000,
+  });
+  const prop = marketQ.data?.props.find((p) => p.player_id === player.player_id && p.line != null) ?? null;
+  // when a market line exists, snap the slider to it so P(Over) is at the market line
+  useEffect(() => {
+    if (prop?.line != null) setLine(prop.line);
+  }, [prop?.line]);
 
   const pOver = prob.data?.p_over ?? 0;
   const pUnder = prob.data?.p_under ?? 0;
@@ -260,6 +272,13 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
   const edge = pOver - marketImplied;
   const s = hist.data;
   const sd = Math.max(player.proj_sd, 0.05);
+  const evNum = (p: number, odds: number | null) => {
+    if (odds == null) return 0;
+    const dec = americanToDecimal(odds);
+    return dec > 1 ? p * (dec - 1) - (1 - p) : 0;
+  };
+  const evStr = (p: number, odds: number | null) =>
+    odds == null ? "—" : `${evNum(p, odds) >= 0 ? "+" : ""}${(evNum(p, odds) * 100).toFixed(1)}%`;
 
   return (
     <div className="space-y-4">
@@ -305,6 +324,23 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
           <Stat label="P(Push)" value={pPush > 0.0005 ? formatPct(pPush) : "—"} />
           <Stat label="Market implied" value={formatPct(marketImplied)} />
         </div>
+
+        {prop && prop.line != null && (
+          <div className="pt-3 border-t border-glass">
+            <div className="flex items-center gap-2 mb-2 flex-wrap">
+              <span className="font-medium text-sm text-emerald-light">Market EV · live</span>
+              <span className="text-xs text-gray-500">
+                {stat.label} {prop.line} · Over {formatAmerican(prop.over_odds)} / Under {formatAmerican(prop.under_odds)} (SportsGameOdds)
+              </span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <Stat label={`Over ${prop.line} EV/$1`} value={evStr(pOver, prop.over_odds)} tone={evNum(pOver, prop.over_odds) > 0 ? "pos" : "neg"} />
+              <Stat label={`Under ${prop.line} EV/$1`} value={evStr(pUnder, prop.under_odds)} tone={evNum(pUnder, prop.under_odds) > 0 ? "pos" : "neg"} />
+              <Stat label="Model P(Over)" value={formatPct(pOver)} />
+              <Stat label="Mkt implied (Over)" value={formatPct(prop.over_odds != null ? americanToImpliedProb(prop.over_odds) : 0)} />
+            </div>
+          </div>
+        )}
       </Card>
 
       <div className="grid md:grid-cols-2 gap-4">
@@ -402,16 +438,18 @@ function GameProjections({ sport }: { sport: string }) {
   const [gameId, setGameId] = useState("");
   const [spreadOdds, setSpreadOdds] = useState("-110");
   const [totalOdds, setTotalOdds] = useState("-110");
-  const games = useQuery({ queryKey: ["team-games", sport], queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }) });
-  const upcoming = [...(games.data?.games ?? [])].filter((g) => g.home && g.away).sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
-  function pickGame(gid: string) {
-    setGameId(gid);
-    const g = upcoming.find((x) => x.game_id === gid);
+  const market = useQuery({ queryKey: ["market-games", sport], queryFn: () => api.marketGames(sport) });
+  const upcoming = market.data?.games ?? [];
+  function pickGame(idx: string) {
+    setGameId(idx);
+    const g = upcoming[Number(idx)];
     if (!g) return;
-    if (g.home) setHome(g.home);
-    if (g.away) setAway(g.away);
-    if (g.spread_line != null) setSpread(String(-g.spread_line)); // nflverse spread_line = home expected margin (+ = home favored)
-    if (g.total_line != null) setTotal(String(g.total_line));
+    setHome(g.home);
+    setAway(g.away);
+    if (g.spread != null) setSpread(String(g.spread)); // SGO home spread (negative = home favored) maps straight to our matchup spread
+    if (g.total != null) setTotal(String(g.total));
+    if (g.spread_home_odds != null) setSpreadOdds(String(g.spread_home_odds));
+    if (g.over_odds != null) setTotalOdds(String(g.over_odds));
   }
   // EV per $1 stake from a model probability and American odds.
   const ev = (p: number, odds: string) => {
@@ -437,10 +475,10 @@ function GameProjections({ sport }: { sport: string }) {
             onChange={(e) => pickGame(e.target.value)}
             className="w-full bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
           >
-            <option value="">Pick an upcoming game to autofill teams{sport === "nfl" ? " + market lines" : ""}…</option>
-            {upcoming.map((g) => (
-              <option key={g.game_id} value={g.game_id}>
-                {g.away} @ {g.home}{g.date ? ` · ${g.date}` : ""}{g.spread_line != null ? ` · ${g.home} ${-g.spread_line}` : ""}
+            <option value="">Pick a live market game (autofills lines + odds)…</option>
+            {upcoming.map((g, i) => (
+              <option key={i} value={i}>
+                {g.away} @ {g.home}{g.spread != null ? ` · ${g.home} ${g.spread}` : ""}{g.total != null ? ` · O/U ${g.total}` : ""}
               </option>
             ))}
           </select>

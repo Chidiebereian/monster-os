@@ -91,6 +91,8 @@ export const api = {
   playerProjection: (sport: string, stat: string, playerId: string) =>
     getJson<ProjectionDetail>(`/projection-service/projections/${sport}/${stat}/${playerId}`),
   teamRatings: (sport = "nfl") => getJson<TeamRatings>(`/projection-service/teams/${sport}`),
+  marketGames: (sport: string) => getJson<{ sport: string; count: number; games: MarketGame[] }>(`/projection-service/market/${sport}/games`),
+  marketProps: (sport: string, stat: string) => getJson<{ sport: string; stat: string; count: number; props: MarketProp[] }>(`/projection-service/market/${sport}/props/${stat}`),
   matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
 
@@ -181,6 +183,16 @@ export interface Game {
   spread_line: number | null; total_line: number | null; status: string | null;
 }
 export interface GamesList { count: number; games: Game[]; }
+export interface MarketGame {
+  home: string; away: string; starts_at: string | null;
+  ml_home_odds: number | null; ml_away_odds: number | null; novig_home_win: number | null;
+  spread: number | null; spread_home_odds: number | null; spread_away_odds: number | null;
+  total: number | null; over_odds: number | null; under_odds: number | null;
+}
+export interface MarketProp {
+  player: string; player_id: string | null; team: string | null;
+  line: number | null; over_odds: number | null; under_odds: number | null;
+}
 export interface TeamRating { team: string; off: number; def: number; net: number; }
 export interface TeamRatings { model_id: string; count: number; teams: TeamRating[]; }
 export interface Matchup {
