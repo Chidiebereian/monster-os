@@ -93,6 +93,7 @@ export const api = {
   teamRatings: (sport = "nfl") => getJson<TeamRatings>(`/projection-service/teams/${sport}`),
   marketGames: (sport: string) => getJson<{ sport: string; count: number; games: MarketGame[] }>(`/projection-service/market/${sport}/games`),
   marketProps: (sport: string, stat: string) => getJson<{ sport: string; stat: string; count: number; props: MarketProp[] }>(`/projection-service/market/${sport}/props/${stat}`),
+  backtest: (sport = "nfl", opts: { from?: number; to?: number } = {}) => getJson<Backtest>(`/projection-service/backtest/${sport}?${qs(opts)}`),
   matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
 
@@ -192,6 +193,15 @@ export interface MarketGame {
 export interface MarketProp {
   player: string; player_id: string | null; team: string | null;
   line: number | null; over_odds: number | null; under_odds: number | null;
+}
+export interface Backtest {
+  model: string; method: string; test_seasons: string; games: number;
+  straight_up_accuracy: number; brier_score: number;
+  ats_vs_closing_line: { record: string; pct: number };
+  plus_ev_subset: { record: string; pct: number; note: string };
+  totals_vs_closing_line: { record: string; pct: number };
+  calibration: { bucket: string; n: number; predicted: number; actual: number }[];
+  by_season: { season: number; games: number; train_games: number; su_acc: number; ats_record: string; ats_pct: number }[];
 }
 export interface TeamRating { team: string; off: number; def: number; net: number; }
 export interface TeamRatings { model_id: string; count: number; teams: TeamRating[]; }

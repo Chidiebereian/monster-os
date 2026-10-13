@@ -8,6 +8,7 @@ import { Arbitrage } from "./pages/Arbitrage";
 import { WhaleWatch } from "./pages/WhaleWatch";
 import { SmartSignals } from "./pages/SmartSignals";
 import { TopTraders } from "./pages/TopTraders";
+import { Backtest } from "./pages/Backtest";
 import { MonsterGpt } from "./pages/MonsterGpt";
 
 const queryClient = new QueryClient({
@@ -28,6 +29,7 @@ export default function App() {
             <Route path="/whale-watch" element={<WhaleWatch />} />
             <Route path="/signals" element={<SmartSignals />} />
             <Route path="/copy" element={<TopTraders />} />
+            <Route path="/backtest" element={<Backtest />} />
             <Route path="/monster-gpt" element={<MonsterGpt />} />
             <Route path="*" element={<Navigate to="/odds" replace />} />
           </Route>
