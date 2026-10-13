@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
-import { americanToImpliedProb, formatPct } from "../lib/odds";
+import { americanToDecimal, americanToImpliedProb, formatPct } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
 // AI Picks & Projections. Filter sport -> stat -> player, then see that player's
@@ -398,6 +398,27 @@ function GameProjections({ sport }: { sport: string }) {
   const homeScore = d ? d.proj_home_points ?? d.proj_home_goals ?? 0 : 0;
   const awayScore = d ? d.proj_away_points ?? d.proj_away_goals ?? 0 : 0;
 
+  // upcoming games (with market lines for NFL) to prefill the matchup
+  const [gameId, setGameId] = useState("");
+  const [spreadOdds, setSpreadOdds] = useState("-110");
+  const [totalOdds, setTotalOdds] = useState("-110");
+  const games = useQuery({ queryKey: ["team-games", sport], queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }) });
+  const upcoming = [...(games.data?.games ?? [])].filter((g) => g.home && g.away).sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
+  function pickGame(gid: string) {
+    setGameId(gid);
+    const g = upcoming.find((x) => x.game_id === gid);
+    if (!g) return;
+    if (g.home) setHome(g.home);
+    if (g.away) setAway(g.away);
+    if (g.spread_line != null) setSpread(String(-g.spread_line)); // nflverse spread_line = home expected margin (+ = home favored)
+    if (g.total_line != null) setTotal(String(g.total_line));
+  }
+  // EV per $1 stake from a model probability and American odds.
+  const ev = (p: number, odds: string) => {
+    const dec = americanToDecimal(Number(odds) || 0);
+    return dec > 1 ? p * (dec - 1) - (1 - p) : 0;
+  };
+
   const teamSelect = (value: string, onChange: (v: string) => void, label: string) => (
     <label className="text-xs text-gray-500">
       {label}
@@ -410,6 +431,20 @@ function GameProjections({ sport }: { sport: string }) {
   return (
     <div className="space-y-4">
       <Card className="space-y-4">
+        {upcoming.length > 0 && (
+          <select
+            value={gameId}
+            onChange={(e) => pickGame(e.target.value)}
+            className="w-full bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
+          >
+            <option value="">Pick an upcoming game to autofill teams{sport === "nfl" ? " + market lines" : ""}…</option>
+            {upcoming.map((g) => (
+              <option key={g.game_id} value={g.game_id}>
+                {g.away} @ {g.home}{g.date ? ` · ${g.date}` : ""}{g.spread_line != null ? ` · ${g.home} ${-g.spread_line}` : ""}
+              </option>
+            ))}
+          </select>
+        )}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 items-end">
           {teamSelect(away, setAway, "Away")}
           {teamSelect(home, setHome, "Home")}
@@ -456,6 +491,39 @@ function GameProjections({ sport }: { sport: string }) {
           </>
         )}
       </Card>
+
+      {d && d.cover_prob != null && d.over_prob != null && (
+        <Card className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h3 className="font-medium text-sm">Edge &amp; EV vs market</h3>
+            <span className="text-xs text-gray-500">model probability vs the price you pay</span>
+            <label className="text-xs text-gray-500 ml-auto">Spread odds<Input type="number" value={spreadOdds} onChange={setSpreadOdds} className="w-20 ml-1" /></label>
+            <label className="text-xs text-gray-500">Total odds<Input type="number" value={totalOdds} onChange={setTotalOdds} className="w-20 ml-1" /></label>
+          </div>
+          <Table head={<tr><Th>Bet</Th><Th className="text-right">Model</Th><Th className="text-right">Implied</Th><Th className="text-right">Edge</Th><Th className="text-right">EV / $1</Th></tr>}>
+            {[
+              { label: `${d.home} ${Number(spread) <= 0 ? spread : "+" + spread} (cover)`, p: d.cover_prob, odds: spreadOdds },
+              { label: `${d.away} ${-Number(spread) <= 0 ? -Number(spread) : "+" + -Number(spread)} (cover)`, p: 1 - d.cover_prob, odds: spreadOdds },
+              { label: `Over ${total}`, p: d.over_prob, odds: totalOdds },
+              { label: `Under ${total}`, p: 1 - d.over_prob, odds: totalOdds },
+            ].map((r, i) => {
+              const implied = americanToImpliedProb(Number(r.odds) || 0);
+              const edge = r.p - implied;
+              const e = ev(r.p, r.odds);
+              return (
+                <tr key={i} className="border-t border-glass">
+                  <Td>{r.label}</Td>
+                  <Td className="text-right font-mono">{formatPct(r.p)}</Td>
+                  <Td className="text-right font-mono text-gray-400">{formatPct(implied)}</Td>
+                  <Td className={clsx("text-right font-mono", edge > 0 ? "text-emerald-light" : "text-gray-500")}>{edge >= 0 ? "+" : ""}{formatPct(edge)}</Td>
+                  <Td className={clsx("text-right font-mono", e > 0 ? "text-emerald-light" : "text-crimson-light")}>{e >= 0 ? "+" : ""}{(e * 100).toFixed(1)}%</Td>
+                </tr>
+              );
+            })}
+          </Table>
+          <div className="text-[11px] text-gray-500">+EV (green) = model probability beats the break-even implied by the price. The NFL backtest shows a total-points model rarely beats the closing line, so treat edges skeptically.</div>
+        </Card>
+      )}
 
       {d && (
         <div className="grid md:grid-cols-2 gap-4">
