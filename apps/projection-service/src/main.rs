@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
+mod market;
 mod nba;
 mod nba_teams;
 mod nhl;
@@ -610,6 +611,8 @@ async fn main() -> std::io::Result<()> {
             .route("/games/nfl", web::get().to(teams::list_games))
             .route("/matchup/nfl", web::get().to(teams::matchup))
             .route("/backtest/nfl", web::get().to(teams::backtest))
+            .route("/market/{sport}/games", web::get().to(market::games))
+            .route("/market/{sport}/props/{stat}", web::get().to(market::props))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
             .route("/ingest/nhl/goalies", web::post().to(nhl::ingest_goalies))
             .route("/stats/nhl", web::get().to(nhl::list_stats))
