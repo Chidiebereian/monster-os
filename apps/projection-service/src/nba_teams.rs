@@ -182,10 +182,14 @@ pub async fn list_ratings(state: web::Data<State>) -> impl Responder {
 pub struct GamesQuery { season: Option<i32>, status: Option<String>, limit: Option<i64> }
 pub async fn list_games(state: web::Data<State>, q: web::Query<GamesQuery>) -> impl Responder {
     let limit = q.limit.unwrap_or(400).clamp(1, 2000);
-    let sql = "SELECT game_id, season, week, game_type, game_date, home_team, away_team, home_score, away_score, status \
-               FROM sports_games WHERE sport='nba' AND ($1::int IS NULL OR season=$1) AND ($2::text IS NULL OR status=$2) \
-               ORDER BY game_date ASC NULLS LAST, game_id LIMIT $3";
-    match state.db.query(sql, &[&q.season, &q.status, &limit]).await {
+    // Only real NBA teams (exclude global/exhibition placeholders like LON) by
+    // requiring both sides to have a fitted rating.
+    let sql = "SELECT g.game_id, g.season, g.week, g.game_type, g.game_date, g.home_team, g.away_team, g.home_score, g.away_score, g.status \
+               FROM sports_games g WHERE g.sport='nba' AND ($1::int IS NULL OR g.season=$1) AND ($2::text IS NULL OR g.status=$2) \
+                 AND EXISTS (SELECT 1 FROM team_components tc WHERE tc.sport='nba' AND tc.model_id=$4 AND tc.component='points_off' AND tc.team=g.home_team) \
+                 AND EXISTS (SELECT 1 FROM team_components tc WHERE tc.sport='nba' AND tc.model_id=$4 AND tc.component='points_off' AND tc.team=g.away_team) \
+               ORDER BY g.game_date ASC NULLS LAST, g.game_id LIMIT $3";
+    match state.db.query(sql, &[&q.season, &q.status, &limit, &TEAM_MODEL]).await {
         Ok(rows) => {
             let out: Vec<Value> = rows.iter().map(|r| json!({
                 "game_id": r.get::<_, String>("game_id"), "season": r.get::<_, Option<i32>>("season"),
