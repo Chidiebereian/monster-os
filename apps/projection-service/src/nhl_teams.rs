@@ -98,7 +98,7 @@ pub async fn ingest_teams(state: web::Data<State>, q: web::Query<IngestQuery>) -
     if teams.is_empty() { return internal("no teams"); }
 
     // fetch per-team game logs concurrently -> (team, opp, home, season, goals)
-    let rows: Vec<(String, String, bool, i32, f64)> = stream::iter(teams.clone())
+    let rows: Vec<(String, String, bool, i32, f64, String)> = stream::iter(teams.clone())
         .map(|abbr| {
             let http = http.clone();
             async move {
@@ -111,9 +111,13 @@ pub async fn ingest_teams(state: web::Data<State>, q: web::Query<IngestQuery>) -
         .buffer_unordered(q.concurrency).collect::<Vec<_>>().await.into_iter().flatten().collect();
     if rows.len() < 100 { return internal("not enough team-game rows"); }
 
+    // Persist historical games into sports_games (home perspective + away score)
+    // so the walk-forward backtest has NHL history to train/test on.
+    if let Err(e) = store_games(&state.db, &rows).await { return internal(e); }
+
     // team index
     let mut idx: HashMap<String, usize> = HashMap::new();
-    for (t, o, _, _, _) in &rows {
+    for (t, o, _, _, _, _) in &rows {
         let n = idx.len(); idx.entry(t.clone()).or_insert(n);
         let n = idx.len(); idx.entry(o.clone()).or_insert(n);
     }
@@ -121,7 +125,7 @@ pub async fn ingest_teams(state: web::Data<State>, q: web::Query<IngestQuery>) -
     let names: Vec<String> = { let mut v = vec![String::new(); tn]; for (k, &i) in &idx { v[i] = k.clone(); } v };
     let max_season = rows.iter().map(|r| r.3).max().unwrap_or(0) as f64;
 
-    let obs: Vec<Obs> = rows.iter().map(|(t, o, home, season, goals)| Obs {
+    let obs: Vec<Obs> = rows.iter().map(|(t, o, home, season, goals, _)| Obs {
         y: *goals, team: idx[t], opp: idx[o], home: if *home { 1.0 } else { 0.0 },
         w: 0.5f64.powf((max_season - *season as f64) / q.halflife_seasons),
     }).collect();
@@ -188,7 +192,7 @@ fn norm(t: &str) -> String {
     }.to_string()
 }
 
-fn parse_team(text: &str) -> Vec<(String, String, bool, i32, f64)> {
+fn parse_team(text: &str) -> Vec<(String, String, bool, i32, f64, String)> {
     let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(text.as_bytes());
     let Ok(headers) = rdr.headers() else { return Vec::new() };
     let headers = headers.clone();
@@ -196,15 +200,53 @@ fn parse_team(text: &str) -> Vec<(String, String, bool, i32, f64)> {
     let (Some(i_sit), Some(i_team), Some(i_opp), Some(i_home), Some(i_season), Some(i_gf)) =
         (idx("situation"), idx("playerTeam"), idx("opposingTeam"), idx("home_or_away"), idx("season"), idx("goalsFor"))
     else { return Vec::new() };
+    let i_date = idx("gameDate");
     let mut out = Vec::new();
     for rec in rdr.records().flatten() {
         if rec.get(i_sit) != Some("all") { continue; }
         let goals = rec.get(i_gf).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let season: i32 = rec.get(i_season).and_then(|s| s.parse().ok()).unwrap_or(0);
         let home = rec.get(i_home).map(|s| s.eq_ignore_ascii_case("HOME")).unwrap_or(false);
-        out.push((norm(rec.get(i_team).unwrap_or("")), norm(rec.get(i_opp).unwrap_or("")), home, season, goals));
+        let date = i_date.and_then(|i| rec.get(i)).unwrap_or("").to_string();
+        out.push((norm(rec.get(i_team).unwrap_or("")), norm(rec.get(i_opp).unwrap_or("")), home, season, goals, date));
     }
     out
+}
+
+/// Pair the per-team MoneyPuck rows into one game row (home + away score) and
+/// persist completed games into sports_games for backtesting.
+async fn store_games(db: &tokio_postgres::Client, rows: &[(String, String, bool, i32, f64, String)]) -> Result<(), String> {
+    let mut games: HashMap<(String, String, String), (i32, Option<f64>, Option<f64>)> = HashMap::new();
+    for (team, opp, home, season, goals, date) in rows {
+        if date.is_empty() { continue; }
+        if *home {
+            let e = games.entry((date.clone(), team.clone(), opp.clone())).or_insert((*season, None, None));
+            e.0 = *season; e.1 = Some(*goals);
+        } else {
+            let e = games.entry((date.clone(), opp.clone(), team.clone())).or_insert((*season, None, None));
+            e.0 = *season; e.2 = Some(*goals);
+        }
+    }
+    let (mut gid, mut season, mut week, mut gtype, mut gdate, mut home_v, mut away_v, mut hs, mut as_, mut status) =
+        (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    for ((date, h, a), (s, hsc, asc)) in &games {
+        let (Some(hsc), Some(asc)) = (hsc, asc) else { continue };
+        gid.push(format!("mp_{date}_{a}_{h}"));
+        season.push(*s);
+        week.push(date.clone());
+        gtype.push("REG".to_string());
+        gdate.push(chrono::NaiveDate::parse_from_str(date, "%Y%m%d").or_else(|_| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")).ok());
+        home_v.push(h.clone()); away_v.push(a.clone());
+        hs.push(*hsc as i32); as_.push(*asc as i32);
+        status.push("final".to_string());
+    }
+    if gid.is_empty() { return Ok(()); }
+    db.execute(
+        "INSERT INTO sports_games (sport, game_id, season, week, game_type, game_date, home_team, away_team, home_score, away_score, status) \
+         SELECT 'nhl', * FROM UNNEST($1::text[],$2::int[],$3::text[],$4::text[],$5::date[],$6::text[],$7::text[],$8::int[],$9::int[],$10::text[]) \
+         ON CONFLICT (sport, game_id) DO UPDATE SET home_score=EXCLUDED.home_score, away_score=EXCLUDED.away_score, status=EXCLUDED.status, game_date=EXCLUDED.game_date, season=EXCLUDED.season",
+        &[&gid, &season, &week, &gtype, &gdate, &home_v, &away_v, &hs, &as_, &status],
+    ).await.map(|_| ()).map_err(|e| format!("store nhl games: {e}"))
 }
 
 async fn store(db: &tokio_postgres::Client, names: &[String], off: &[f64], def: &[f64], ha: f64, ic: f64, disp: f64) -> Result<(), String> {

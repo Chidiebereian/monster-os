@@ -29,6 +29,8 @@ use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
 mod market;
+mod team_model;
+mod player_backtest;
 mod nba;
 mod nba_teams;
 mod nhl;
@@ -77,7 +79,7 @@ pub(crate) struct StatDef {
     pub(crate) unit: &'static str,
 }
 
-const NFL_STATS: &[StatDef] = &[
+pub(crate) const NFL_STATS: &[StatDef] = &[
     StatDef { key: "pass_td",      label: "Passing TDs",      column: "passing_tds",    opportunity: "attempts", family: Family::Count,      unit: "TDs" },
     StatDef { key: "pass_yds",     label: "Passing Yards",    column: "passing_yards",  opportunity: "attempts", family: Family::Continuous, unit: "yds" },
     StatDef { key: "pass_att",     label: "Pass Attempts",    column: "attempts",       opportunity: "attempts", family: Family::Count,      unit: "att" },
@@ -610,7 +612,8 @@ async fn main() -> std::io::Result<()> {
             .route("/teams/nfl", web::get().to(teams::list_ratings))
             .route("/games/nfl", web::get().to(teams::list_games))
             .route("/matchup/nfl", web::get().to(teams::matchup))
-            .route("/backtest/nfl", web::get().to(teams::backtest))
+            .route("/backtest/{sport}", web::get().to(team_model::backtest))
+            .route("/backtest/player/{sport}/{stat}", web::get().to(player_backtest::backtest_q))
             .route("/market/{sport}/games", web::get().to(market::games))
             .route("/market/{sport}/props/{stat}", web::get().to(market::props))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
