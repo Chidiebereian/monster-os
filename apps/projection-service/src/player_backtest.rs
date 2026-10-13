@@ -6,8 +6,6 @@
 //! average. No historical prop lines are stored, so this measures predictive
 //! QUALITY (calibration/accuracy), not ATS vs a market.
 
-use std::collections::HashMap;
-
 use actix_web::{web, HttpResponse, Responder};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,10 +36,6 @@ fn d_test_games() -> usize { 15 }
 fn d_prior_k() -> f64 { 8.0 }
 fn d_halflife() -> f64 { 40.0 }
 fn d_min_games() -> usize { 30 }
-
-pub async fn backtest(state: web::Data<State>, path: web::Path<(String, String)>) -> impl Responder {
-    backtest_q(state, path, web::Query(Query { min_train: d_min_train(), test_games: d_test_games(), prior_k: d_prior_k(), halflife: d_halflife(), min_games: d_min_games() })).await
-}
 
 pub async fn backtest_q(state: web::Data<State>, path: web::Path<(String, String)>, q: web::Query<Query>) -> impl Responder {
     let (sport, stat) = path.into_inner();

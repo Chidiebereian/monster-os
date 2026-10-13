@@ -135,8 +135,12 @@ fn recency_weight(age: f64, halflife: f64) -> f64 {
     0.5f64.powf(age / halflife)
 }
 
-/// COUNT: empirical-Bayes Gamma-Poisson. Posterior predictive is Negative-Binomial
-/// (mean = posterior rate, var = rate*(1 + 1/beta)).
+/// COUNT: empirical-Bayes Negative-Binomial. The mean is shrunk toward the
+/// league rate; the predictive variance is the player's EMPIRICAL recency-
+/// weighted game-to-game variance (inflated for parameter uncertainty), floored
+/// at the Poisson minimum (var >= mean). This captures real overdispersion for
+/// high-variance counts (e.g. NBA points) that the pure Gamma-Poisson predictive
+/// badly underestimated. The NB size `r` is back-solved so a draw matches.
 pub(crate) fn fit_count(values_oldest_first: &[f64], league_rate: f64, prior_k: f64, halflife: f64) -> Projection {
     let n = values_oldest_first.len();
     let newest = (n - 1) as f64;
@@ -146,14 +150,22 @@ pub(crate) fn fit_count(values_oldest_first: &[f64], league_rate: f64, prior_k: 
         sw += w;
         swy += w * y;
     }
-    let alpha = league_rate * prior_k + swy;
-    let beta = prior_k + sw;
-    let rate = alpha / beta;
-    let var = rate * (1.0 + 1.0 / beta);
+    let wmean = if sw > 0.0 { swy / sw } else { league_rate };
+    let mut swv = 0.0;
+    for (i, &y) in values_oldest_first.iter().enumerate() {
+        swv += recency_weight(newest - i as f64, halflife) * (y - wmean).powi(2);
+    }
+    let game_var = if sw > 0.0 { swv / sw } else { wmean };
+    // EB shrinkage of the mean toward the league baseline
+    let mean = (prior_k * league_rate + sw * wmean) / (prior_k + sw);
+    // predictive var = game-to-game var + parameter uncertainty, never below Poisson
+    let pred_var = (game_var * (1.0 + 1.0 / (prior_k + sw))).max(mean.max(1e-6));
+    // Negative-Binomial size that reproduces this mean/variance (var = mean + mean^2/r)
+    let dispersion = if pred_var > mean + 1e-9 { (mean * mean / (pred_var - mean)).clamp(0.1, 1e6) } else { 1e6 };
     Projection {
-        proj_mean: rate,
-        proj_sd: var.sqrt(),
-        dispersion: alpha,
+        proj_mean: mean,
+        proj_sd: pred_var.sqrt(),
+        dispersion,
         career_mean: values_oldest_first.iter().sum::<f64>() / n as f64,
         recent_mean: recent_mean(values_oldest_first),
         sample_games: n as i32,
