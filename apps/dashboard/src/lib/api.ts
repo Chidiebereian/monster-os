@@ -94,6 +94,8 @@ export const api = {
   marketGames: (sport: string) => getJson<{ sport: string; count: number; games: MarketGame[] }>(`/projection-service/market/${sport}/games`),
   marketProps: (sport: string, stat: string) => getJson<{ sport: string; stat: string; count: number; props: MarketProp[] }>(`/projection-service/market/${sport}/props/${stat}`),
   backtest: (sport = "nfl", opts: { from?: number; to?: number } = {}) => getJson<Backtest>(`/projection-service/backtest/${sport}?${qs(opts)}`),
+  playerBacktest: (sport: string, stat: string, opts: { test_games?: number; min_games?: number } = {}) =>
+    getJson<PlayerBacktest>(`/projection-service/backtest/player/${sport}/${stat}?${qs(opts)}`),
   matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
 
@@ -194,8 +196,16 @@ export interface MarketProp {
   player: string; player_id: string | null; team: string | null;
   line: number | null; over_odds: number | null; under_odds: number | null;
 }
+export interface PlayerBacktest {
+  sport: string; stat: string; label: string; unit: string; family: string;
+  method: string; players: number; samples: number;
+  model: { mae: number; rmse: number; bias: number; coverage_80: number; coverage_90: number };
+  baseline_career_avg: { mae: number; rmse: number };
+  note: string;
+}
 export interface Backtest {
   model: string; method: string; test_seasons: string; games: number;
+  has_market_lines?: boolean;
   straight_up_accuracy: number; brier_score: number;
   ats_vs_closing_line: { record: string; pct: number };
   plus_ev_subset: { record: string; pct: number; note: string };
