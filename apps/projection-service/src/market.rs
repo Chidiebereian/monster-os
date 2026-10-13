@@ -24,16 +24,38 @@ fn league(sport: &str) -> Option<&'static str> {
 }
 
 /// our stat key -> SportsGameOdds statID (per sport); None = no mapped market.
+/// statIDs verified against live SGO events (2026-10).
 fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
     match (sport, key) {
-        ("nba", "points") => Some("points"), ("nba", "rebounds") => Some("rebounds"), ("nba", "assists") => Some("assists"),
-        ("nba", "threes") => Some("threePointersMade"), ("nba", "steals") => Some("steals"), ("nba", "blocks") => Some("blocks"),
+        // NBA
+        ("nba", "points") => Some("points"),
+        ("nba", "rebounds") => Some("rebounds"),
+        ("nba", "assists") => Some("assists"),
+        ("nba", "threes") => Some("threePointersMade"),
+        ("nba", "steals") => Some("steals"),
+        ("nba", "blocks") => Some("blocks"),
         ("nba", "turnovers") => Some("turnovers"),
-        ("nfl", "pass_yds") => Some("passing_yards"), ("nfl", "rush_yds") => Some("rushing_yards"),
-        ("nfl", "rec_yds") => Some("receiving_yards"), ("nfl", "receptions") => Some("receptions"),
-        ("nfl", "pass_td") => Some("passing_touchdowns"), ("nfl", "interceptions") => Some("passing_interceptions"),
-        ("nhl", "shots") => Some("shots_on_goal"), ("nhl", "goals") => Some("goals"), ("nhl", "assists") => Some("assists"),
-        ("nhl", "points") => Some("points"), ("nhl", "saves") => Some("saves"),
+        // NFL
+        ("nfl", "pass_yds") => Some("passing_yards"),
+        ("nfl", "pass_td") => Some("passing_touchdowns"),
+        ("nfl", "pass_att") => Some("passing_attempts"),
+        ("nfl", "completions") => Some("passing_completions"),
+        ("nfl", "interceptions") => Some("passing_interceptions"),
+        ("nfl", "rush_yds") => Some("rushing_yards"),
+        ("nfl", "carries") => Some("rushing_attempts"),
+        ("nfl", "rush_td") => Some("rushing_touchdowns"),
+        ("nfl", "rec_yds") => Some("receiving_yards"),
+        ("nfl", "receptions") => Some("receiving_receptions"),
+        ("nfl", "targets") => Some("receiving_targets"),
+        ("nfl", "rec_td") => Some("receiving_touchdowns"),
+        // NHL (shots = shots on goal; saves/GA are goalie markets)
+        ("nhl", "shots") => Some("shots_onGoal"),
+        ("nhl", "assists") => Some("assists"),
+        ("nhl", "points") => Some("points"),
+        ("nhl", "hits") => Some("hits"),
+        ("nhl", "toi") => Some("minutesPlayed"),
+        ("nhl", "saves") => Some("goalie_saves"),
+        ("nhl", "goals_against") => Some("goalie_goalsAgainst"),
         _ => None,
     }
 }
