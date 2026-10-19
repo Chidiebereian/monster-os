@@ -18,6 +18,7 @@ pub(crate) fn stat_def(sport: &str, key: &str) -> Option<&'static StatDef> {
         "nfl" => &[NFL_STATS],
         "nhl" => &[crate::nhl::NHL_STATS, crate::nhl::GOALIE_STATS],
         "nba" => &[crate::nba::NBA_STATS],
+        "mlb" => &[crate::mlb::MLB_BATTER_STATS, crate::mlb::MLB_PITCHER_STATS],
         _ => &[],
     };
     regs.iter().flat_map(|r| r.iter()).find(|s| s.key == key)

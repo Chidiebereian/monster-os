@@ -67,7 +67,18 @@ const PROJ_SPORTS: SportDef[] = [
       { key: "ra", label: "Reb+Ast", unit: "R+A", model: "nba-ra-v1" },
     ],
   },
-  { sport: "mlb", label: "MLB", stats: [] },
+  {
+    sport: "mlb",
+    label: "MLB",
+    stats: [
+      ["hits", "Hits", "H"], ["total_bases", "Total Bases", "TB"], ["home_runs", "Home Runs", "HR"], ["runs", "Runs", "R"],
+      ["rbi", "RBI", "RBI"], ["hrr", "Hits+Runs+RBI", "H+R+RBI"], ["singles", "Singles", "1B"], ["doubles", "Doubles", "2B"],
+      ["walks", "Walks", "BB"], ["batter_k", "Batter K", "K"], ["stolen_bases", "Stolen Bases", "SB"],
+      ["pitcher_k", "Pitcher K (SP)", "K"], ["outs", "Outs (SP)", "outs"], ["hits_allowed", "Hits Allowed (SP)", "H"],
+      ["earned_runs", "Earned Runs (SP)", "ER"], ["walks_allowed", "Walks Allowed (SP)", "BB"], ["batters_faced", "Batters Faced (SP)", "BF"],
+      ["hr_allowed", "HR Allowed (SP)", "HR"], ["pitches", "Pitch Count (SP)", "P"],
+    ].map(([key, label, unit]) => ({ key, label, unit, model: `mlb-${key}-v1` })),
+  },
 ];
 
 export function Projections() {
@@ -113,7 +124,7 @@ export function Projections() {
         sportKey === "nfl" || sportKey === "nhl" || sportKey === "nba" ? (
           <GameProjections sport={sportKey} />
         ) : (
-          <Msg>{sport.label} team model is in the pipeline. NFL, NHL and NBA game projections are live now.</Msg>
+          <Msg>{sportKey === "mlb" ? <>MLB game projections come from the plate-appearance simulator — open <a href="/mlb-sim" className="text-violet-light underline">MLB Game Sim</a>.</> : <>{sport.label} team model is in the pipeline. NFL, NHL and NBA game projections are live now.</>}</Msg>
         )
       ) : sport.stats.length === 0 || !stat ? (
         <Msg>{sport.label} player models are in the pipeline. NFL passing TDs is live now — pick NFL above.</Msg>

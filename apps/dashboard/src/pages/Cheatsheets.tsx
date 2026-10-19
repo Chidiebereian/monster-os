@@ -10,6 +10,7 @@ const SPORTS = [
   { key: "nba", label: "NBA" },
   { key: "nfl", label: "NFL" },
   { key: "nhl", label: "NHL" },
+  { key: "mlb", label: "MLB" },
 ];
 
 // Cheat sheets: every live line graded by how often it has hit (L5/L10/L20,

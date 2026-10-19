@@ -107,6 +107,12 @@ export const api = {
     getJson<PropsCheatsheet>(`/projection-service/cheatsheet/${sport}/props?${qs(opts)}`),
   gamesCheatsheet: (sport: string) => getJson<GamesCheatsheet>(`/projection-service/cheatsheet/${sport}/games`),
 
+  // --- MLB game simulator (projection-service) ---
+  mlbSlate: (days = 7) => getJson<MlbSlate>(`/projection-service/mlb/slate?${qs({ days })}`),
+  mlbSimulate: (gamePk: number | string, opts: { n?: number; seed?: number; away_sp?: string; home_sp?: string; away_lineup?: string; home_lineup?: string } = {}) =>
+    getJson<MlbSim>(`/projection-service/mlb/simulate/${gamePk}?${qs(opts)}`),
+  mlbBacktests: () => getJson<{ sport: string; runs: MlbBacktest[] }>(`/projection-service/mlb/backtests`),
+
   // --- monster-gpt ---
   ask: (question: string, context?: unknown) =>
     postJson<{ answer: string; model: string; retrieved: boolean }>(`/monster-gpt/ask`, { question, context }),
@@ -288,3 +294,64 @@ export interface GameRow {
   market: MarketGame | null; home_team: GameSide; away_team: GameSide;
 }
 export interface GamesCheatsheet { sport: string; source: "market" | "schedule"; count: number; games: GameRow[]; note: string; }
+
+// --- MLB game simulator ---
+export interface MlbSlateGame {
+  game_pk: number; date: string; start: string; status: string; game_type: string; away: string; home: string; venue: string | null;
+  away_probable: { id: number; name: string } | null; home_probable: { id: number; name: string } | null;
+  lineups_posted: { away: boolean; home: boolean };
+}
+export interface MlbSlate { sport: string; from: string; to: string; count: number; games: MlbSlateGame[]; }
+export interface MlbLine { line: number; over: number; under: number; push: number; mcse: number; }
+export interface MlbDist { mean: number; median: number; sd: number; p10: number; p90: number; p025: number; p975: number; pmf: number[]; lines: MlbLine[]; }
+export interface MlbBatter { slot: number; player_id: string; name: string; position: string | null; stats: Record<string, MlbDist>; }
+export interface MlbSide {
+  team: string; runs: MlbDist;
+  starter: { player_id: string; name: string; stats: Record<string, MlbDist> };
+  batters: MlbBatter[];
+}
+export interface MlbSideInputs {
+  team: string; lineup_source: string; starter_source: string;
+  lineup: { player_id: string; games: number; eff_pa: number; rates: number[] }[];
+  starter: { player_id: string; appearances: number; eff_bf: number; starts_for_hook: number; rates: number[] };
+  bullpen: { relief_appearances: number; rates: number[] };
+  bat_env: number[];
+}
+export interface MlbSim {
+  sim_id: string;
+  game: { game_pk: string; date: string; season: number; game_type: string; away: string; home: string; venue: string | null; status: string; start: string };
+  simulation: {
+    model_version: string; params_season: number; requested: number; valid: number; rejected: number; parameter_draws: number;
+    seed: string; seed_strategy: string; production_grade: boolean; sim_ms: number; total_ms: number; data_cutoff: string;
+    extra_inning_rate: number; note: string;
+    provenance: { sim_params: string; sim_params_fitted_at: string; baserunning: string | null; baserunning_source: string | null };
+  };
+  team: {
+    home_win: number; away_win: number; home_runline_minus_1_5: number; away_runline_plus_1_5: number;
+    away_runline_minus_1_5: number; home_runline_plus_1_5: number; total: MlbDist; totals: MlbLine[];
+  };
+  away: MlbSide; home: MlbSide;
+  inputs: { away: MlbSideInputs; home: MlbSideInputs };
+  flags: string[]; limitations: string[];
+}
+export interface MlbBinaryReport {
+  market: string; n: number; base_rate: number;
+  model: { brier: number; log_loss: number; mean_pred: number; ece: number };
+  baseline: { name: string; brier: number; log_loss: number };
+  brier_diff_model_minus_baseline: number; brier_diff_se: number;
+  calibration: { bucket: string; n: number; mean_pred: number; observed: number }[];
+}
+export interface MlbNumericReport {
+  stat: string; n: number; actual_mean: number;
+  model: { mae: number; rmse: number; bias: number; coverage_80: number };
+  baseline: { name: string; mae: number; rmse: number };
+  by_prediction_tercile: { n: number; mean_pred: number; mean_actual: number; baseline_mean: number }[];
+}
+export interface MlbBacktest {
+  season: number; window: [string, string]; games_simulated: number; sims_per_game: number; research_mode: boolean; run_at: string;
+  settings: Record<string, number>; provenance: { sim_params: string; baserunning: string | null };
+  method: string; baselines: { team: string; player: string };
+  team: MlbBinaryReport[]; batter: MlbBinaryReport[]; pitcher: MlbBinaryReport[];
+  team_numeric: MlbNumericReport[]; batter_numeric: MlbNumericReport[]; pitcher_numeric: MlbNumericReport[];
+  notes: string[];
+}

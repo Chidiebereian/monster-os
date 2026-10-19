@@ -61,6 +61,25 @@ pub(crate) fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
         ("nhl", "toi") => Some("minutesPlayed"),
         ("nhl", "saves") => Some("goalie_saves"),
         ("nhl", "goals_against") => Some("goalie_goalsAgainst"),
+        // MLB: SGO's batting_/pitching_ naming. NOT yet verified against live
+        // events (amateur tier was rate-limited, 2026-10-19); a wrong ID just
+        // yields no line, never a fabricated one.
+        ("mlb", "hits") => Some("batting_hits"),
+        ("mlb", "total_bases") => Some("batting_totalBases"),
+        ("mlb", "home_runs") => Some("batting_homeRuns"),
+        ("mlb", "runs") => Some("batting_runs"),
+        ("mlb", "rbi") => Some("batting_RBI"),
+        ("mlb", "hrr") => Some("batting_hits+runs+rbi"),
+        ("mlb", "singles") => Some("batting_singles"),
+        ("mlb", "doubles") => Some("batting_doubles"),
+        ("mlb", "walks") => Some("batting_basesOnBalls"),
+        ("mlb", "batter_k") => Some("batting_strikeouts"),
+        ("mlb", "stolen_bases") => Some("batting_stolenBases"),
+        ("mlb", "pitcher_k") => Some("pitching_strikeouts"),
+        ("mlb", "outs") => Some("pitching_outs"),
+        ("mlb", "hits_allowed") => Some("pitching_hits"),
+        ("mlb", "earned_runs") => Some("pitching_earnedRuns"),
+        ("mlb", "walks_allowed") => Some("pitching_basesOnBalls"),
         _ => None,
     }
 }

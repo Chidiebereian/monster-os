@@ -42,6 +42,7 @@ fn registry(sport: &str) -> &'static [&'static [StatDef]] {
         "nfl" => &[crate::NFL_STATS],
         "nhl" => &[crate::nhl::NHL_STATS, crate::nhl::GOALIE_STATS],
         "nba" => &[crate::nba::NBA_STATS],
+        "mlb" => &[crate::mlb::MLB_BATTER_STATS, crate::mlb::MLB_PITCHER_STATS],
         _ => &[],
     }
 }

@@ -9,6 +9,7 @@ const SPORTS = [
   { key: "nba", label: "NBA" },
   { key: "nfl", label: "NFL" },
   { key: "nhl", label: "NHL" },
+  { key: "mlb", label: "MLB" },
 ];
 
 // Hit Rates: look up any player prop or team line and see how often it has

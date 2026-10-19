@@ -34,6 +34,8 @@ mod team_model;
 mod player_backtest;
 mod nba;
 mod nba_teams;
+mod mlb;
+mod mlb_sim;
 mod nhl;
 mod nhl_teams;
 mod teams;
@@ -643,6 +645,17 @@ async fn main() -> std::io::Result<()> {
             .route("/teams/nhl", web::get().to(nhl_teams::list_ratings))
             .route("/games/nhl", web::get().to(nhl_teams::list_games))
             .route("/matchup/nhl", web::get().to(nhl_teams::matchup))
+            .route("/ingest/mlb", web::post().to(mlb::ingest))
+            .route("/fit/mlb", web::post().to(mlb::fit))
+            .route("/stats/mlb", web::get().to(mlb::list_stats))
+            .route("/projections/mlb/{stat}", web::get().to(mlb::list_stat))
+            .route("/projections/mlb/{stat}/{player_id}", web::get().to(mlb::get_player_stat))
+            .route("/mlb/slate", web::get().to(mlb::slate))
+            .route("/mlb/simulate/{game_pk}", web::get().to(mlb::simulate))
+            .route("/mlb/sims/{sim_id}", web::get().to(mlb::get_sim))
+            .route("/mlb/params", web::get().to(mlb::params))
+            .route("/backtest/mlb/sim", web::get().to(mlb::backtest))
+            .route("/mlb/backtests", web::get().to(mlb::latest_backtest))
             .route("/ingest/nba", web::post().to(nba::ingest_nba))
             .route("/fit/nba", web::post().to(nba::fit_nba))
             .route("/stats/nba", web::get().to(nba::list_stats))
