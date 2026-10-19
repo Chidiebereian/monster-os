@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge } from "lucide-react";
+import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target } from "lucide-react";
 import clsx from "clsx";
 import { SPORTS, useSettings } from "../store/settings";
 
@@ -7,6 +7,8 @@ const NAV = [
   { to: "/odds", label: "Odds Screen", icon: Activity },
   { to: "/ev", label: "+EV Finder", icon: TrendingUp },
   { to: "/projections", label: "Projections", icon: BarChart3 },
+  { to: "/cheatsheets", label: "Cheat Sheets", icon: ClipboardList },
+  { to: "/hit-rates", label: "Hit Rates", icon: Target },
   { to: "/arbitrage", label: "Arbitrage", icon: Scale },
   { to: "/whale-watch", label: "Whale Watch", icon: Waves },
   { to: "/signals", label: "Smart Signals", icon: Radar },

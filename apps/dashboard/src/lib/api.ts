@@ -98,6 +98,14 @@ export const api = {
     getJson<PlayerBacktest>(`/projection-service/backtest/player/${sport}/${stat}?${qs(opts)}`),
   matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
+  statList: (sport: string) => getJson<{ sport: string; stats: { key: string; label: string; unit: string; family: string }[] }>(`/projection-service/stats/${sport}`),
+  playerHitRates: (sport: string, playerId: string, opts: { stat: string; line?: number; opponent?: string; games?: number }) =>
+    getJson<PlayerHitRates>(`/projection-service/hitrates/${sport}/player/${playerId}?${qs(opts)}`),
+  teamHitRates: (sport: string, team: string, opts: { spread?: number; total?: number; team_total?: number; opponent?: string; games?: number } = {}) =>
+    getJson<TeamHitRates>(`/projection-service/hitrates/${sport}/team/${team}?${qs(opts)}`),
+  propsCheatsheet: (sport: string, opts: { stat?: string; source?: string; sort?: string; side?: string; min_games?: number; limit?: number; include_lopsided?: string } = {}) =>
+    getJson<PropsCheatsheet>(`/projection-service/cheatsheet/${sport}/props?${qs(opts)}`),
+  gamesCheatsheet: (sport: string) => getJson<GamesCheatsheet>(`/projection-service/cheatsheet/${sport}/games`),
 
   // --- monster-gpt ---
   ask: (question: string, context?: unknown) =>
@@ -228,3 +236,55 @@ export interface Matchup {
 }
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number; }
 export interface Candles { market_id: string | null; outcome_index: number | null; interval_secs: number; candles: Candle[]; }
+
+// --- hit rates + cheatsheets (projection-service) ---
+/** rate = overs / (overs + unders); pushes counted but excluded. */
+export interface HitSummary { games: number; over: number; under: number; push: number; rate: number | null; }
+export interface HitWindows {
+  l5: HitSummary; l10: HitSummary; l20: HitSummary; season: HitSummary; season_label: number | null; career: HitSummary;
+  home: HitSummary; away: HitSummary; venue: HitSummary | null; h2h: HitSummary | null;
+  streak: { side: "over" | "under" | null; games: number };
+}
+export interface PropModel {
+  mean: number; conditional_mean: number; participation: number;
+  p_over: number; p_under: number; p_push: number; edge_over: number | null; edge_under: number | null;
+}
+export interface PlayerHitRates {
+  sport: string; player_id: string; player: string | null; team: string | null; position: string | null;
+  stat: string; label: string; unit: string; family: string;
+  line: number; line_source: "query" | "projection" | "l20_average"; opponent: string | null;
+  hit_rates: HitWindows;
+  averages: { l5: number | null; l10: number | null; l20: number | null; season: number | null; career: number | null };
+  model: PropModel | null;
+  log: { season: number; week: string; date: string | null; opponent: string; home: boolean | null; value: number; result: "over" | "under" | "push" }[];
+}
+export interface TeamMarkets {
+  win: HitWindows | null; cover: HitWindows | null; over: HitWindows | null; team_total_over: HitWindows | null;
+  ats_closing: HitWindows | null; ou_closing: HitWindows | null;
+}
+type Split = { l5: number | null; l10: number | null; season: number | null };
+export interface TeamAverages { points_for: Split; points_against: Split; margin: Split; total: Split; }
+export interface TeamHitRates {
+  sport: string; team: string; opponent: string | null;
+  lines: { spread: number | null; total: number | null; team_total: number | null };
+  markets: TeamMarkets; averages: TeamAverages;
+  log: {
+    season: number; date: string | null; opponent: string; home: boolean; points_for: number; points_against: number;
+    margin: number; total: number; closing_spread: number | null; closing_total: number | null;
+    covered_line: boolean | null; over_line: boolean | null;
+  }[];
+  note: string;
+}
+export interface PropRow {
+  player: string; player_id: string; team: string | null; opponent: string | null; home: boolean | null; starts_at: string | null;
+  stat: string; label: string; unit: string; line: number; over_odds: number | null; under_odds: number | null;
+  implied_over: number | null; side: "over" | "under"; side_rate: number | null; avg_l10: number | null;
+  hit_rates: HitWindows; model: PropModel | null;
+}
+export interface PropsCheatsheet { sport: string; source: string; sort: string; side: string; stats: string[]; count: number; props: PropRow[]; note: string; }
+export interface GameSide { games: number; markets: TeamMarkets; averages: TeamAverages; }
+export interface GameRow {
+  home: string; away: string; starts_at: string | null; spread_home: number | null; total: number | null;
+  market: MarketGame | null; home_team: GameSide; away_team: GameSide;
+}
+export interface GamesCheatsheet { sport: string; source: "market" | "schedule"; count: number; games: GameRow[]; note: string; }

@@ -9,6 +9,8 @@ import { WhaleWatch } from "./pages/WhaleWatch";
 import { SmartSignals } from "./pages/SmartSignals";
 import { TopTraders } from "./pages/TopTraders";
 import { Backtest } from "./pages/Backtest";
+import { Cheatsheets } from "./pages/Cheatsheets";
+import { HitRates } from "./pages/HitRates";
 import { MonsterGpt } from "./pages/MonsterGpt";
 
 const queryClient = new QueryClient({
@@ -25,6 +27,8 @@ export default function App() {
             <Route path="/odds" element={<Odds />} />
             <Route path="/ev" element={<EVFinder />} />
             <Route path="/projections" element={<Projections />} />
+            <Route path="/cheatsheets" element={<Cheatsheets />} />
+            <Route path="/hit-rates" element={<HitRates />} />
             <Route path="/arbitrage" element={<Arbitrage />} />
             <Route path="/whale-watch" element={<WhaleWatch />} />
             <Route path="/signals" element={<SmartSignals />} />
