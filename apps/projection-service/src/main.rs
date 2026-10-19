@@ -28,6 +28,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
+mod hitrates;
 mod market;
 mod team_model;
 mod player_backtest;
@@ -627,6 +628,10 @@ async fn main() -> std::io::Result<()> {
             .route("/backtest/{sport}", web::get().to(team_model::backtest))
             .route("/backtest/player/{sport}/{stat}", web::get().to(player_backtest::backtest_q))
             .route("/market/{sport}/games", web::get().to(market::games))
+            .route("/hitrates/{sport}/player/{player_id}", web::get().to(hitrates::player))
+            .route("/hitrates/{sport}/team/{team}", web::get().to(hitrates::team))
+            .route("/cheatsheet/{sport}/props", web::get().to(hitrates::cheatsheet_props))
+            .route("/cheatsheet/{sport}/games", web::get().to(hitrates::cheatsheet_games))
             .route("/market/{sport}/props/{stat}", web::get().to(market::props))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
             .route("/ingest/nhl/goalies", web::post().to(nhl::ingest_goalies))

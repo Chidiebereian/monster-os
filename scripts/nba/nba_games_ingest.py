@@ -61,7 +61,9 @@ try:
                 continue
             date = (g.get("gameDateEst") or g.get("gameDate") or "")[:10]
             fin = st == 3
-            games[gid] = {"season": season, "date": date, "type": "REG",
+            # NBA game ids: 001 preseason, 002 regular, 003 all-star, 004 playoffs, 005 play-in
+            gtype = {"001": "PRE", "003": "ASG", "004": "POST", "005": "PLAYIN"}.get(gid[:3], "REG")
+            games[gid] = {"season": season, "date": date, "type": gtype,
                           "status": "final" if fin else "scheduled",
                           "home": home, "away": away,
                           "hs": (g.get("homeTeam") or {}).get("score") if fin else None,

@@ -185,7 +185,7 @@ pub async fn ingest_teams(state: web::Data<State>, q: web::Query<IngestQuery>) -
 
 /// Normalize MoneyPuck's dotted team codes to the standard NHL abbreviations
 /// so a team's games aren't split across two identities.
-fn norm(t: &str) -> String {
+pub(crate) fn norm(t: &str) -> String {
     match t {
         "T.B" => "TBL", "N.J" => "NJD", "S.J" => "SJS", "L.A" => "LAK",
         other => other,

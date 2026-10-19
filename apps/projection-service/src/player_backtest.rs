@@ -13,7 +13,7 @@ use tokio_postgres::types::Json;
 
 use crate::{fit_continuous, fit_count, Family, State, StatDef, NFL_STATS};
 
-fn stat_def(sport: &str, key: &str) -> Option<&'static StatDef> {
+pub(crate) fn stat_def(sport: &str, key: &str) -> Option<&'static StatDef> {
     let regs: &[&[StatDef]] = match sport {
         "nfl" => &[NFL_STATS],
         "nhl" => &[crate::nhl::NHL_STATS, crate::nhl::GOALIE_STATS],

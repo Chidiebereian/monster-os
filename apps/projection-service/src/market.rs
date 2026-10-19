@@ -19,13 +19,13 @@ fn internal(m: impl std::fmt::Display) -> HttpResponse {
 }
 fn bad_request(m: impl Into<String>) -> HttpResponse { HttpResponse::BadRequest().json(json!({ "error": m.into() })) }
 
-fn league(sport: &str) -> Option<&'static str> {
+pub(crate) fn league(sport: &str) -> Option<&'static str> {
     match sport { "nfl" => Some("NFL"), "nhl" => Some("NHL"), "nba" => Some("NBA"), "mlb" => Some("MLB"), _ => None }
 }
 
 /// our stat key -> SportsGameOdds statID (per sport); None = no mapped market.
 /// statIDs verified against live SGO events (2026-10).
-fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
+pub(crate) fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
     match (sport, key) {
         // NBA
         ("nba", "points") => Some("points"),
@@ -35,6 +35,11 @@ fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
         ("nba", "steals") => Some("steals"),
         ("nba", "blocks") => Some("blocks"),
         ("nba", "turnovers") => Some("turnovers"),
+        // combos: SGO joins statIDs with '+' (not yet seen on the amateur tier)
+        ("nba", "pra") => Some("points+rebounds+assists"),
+        ("nba", "pr") => Some("points+rebounds"),
+        ("nba", "pa") => Some("points+assists"),
+        ("nba", "ra") => Some("rebounds+assists"),
         // NFL
         ("nfl", "pass_yds") => Some("passing_yards"),
         ("nfl", "pass_td") => Some("passing_touchdowns"),
@@ -63,7 +68,7 @@ fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
 const BOOK_PRIORITY: &[&str] = &["pinnacle", "draftkings", "fanduel", "betmgm", "caesars", "espnbet", "betonline", "bovada"];
 
 /// Accent-normalize a name for matching (č->c, ć->c, ö->o, ...), keep ascii alnum lowercased.
-fn norm_name(s: &str) -> String {
+pub(crate) fn norm_name(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let c = match ch {
@@ -91,7 +96,7 @@ async fn fetch_events(http: &reqwest::Client, key: &str, lg: &str) -> Result<Vec
     Ok(v["data"].as_array().cloned().unwrap_or_default())
 }
 
-fn key_from_env() -> Option<String> {
+pub(crate) fn key_from_env() -> Option<String> {
     std::env::var("SPORTSGAMEODDS_API_KEY").ok().filter(|k| !k.is_empty())
 }
 
@@ -111,19 +116,30 @@ fn odds_of(v: Option<&Value>) -> Option<f64> {
 fn num_field(v: Option<&Value>, field: &str) -> Option<f64> {
     v?.get(field)?.as_str().and_then(|s| s.parse::<f64>().ok())
 }
-fn implied(american: f64) -> f64 {
+pub(crate) fn implied(american: f64) -> f64 {
     if american < 0.0 { -american / (-american + 100.0) } else { 100.0 / (american + 100.0) }
 }
 
-// --------------------------------------------------------------------------
-// GET /market/{sport}/games  -> current game lines (ml / spread / total)
-// --------------------------------------------------------------------------
-pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Responder {
-    let sport = path.into_inner();
-    let Some(lg) = league(&sport) else { return bad_request("unknown sport"); };
-    let Some(key) = key_from_env() else { return internal("SPORTSGAMEODDS_API_KEY not set"); };
-    let events = match fetch_events(&state.http, &key, lg).await { Ok(e) => e, Err(e) => return internal(e) };
+/// One current player-prop line, matched (by name) to our player where possible.
+pub(crate) struct PropLine {
+    pub stat: &'static str,
+    pub player: String,
+    pub player_id: Option<String>,
+    pub team: Option<String>,
+    pub opponent: Option<String>,
+    pub home: Option<bool>,
+    pub starts_at: Value,
+    pub line: f64,
+    pub over_odds: Option<f64>,
+    pub under_odds: Option<f64>,
+}
 
+/// Current game lines (ml / spread / total) for a sport. `spread` is the HOME
+/// spread in bettor convention (negative = home favored).
+pub(crate) async fn fetch_games(state: &State, sport: &str) -> Result<Vec<Value>, String> {
+    let lg = league(sport).ok_or("unknown sport")?;
+    let key = key_from_env().ok_or("SPORTSGAMEODDS_API_KEY not set")?;
+    let events = fetch_events(&state.http, &key, lg).await?;
     let mut out = Vec::new();
     for ev in &events {
         let home = ev["teams"]["home"]["names"]["short"].as_str().unwrap_or("");
@@ -144,7 +160,66 @@ pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Res
             "total": num_field(ou_o, "overUnder"), "over_odds": odds_of(ou_o), "under_odds": odds_of(ou_u),
         }));
     }
-    HttpResponse::Ok().json(json!({ "sport": sport, "count": out.len(), "games": out }))
+    Ok(out)
+}
+
+/// Current over/under player-prop lines for the given stat keys (one SGO fetch).
+pub(crate) async fn fetch_props(state: &State, sport: &str, stats: &[&'static str]) -> Result<Vec<PropLine>, String> {
+    let lg = league(sport).ok_or("unknown sport")?;
+    let key = key_from_env().ok_or("SPORTSGAMEODDS_API_KEY not set")?;
+    let mapped: Vec<(&'static str, &'static str)> = stats.iter().filter_map(|k| sgo_stat(sport, k).map(|s| (*k, s))).collect();
+    if mapped.is_empty() { return Err("no mapped market for these stats".into()); }
+    let events = fetch_events(&state.http, &key, lg).await?;
+
+    // our players (normalized name -> player_id) for matching
+    let rows = state.db.query("SELECT player_id, display_name FROM sports_players WHERE sport=$1", &[&sport])
+        .await.map_err(|e| e.to_string())?;
+    let mut by_name: HashMap<String, String> = HashMap::new();
+    for r in &rows { by_name.insert(norm_name(&r.get::<_, String>("display_name")), r.get("player_id")); }
+
+    const OVER: &str = "-game-ou-over";
+    let mut out = Vec::new();
+    for ev in &events {
+        let (Some(players), Some(odds)) = (ev["players"].as_object(), ev["odds"].as_object()) else { continue };
+        let side = |s: &str| (ev["teams"][s]["teamID"].as_str().unwrap_or(""), ev["teams"][s]["names"]["short"].as_str().map(str::to_string));
+        let (home_id, home_short) = side("home");
+        let (away_id, away_short) = side("away");
+        for (oid, market) in odds {
+            // {sgo}-{PLAYERID}-game-ou-over
+            let Some(rest) = oid.strip_suffix(OVER) else { continue };
+            for &(our, sgo) in &mapped {
+                let Some(pid_sgo) = rest.strip_prefix(sgo).and_then(|r| r.strip_prefix('-')) else { continue };
+                // must be a player market (playerID present in players map), not a team market
+                let Some(p) = players.get(pid_sgo) else { continue };
+                let over = book_pick(market);
+                let Some(line) = num_field(over, "overUnder") else { continue };
+                let under = odds.get(&format!("{sgo}-{pid_sgo}-game-ou-under")).and_then(book_pick);
+                let name = p["name"].as_str().unwrap_or("").to_string();
+                let tid = p["teamID"].as_str().unwrap_or("");
+                let (team, opponent, home) = if !tid.is_empty() && tid == home_id { (home_short.clone(), away_short.clone(), Some(true)) }
+                    else if !tid.is_empty() && tid == away_id { (away_short.clone(), home_short.clone(), Some(false)) }
+                    else { (None, None, None) };
+                out.push(PropLine {
+                    stat: our, player_id: by_name.get(&norm_name(&name)).cloned(), player: name,
+                    team, opponent, home, starts_at: ev["status"]["startsAt"].clone(),
+                    line, over_odds: odds_of(over), under_odds: odds_of(under),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// --------------------------------------------------------------------------
+// GET /market/{sport}/games  -> current game lines (ml / spread / total)
+// --------------------------------------------------------------------------
+pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Responder {
+    let sport = path.into_inner();
+    if league(&sport).is_none() { return bad_request("unknown sport"); }
+    match fetch_games(&state, &sport).await {
+        Ok(out) => HttpResponse::Ok().json(json!({ "sport": sport, "count": out.len(), "games": out })),
+        Err(e) => internal(e),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -152,44 +227,17 @@ pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Res
 // --------------------------------------------------------------------------
 pub async fn props(state: web::Data<State>, path: web::Path<(String, String)>) -> impl Responder {
     let (sport, stat) = path.into_inner();
-    let Some(lg) = league(&sport) else { return bad_request("unknown sport"); };
+    if league(&sport).is_none() { return bad_request("unknown sport"); }
     let Some(sgo) = sgo_stat(&sport, &stat) else { return bad_request("stat has no mapped market"); };
-    let Some(key) = key_from_env() else { return internal("SPORTSGAMEODDS_API_KEY not set"); };
-    let events = match fetch_events(&state.http, &key, lg).await { Ok(e) => e, Err(e) => return internal(e) };
-
-    // our players (normalized name -> player_id) for matching
-    let rows = match state.db.query("SELECT player_id, display_name FROM sports_players WHERE sport=$1", &[&sport]).await {
-        Ok(r) => r, Err(e) => return internal(e),
-    };
-    let mut by_name: HashMap<String, String> = HashMap::new();
-    for r in &rows { by_name.insert(norm_name(&r.get::<_, String>("display_name")), r.get("player_id")); }
-
-    let over_suffix = format!("-game-ou-over");
-    let mut out = Vec::new();
-    for ev in &events {
-        let players = ev["players"].as_object();
-        let odds = ev["odds"].as_object();
-        let (Some(players), Some(odds)) = (players, odds) else { continue };
-        for (oid, market) in odds {
-            // {sgo}-{PLAYERID}-game-ou-over
-            if !oid.ends_with(&over_suffix) { continue; }
-            let Some(rest) = oid.strip_suffix(&over_suffix) else { continue };
-            let Some(pid_sgo) = rest.strip_prefix(&format!("{sgo}-")) else { continue };
-            // must be a player market (playerID present in players map), not a team market
-            let Some(p) = players.get(pid_sgo) else { continue };
-            let name = p["name"].as_str().unwrap_or("");
-            let over = book_pick(market);
-            let under_oid = format!("{sgo}-{pid_sgo}-game-ou-under");
-            let under = odds.get(&under_oid).and_then(book_pick);
-            let line = num_field(over, "overUnder");
-            if line.is_none() { continue; }
-            let matched = by_name.get(&norm_name(name)).cloned();
-            out.push(json!({
-                "player": name, "player_id": matched,
-                "team": p["teamID"].as_str().map(|t| t.rsplit('_').nth(1).unwrap_or(t)),
-                "line": line, "over_odds": odds_of(over), "under_odds": odds_of(under),
-            }));
+    let Some(def) = crate::player_backtest::stat_def(&sport, &stat) else { return bad_request("unknown stat"); };
+    match fetch_props(&state, &sport, &[def.key]).await {
+        Ok(lines) => {
+            let out: Vec<Value> = lines.iter().map(|p| json!({
+                "player": p.player, "player_id": p.player_id, "team": p.team,
+                "line": p.line, "over_odds": p.over_odds, "under_odds": p.under_odds,
+            })).collect();
+            HttpResponse::Ok().json(json!({ "sport": sport, "stat": stat, "sgo_stat": sgo, "count": out.len(), "props": out }))
         }
+        Err(e) => internal(e),
     }
-    HttpResponse::Ok().json(json!({ "sport": sport, "stat": stat, "sgo_stat": sgo, "count": out.len(), "props": out }))
 }
