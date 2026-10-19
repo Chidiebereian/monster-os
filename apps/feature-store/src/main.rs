@@ -14,16 +14,74 @@
 //! Reads are point-in-time: pass the prediction cutoff as `as_of` so training
 //! never sees features written after the event (data leakage).
 
-use std::sync::Arc;
+use std::future::Future;
+use std::ops::Deref;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
-use actix_web::{web, App, HttpServer, HttpResponse, Responder};
+use actix_web::{dev::Payload, web, App, FromRequest, HttpRequest, HttpServer, HttpResponse, Responder};
 use chrono::{DateTime, Utc};
 use common::{healthz, PosteriorSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_postgres::{error::SqlState, Client, NoTls, Row};
 
-type Db = web::Data<Arc<Client>>;
+/// Shared Postgres handle that reconnects when the connection drops (e.g.
+/// the database container restarts). Without this, one restart leaves every
+/// request failing with 500 until feature-store itself is restarted.
+struct Pg {
+    url: String,
+    client: Mutex<Arc<Client>>,
+}
+
+async fn connect(url: &str) -> Result<Client, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    actix_web::rt::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("feature-store: postgres connection closed: {e}");
+        }
+    });
+    Ok(client)
+}
+
+impl Pg {
+    async fn client(&self) -> Result<Arc<Client>, tokio_postgres::Error> {
+        let current = self.client.lock().unwrap().clone();
+        if !current.is_closed() {
+            return Ok(current);
+        }
+        eprintln!("feature-store: postgres connection lost; reconnecting");
+        let fresh = Arc::new(connect(&self.url).await?);
+        *self.client.lock().unwrap() = fresh.clone();
+        Ok(fresh)
+    }
+}
+
+/// Per-request extractor: a live client (reconnecting if needed).
+struct Db(Arc<Client>);
+
+impl Deref for Db {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.0
+    }
+}
+
+impl FromRequest for Db {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let pg = req.app_data::<web::Data<Pg>>().cloned();
+        Box::pin(async move {
+            let pg = pg.ok_or_else(|| actix_web::error::ErrorInternalServerError("db not configured"))?;
+            pg.client().await.map(Db).map_err(|e| {
+                eprintln!("feature-store: postgres reconnect failed: {e}");
+                actix_web::error::ErrorServiceUnavailable("database unavailable")
+            })
+        })
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 struct SimulationRecord {
@@ -249,15 +307,10 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8118);
     let url = std::env::var("DATABASE_URL")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "DATABASE_URL must be set"))?;
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+    let client = connect(&url)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    actix_web::rt::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("feature-store: postgres connection closed: {e}");
-        }
-    });
-    let db = web::Data::new(Arc::new(client));
+    let db = web::Data::new(Pg { url, client: Mutex::new(Arc::new(client)) });
 
     println!("feature-store listening on 0.0.0.0:{}", port);
     HttpServer::new(move || {
