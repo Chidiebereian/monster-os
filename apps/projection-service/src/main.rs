@@ -33,6 +33,9 @@ mod market;
 mod team_model;
 mod player_backtest;
 mod nba;
+mod nba_espn;
+mod nba_game;
+mod nba_sim;
 mod nba_teams;
 mod mlb;
 mod mlb_sim;
@@ -40,6 +43,9 @@ mod nfl_game;
 mod nfl_sim;
 mod sim_sessions;
 mod nhl;
+mod nhl_api;
+mod nhl_game;
+mod nhl_sim;
 mod nhl_teams;
 mod teams;
 
@@ -638,6 +644,11 @@ async fn main() -> std::io::Result<()> {
             .route("/cheatsheet/{sport}/props", web::get().to(hitrates::cheatsheet_props))
             .route("/cheatsheet/{sport}/games", web::get().to(hitrates::cheatsheet_games))
             .route("/market/{sport}/props/{stat}", web::get().to(market::props))
+            .route("/ingest/nhl/api", web::post().to(nhl_api::ingest))
+            .route("/fit/nhl/sim", web::post().to(nhl_game::fit))
+            .route("/nhl/sim/games", web::get().to(nhl_game::games))
+            .route("/nhl/simulate/{game_id}", web::get().to(nhl_game::simulate))
+            .route("/backtest/nhl/sim", web::get().to(nhl_game::backtest))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
             .route("/ingest/nhl/goalies", web::post().to(nhl::ingest_goalies))
             .route("/stats/nhl", web::get().to(nhl::list_stats))
@@ -671,6 +682,11 @@ async fn main() -> std::io::Result<()> {
             .route("/sim/sessions/{id}", web::get().to(sim_sessions::get))
             .route("/sim/sessions/{id}/events", web::get().to(sim_sessions::events))
             .route("/sim/sessions/{id}/state", web::get().to(sim_sessions::snapshot))
+            .route("/ingest/nba/espn", web::post().to(nba_espn::ingest))
+            .route("/fit/nba/sim", web::post().to(nba_game::fit))
+            .route("/nba/sim/games", web::get().to(nba_game::games))
+            .route("/nba/simulate/{game_id}", web::get().to(nba_game::simulate))
+            .route("/backtest/nba/sim", web::get().to(nba_game::backtest))
             .route("/ingest/nba", web::post().to(nba::ingest_nba))
             .route("/fit/nba", web::post().to(nba::fit_nba))
             .route("/stats/nba", web::get().to(nba::list_stats))

@@ -8,6 +8,8 @@ import { useSimulationPlayback } from "../hooks/useSimulationPlayback";
 import { EMPTY_SCENARIO, isEmptyScenario, loadAllEvents, simApi, teamColor, type NflEnsemble, type NflSimGame, type Scenario, type SimEvent, type SimSession } from "../lib/sim";
 import { LineupPanel, ScenarioImpact } from "../components/simulation/LineupPanel";
 import { MlbBroadcast } from "../components/simulation/MlbBroadcast";
+import { NbaBroadcast } from "../components/simulation/NbaBroadcast";
+import { NhlBroadcast } from "../components/simulation/NhlBroadcast";
 import { StartersCompare, type LineupMode } from "../components/simulation/StartersCompare";
 import { formatPct } from "../lib/odds";
 import { Card, Msg } from "../components/ui";
@@ -20,13 +22,13 @@ import { Card, Msg } from "../components/ui";
 const SPORTS = [
   { key: "nfl", label: "NFL", ready: true },
   { key: "mlb", label: "MLB", ready: true },
-  { key: "nba", label: "NBA", ready: false },
-  { key: "nhl", label: "NHL", ready: false },
+  { key: "nba", label: "NBA", ready: true },
+  { key: "nhl", label: "NHL", ready: true },
 ];
 
 export function BroadcastSim() {
   const [params, setParams] = useSearchParams();
-  const sport = params.get("sport") === "mlb" ? "mlb" : "nfl";
+  const sport = params.get("sport") === "mlb" ? "mlb" : params.get("sport") === "nba" ? "nba" : params.get("sport") === "nhl" ? "nhl" : "nfl";
   return (
     <div className="space-y-4 min-w-0">
       <div className="flex flex-wrap items-center gap-3">
@@ -41,7 +43,7 @@ export function BroadcastSim() {
           ))}
         </div>
       </div>
-      {sport === "mlb" ? <MlbBroadcast /> : <NflBroadcast />}
+      {sport === "mlb" ? <MlbBroadcast /> : sport === "nba" ? <NbaBroadcast /> : sport === "nhl" ? <NhlBroadcast /> : <NflBroadcast />}
     </div>
   );
 }

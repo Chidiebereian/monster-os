@@ -62,7 +62,16 @@ pub async fn create(state: web::Data<State>, body: web::Json<CreateBody>) -> imp
             Ok((m, e, f, d)) => (m, e, f, d, crate::mlb::SIM_MODEL),
             Err(e) => return err(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, e),
         },
-        other => return err(actix_web::http::StatusCode::BAD_REQUEST, format!("broadcast sessions are not available for '{other}' yet (nfl, mlb)")),
+        "nba" => match crate::nba_game::new_session(&state, &b.game_id, seed, crate::nba_game::opts(b.lineup.as_deref(), &b.out, &b.force_in)).await {
+            Ok((m, e, f, d)) => (m, e, f, d, crate::nba_game::MODEL_VERSION),
+            Err(e) => return err(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, e),
+        },
+        "nhl" => match crate::nhl_game::new_session(&state, &b.game_id, seed,
+            crate::nhl_game::opts(b.lineup.as_deref(), &b.out, &b.force_in, b.away_qb.clone(), b.home_qb.clone())).await {
+            Ok((m, e, f, d)) => (m, e, f, d, crate::nhl_game::MODEL_VERSION),
+            Err(e) => return err(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, e),
+        },
+        other => return err(actix_web::http::StatusCode::BAD_REQUEST, format!("broadcast sessions are not available for '{other}'")),
     };
     let id = format!("sim_{:016x}", nfl_sim::derive_seed(seed, &[&b.sport, &b.game_id, &chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string()]));
     let n_events = events.len();

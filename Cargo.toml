@@ -35,3 +35,8 @@ members = [
 [profile.release]
 opt-level = 3
 lto = true
+
+# The simulation engines run 100,000-game ensembles inside projection-service;
+# optimise that crate even in dev builds (other crates stay fast to compile).
+[profile.dev.package.projection-service]
+opt-level = 2

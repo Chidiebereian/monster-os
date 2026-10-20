@@ -2,9 +2,13 @@
 
 Status as of 2026-10-19:
 
-* **NFL and MLB** are implemented end to end, including confirmed lineups and
-  alternate realities.
-* **NBA and NHL** are not yet available as broadcast sessions.
+* **NFL, MLB and NBA** are implemented end to end, including projected,
+  confirmed and actual lineups and alternate realities. NBA is in
+  `nba_sim.rs` and `nba_game.rs` with ESPN data; see
+  `docs/nba-poss-sim-model-card.md`.
+* **NHL** is implemented: `nhl_api.rs`, `nhl_sim.rs` and `nhl_game.rs`,
+  using NHL API data; see `docs/nhl-event-sim-model-card.md`. All four
+  sports now share the `/sim/sessions` contract and the `/broadcast` page.
 
 ## Principle
 
