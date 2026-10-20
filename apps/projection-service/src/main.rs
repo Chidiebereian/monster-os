@@ -36,6 +36,9 @@ mod nba;
 mod nba_teams;
 mod mlb;
 mod mlb_sim;
+mod nfl_game;
+mod nfl_sim;
+mod sim_sessions;
 mod nhl;
 mod nhl_teams;
 mod teams;
@@ -656,6 +659,18 @@ async fn main() -> std::io::Result<()> {
             .route("/mlb/params", web::get().to(mlb::params))
             .route("/backtest/mlb/sim", web::get().to(mlb::backtest))
             .route("/mlb/backtests", web::get().to(mlb::latest_backtest))
+            .route("/ingest/nfl/pbp", web::post().to(nfl_game::ingest))
+            .route("/fit/nfl/sim", web::post().to(nfl_game::fit))
+            .route("/ingest/nfl/availability", web::post().to(nfl_game::ingest_availability))
+            .route("/nfl/sim/games", web::get().to(nfl_game::games))
+            .route("/nfl/simulate/{game_id}", web::get().to(nfl_game::simulate))
+            .route("/backtest/nfl/sim", web::get().to(nfl_game::backtest))
+            .route("/nfl/backtests", web::get().to(nfl_game::backtests))
+            .route("/sim/sessions", web::post().to(sim_sessions::create))
+            .route("/sim/sessions", web::get().to(sim_sessions::list))
+            .route("/sim/sessions/{id}", web::get().to(sim_sessions::get))
+            .route("/sim/sessions/{id}/events", web::get().to(sim_sessions::events))
+            .route("/sim/sessions/{id}/state", web::get().to(sim_sessions::snapshot))
             .route("/ingest/nba", web::post().to(nba::ingest_nba))
             .route("/fit/nba", web::post().to(nba::fit_nba))
             .route("/stats/nba", web::get().to(nba::list_stats))
