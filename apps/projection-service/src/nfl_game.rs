@@ -956,6 +956,71 @@ pub struct Opts {
     /// alternate reality: players forced out / forced active (gsis ids)
     pub out: std::collections::HashSet<String>,
     pub force_in: std::collections::HashSet<String>,
+    pub lineup_mode: LineupMode,
+}
+
+/// Which lineup the engine plays.
+/// * Projected — usage only (players used in the team's last 3 games), no roster or injury report.
+/// * Confirmed — this week's active roster + official injury report (default).
+/// * Actual — who really played, from the game's own play-by-play (completed games only; hindsight).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LineupMode { Projected, Confirmed, Actual }
+impl LineupMode {
+    pub fn parse(s: Option<&str>) -> LineupMode {
+        match s { Some("projected") => LineupMode::Projected, Some("actual") => LineupMode::Actual, _ => LineupMode::Confirmed }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self { LineupMode::Projected => "projected", LineupMode::Confirmed => "confirmed", LineupMode::Actual => "actual" }
+    }
+}
+
+/// Who actually played for each team, from a completed game's play-by-play.
+struct ActualGame {
+    played: HashMap<String, std::collections::HashSet<String>>,
+    qb: HashMap<String, String>,
+    kicker: HashMap<String, String>,
+    /// team -> (id, short name, dropbacks, carries, targets)
+    usage: HashMap<String, Vec<(String, String, f64, f64, f64)>>,
+}
+
+async fn load_actual(db: &tokio_postgres::Client, game_id: &str) -> Result<Option<ActualGame>, String> {
+    let plays = load_plays(db, "game_id = $1", &[&game_id]).await?;
+    if plays.iter().filter(|p| p.scrimmage()).count() < 40 {
+        return Ok(None);
+    }
+    let mut a = ActualGame { played: HashMap::new(), qb: HashMap::new(), kicker: HashMap::new(), usage: HashMap::new() };
+    let mut u: HashMap<(String, String), (String, f64, f64, f64)> = HashMap::new();
+    let mut kick: HashMap<(String, String), f64> = HashMap::new();
+    for p in &plays {
+        let Some(team) = p.posteam.clone() else { continue };
+        if p.scrimmage() {
+            if p.dropback() {
+                if let Some((id, nm)) = p.passer.as_ref().or(p.rusher.as_ref()) { u.entry((team.clone(), id.clone())).or_insert((nm.clone(), 0.0, 0.0, 0.0)).1 += 1.0; }
+            }
+            if p.designed_run() {
+                if let Some((id, nm)) = &p.rusher { u.entry((team.clone(), id.clone())).or_insert((nm.clone(), 0.0, 0.0, 0.0)).2 += 1.0; }
+            }
+            if p.attempt() {
+                if let Some((id, nm)) = &p.receiver { u.entry((team.clone(), id.clone())).or_insert((nm.clone(), 0.0, 0.0, 0.0)).3 += 1.0; }
+            }
+        }
+        if matches!(p.ptype.as_str(), "field_goal" | "extra_point") {
+            if let Some((id, _)) = &p.kicker { *kick.entry((team.clone(), id.clone())).or_insert(0.0) += 1.0; }
+        }
+    }
+    for ((team, id), (nm, db_, ca, tg)) in u {
+        a.played.entry(team.clone()).or_default().insert(id.clone());
+        a.usage.entry(team).or_default().push((id, nm, db_, ca, tg));
+    }
+    for (team, v) in a.usage.iter_mut() {
+        v.sort_by(|x, y| (y.2 + y.3 + y.4).total_cmp(&(x.2 + x.3 + x.4)));
+        if let Some(q) = v.iter().max_by(|x, y| x.2.total_cmp(&y.2)).filter(|q| q.2 > 0.0) { a.qb.insert(team.clone(), q.0.clone()); }
+    }
+    for ((team, id), n) in kick {
+        let cur = a.kicker.get(&team).cloned();
+        if cur.is_none() { a.kicker.insert(team, id); } else { let _ = n; }
+    }
+    Ok(Some(a))
 }
 
 /// Probability a player listed on the injury report plays, fitted from
@@ -974,6 +1039,14 @@ struct Avail {
     injury: HashMap<String, (String, String, String)>, // id -> (report_status, practice_status, injury)
     rates: AvailRates,
     rates_source: String,
+}
+
+impl Avail {
+    /// Same play-probability rates, but no roster and no injury report.
+    fn without_reports(&self) -> Avail {
+        Avail { roster: HashMap::new(), roster_team: HashMap::new(), teams_with_roster: Default::default(), injury: HashMap::new(),
+            rates: self.rates, rates_source: self.rates_source.clone() }
+    }
 }
 
 async fn load_avail(db: &tokio_postgres::Client, gref: &GameRef) -> Result<Avail, String> {
@@ -1073,7 +1146,8 @@ struct Usage {
 /// Availability: scenario overrides > injury report Out > this week's roster
 /// status (must be ACT) > fallback "used in the last 3 games"; Questionable /
 /// Doubtful players play with the probability fitted from earlier seasons.
-fn usage(plays: &[P], team: &str, league: &League, opts: &Opts, qb_override: Option<&String>, av: &Avail) -> Usage {
+fn usage(plays: &[P], team: &str, league: &League, opts: &Opts, qb_override: Option<&String>, av: &Avail,
+         actual: Option<&std::collections::HashSet<String>>) -> Usage {
     let games: Vec<String> = team_games(plays, team).into_iter().take(16).collect();
     let gi: HashMap<&str, usize> = games.iter().enumerate().map(|(i, g)| (g.as_str(), i)).collect();
     let w_share = |i: usize| 0.5f64.powf(i as f64 / opts.share_halflife);
@@ -1139,7 +1213,12 @@ fn usage(plays: &[P], team: &str, league: &League, opts: &Opts, qb_override: Opt
         let inj = av.injury.get(id);
         let report = inj.map(|x| x.0.clone()).filter(|x| !x.is_empty());
         let elsewhere = has_roster && !on_team;
-        let (p_active, reason) = if elsewhere {
+        let (p_active, reason) = if let Some(act) = actual {
+            if opts.out.contains(id) { (0.0, "scenario: ruled out".to_string()) }
+            else if opts.force_in.contains(id) { (1.0, "scenario: plays".to_string()) }
+            else if act.contains(id) { (1.0, "actual: played in this game".to_string()) }
+            else { (0.0, "actual: no touch in this game".to_string()) }
+        } else if elsewhere {
             (0.0, match av.roster_team.get(id) { Some(t) => format!("now on {t}"), None => "not on this week's active roster".into() })
         } else if opts.out.contains(id) {
             (0.0, "scenario: ruled out".to_string())
@@ -1211,7 +1290,9 @@ fn usage(plays: &[P], team: &str, league: &League, opts: &Opts, qb_override: Opt
     let lineup: Vec<Cand> = cands.into_iter()
         .filter(|c| !c.reason.starts_with("now on "))
         .filter(|c| c.target_share >= 0.02 || c.carry_share >= 0.02 || c.dropbacks >= 5.0).collect();
-    let lineup_source = if has_roster {
+    let lineup_source = if actual.is_some() {
+        "actual: players who recorded a dropback, carry or target in this game (hindsight)".to_string()
+    } else if has_roster {
         "nflverse weekly roster (status ACT) + official injury report".to_string()
     } else {
         "no roster published for this week: players used in the last 3 games + injury report".to_string()
@@ -1294,9 +1375,27 @@ pub async fn build(db: &tokio_postgres::Client, gref: &GameRef, opts: &Opts) -> 
     if team_plays.is_empty() {
         return Err(format!("no plays before {} for {} / {}", gref.date, gref.away, gref.home));
     }
-    let overrides = [opts.away_qb.as_ref(), opts.home_qb.as_ref()];
     let av = load_avail(db, gref).await?;
-    let usages: Vec<Usage> = teams.iter().zip(overrides).map(|(t, o)| usage(&team_plays, t, &league, opts, o, &av)).collect();
+    let av_proj = av.without_reports();
+    let actual = load_actual(db, &gref.game_id).await?;
+    if opts.lineup_mode == LineupMode::Actual && actual.is_none() {
+        return Err("actual lineup is only available after the game has been played (no play-by-play yet)".into());
+    }
+    let act_qb: Vec<Option<String>> = teams.iter().map(|t| actual.as_ref().and_then(|a| a.qb.get(t).cloned())).collect();
+    let mode = opts.lineup_mode;
+    let overrides: [Option<&String>; 2] = [0, 1].map(|i| {
+        let user = if i == 0 { opts.away_qb.as_ref() } else { opts.home_qb.as_ref() };
+        if mode == LineupMode::Actual { user.or(act_qb[i].as_ref()) } else { user }
+    });
+    let used_av = if mode == LineupMode::Projected { &av_proj } else { &av };
+    let usages: Vec<Usage> = teams.iter().zip(overrides).map(|(t, o)| {
+        let act = if mode == LineupMode::Actual { actual.as_ref().and_then(|a| a.played.get(t)) } else { None };
+        usage(&team_plays, t, &league, opts, o, used_av, act)
+    }).collect();
+    // the other views, for the starters comparison (no scenario overrides)
+    let plain = opts_from(None, None);
+    let view_proj: Vec<Usage> = teams.iter().map(|t| usage(&team_plays, t, &league, &plain, None, &av_proj, None)).collect();
+    let view_conf: Vec<Usage> = teams.iter().map(|t| usage(&team_plays, t, &league, &plain, None, &av, None)).collect();
     // every chosen player's own plays (any team) for efficiency + yards
     let mut ids: Vec<String> = Vec::new();
     for u in &usages {
@@ -1310,9 +1409,14 @@ pub async fn build(db: &tokio_postgres::Client, gref: &GameRef, opts: &Opts) -> 
     let pplays = load_plays(db, "game_date < $2 AND season >= $3 AND (passer_id = ANY($1) OR rusher_id = ANY($1) OR receiver_id = ANY($1))",
         &[&ids, &gref.date, &from_season]).await?;
     let mut all_ids = ids.clone();
-    for u in &usages {
+    for u in usages.iter().chain(&view_proj).chain(&view_conf) {
         if let Some(k) = &u.kicker { all_ids.push(k.0.clone()); }
+        if let Some(q) = &u.qb { all_ids.push(q.0.clone()); }
         all_ids.extend(u.lineup.iter().map(|c| c.id.clone()));
+    }
+    if let Some(a) = &actual {
+        for v in a.usage.values() { all_ids.extend(v.iter().map(|x| x.0.clone())); }
+        all_ids.extend(a.kicker.values().cloned());
     }
     let names: HashMap<String, (String, String)> = db.query(
         "SELECT player_id, display_name, COALESCE(position, '') FROM sports_players WHERE sport = 'nfl' AND player_id = ANY($1)", &[&all_ids])
@@ -1454,11 +1558,42 @@ pub async fn build(db: &tokio_postgres::Client, gref: &GameRef, opts: &Opts) -> 
         }));
         team_inputs.push(sim::TeamInput { abbr: abbr.clone(), off, def });
     }
+    // starters by role under each lineup source
+    let role_rows = |qb: Option<String>, kicker: Option<String>, carries: Vec<(String, f64, f64)>, targets: Vec<(String, f64, f64)>| -> Value {
+        // (id, share-or-count, p_active)
+        let person = |id: &str, p: f64| { let (n, pos) = display(id, id); json!({ "id": id, "name": n, "pos": pos, "p_active": r3(p) }) };
+        let pos_of = |id: &str| display(id, id).1;
+        let rbs: Vec<Value> = carries.iter().filter(|x| matches!(pos_of(&x.0).as_str(), "RB" | "FB" | "HB")).take(2).map(|x| person(&x.0, x.2)).collect();
+        let wrs: Vec<Value> = targets.iter().filter(|x| pos_of(&x.0) == "WR").take(3).map(|x| person(&x.0, x.2)).collect();
+        let tes: Vec<Value> = targets.iter().filter(|x| pos_of(&x.0) == "TE").take(1).map(|x| person(&x.0, x.2)).collect();
+        let slot = |v: &Vec<Value>, i: usize| v.get(i).cloned().unwrap_or(Value::Null);
+        json!([
+            { "role": "QB", "player": qb.as_ref().map(|q| person(q, 1.0)) },
+            { "role": "RB1", "player": slot(&rbs, 0) }, { "role": "RB2", "player": slot(&rbs, 1) },
+            { "role": "WR1", "player": slot(&wrs, 0) }, { "role": "WR2", "player": slot(&wrs, 1) }, { "role": "WR3", "player": slot(&wrs, 2) },
+            { "role": "TE1", "player": slot(&tes, 0) },
+            { "role": "K", "player": kicker.as_ref().map(|k| person(k, 1.0)) },
+        ])
+    };
+    let view = |u: &Usage| role_rows(u.qb.as_ref().map(|q| q.0.clone()), u.kicker.as_ref().map(|k| k.0.clone()),
+        u.carries.iter().map(|x| (x.0.clone(), x.2, x.3)).collect(), u.targets.iter().map(|x| (x.0.clone(), x.2, x.3)).collect());
+    let starters_json: Vec<Value> = teams.iter().enumerate().map(|(t, abbr)| {
+        let actual_view = actual.as_ref().map(|a| {
+            let us = a.usage.get(abbr).cloned().unwrap_or_default();
+            let mut car: Vec<(String, f64, f64)> = us.iter().filter(|x| x.3 > 0.0).map(|x| (x.0.clone(), x.3, 1.0)).collect();
+            car.sort_by(|x, y| y.1.total_cmp(&x.1));
+            let mut tgt: Vec<(String, f64, f64)> = us.iter().filter(|x| x.4 > 0.0).map(|x| (x.0.clone(), x.4, 1.0)).collect();
+            tgt.sort_by(|x, y| y.1.total_cmp(&x.1));
+            role_rows(a.qb.get(abbr).cloned(), a.kicker.get(abbr).cloned(), car, tgt)
+        });
+        json!({ "team": abbr, "projected": view(&view_proj[t]), "confirmed": view(&view_conf[t]), "actual": actual_view })
+    }).collect();
     let [a, h]: [sim::TeamInput; 2] = team_inputs.try_into().map_err(|_| "teams".to_string())?;
     let meta = json!({
         "model_version": MODEL_VERSION, "params": params_key, "data_cutoff": gref.date,
         "data_window": format!("plays from season {} up to the day before the game", from_season),
         "players": pmeta, "teams": team_meta, "flags": flags,
+        "lineup_mode": mode.as_str(), "actual_available": actual.is_some(), "starters": starters_json,
         "availability": { "week": gref.week, "rates": { "questionable": r3(av.rates.questionable), "doubtful": r3(av.rates.doubtful) },
             "rates_source": av.rates_source, "scenario_out": opts.out.iter().collect::<Vec<_>>(), "scenario_in": opts.force_in.iter().collect::<Vec<_>>() },
         "assumptions": [
@@ -1520,6 +1655,8 @@ pub struct SimQuery {
     out: Option<String>,
     #[serde(rename = "in")]
     force_in: Option<String>,
+    /// projected | confirmed (default) | actual
+    lineup: Option<String>,
 }
 fn d_n() -> usize { 100_000 }
 fn d_draws() -> usize { 200 }
@@ -1528,7 +1665,8 @@ fn id_set(v: &Option<String>) -> std::collections::HashSet<String> {
     v.as_deref().unwrap_or("").split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
 pub fn opts_from(away_qb: Option<String>, home_qb: Option<String>) -> Opts {
-    Opts { share_halflife: 3.0, team_halflife: 8.0, away_qb, home_qb, out: Default::default(), force_in: Default::default() }
+    Opts { share_halflife: 3.0, team_halflife: 8.0, away_qb, home_qb, out: Default::default(), force_in: Default::default(),
+        lineup_mode: LineupMode::Confirmed }
 }
 pub fn opts_scenario(away_qb: Option<String>, home_qb: Option<String>, out: &[String], force_in: &[String]) -> Opts {
     let mut o = opts_from(away_qb, home_qb);
@@ -1560,7 +1698,9 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
     let gref = match game_ref(&state.db, &gid).await { Ok(g) => g, Err(e) => return unprocessable(e) };
     let out: Vec<String> = id_set(&q.out).into_iter().collect();
     let fin: Vec<String> = id_set(&q.force_in).into_iter().collect();
-    let built = match build(&state.db, &gref, &opts_scenario(q.away_qb.clone(), q.home_qb.clone(), &out, &fin)).await {
+    let mut o = opts_scenario(q.away_qb.clone(), q.home_qb.clone(), &out, &fin);
+    o.lineup_mode = LineupMode::parse(q.lineup.as_deref());
+    let built = match build(&state.db, &gref, &o).await {
         Ok(b) => b,
         Err(e) => return unprocessable(e),
     };

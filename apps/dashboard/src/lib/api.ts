@@ -109,7 +109,7 @@ export const api = {
 
   // --- MLB game simulator (projection-service) ---
   mlbSlate: (days = 7) => getJson<MlbSlate>(`/projection-service/mlb/slate?${qs({ days })}`),
-  mlbSimulate: (gamePk: number | string, opts: { n?: number; seed?: number; away_sp?: string; home_sp?: string; away_lineup?: string; home_lineup?: string } = {}) =>
+  mlbSimulate: (gamePk: number | string, opts: { n?: number; seed?: number; away_sp?: string; home_sp?: string; away_lineup?: string; home_lineup?: string; out?: string; lineup?: string } = {}) =>
     getJson<MlbSim>(`/projection-service/mlb/simulate/${gamePk}?${qs(opts)}`),
   mlbBacktests: () => getJson<{ sport: string; runs: MlbBacktest[] }>(`/projection-service/mlb/backtests`),
 

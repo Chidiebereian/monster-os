@@ -15,6 +15,8 @@ repository against real MLB data; nothing is illustrative.
 | Slate (probable pitchers, lineup status) | `GET /mlb/slate` | implemented |
 | Walk-forward backtest vs baselines | `GET /backtest/mlb/sim`, `GET /mlb/backtests` | implemented, results below |
 | Dashboard | `/mlb-sim` page; MLB in Projections / Hit Rates / Cheat Sheets | implemented |
+| Broadcast (one seeded game, plate appearance by plate appearance) | `POST /sim/sessions {sport:"mlb"}`, dashboard `/broadcast?sport=mlb` | implemented |
+| Alternate realities (batters ruled out, starter swaps) | `?out=` / `away_sp` / `home_sp` on `/mlb/simulate` and sessions | implemented |
 | Sportsbook MLB prop IDs | `market.rs` `sgo_stat` | **unverified** (SGO rate-limited when added) |
 
 ## Data

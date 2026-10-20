@@ -30,13 +30,18 @@ pub struct CreateBody {
     sport: String,
     game_id: String,
     seed: Option<u64>,
+    /// NFL: starting QB ids; MLB: starting pitcher ids
+    #[serde(alias = "away_sp")]
     away_qb: Option<String>,
+    #[serde(alias = "home_sp")]
     home_qb: Option<String>,
     /// alternate reality: player ids ruled out / forced to play
     #[serde(default)]
     out: Vec<String>,
     #[serde(default, rename = "in")]
     force_in: Vec<String>,
+    /// projected | confirmed (default) | actual
+    lineup: Option<String>,
 }
 
 pub async fn create(state: web::Data<State>, body: web::Json<CreateBody>) -> impl Responder {
@@ -44,12 +49,20 @@ pub async fn create(state: web::Data<State>, body: web::Json<CreateBody>) -> imp
     let seed = b.seed.unwrap_or_else(|| nfl_sim::derive_seed(0x5e55, &[&b.game_id, &chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string()]))
         & 0x7fff_ffff_ffff_ffff; // fits BIGINT
     let (meta, events, fin, cutoff, version) = match b.sport.as_str() {
-        "nfl" => match nfl_game::new_session(&state.db, &b.game_id, seed,
-            nfl_game::opts_scenario(b.away_qb.clone(), b.home_qb.clone(), &b.out, &b.force_in)).await {
+        "nfl" => match nfl_game::new_session(&state.db, &b.game_id, seed, {
+            let mut o = nfl_game::opts_scenario(b.away_qb.clone(), b.home_qb.clone(), &b.out, &b.force_in);
+            o.lineup_mode = nfl_game::LineupMode::parse(b.lineup.as_deref());
+            o
+        }).await {
             Ok((m, e, f, d)) => (m, e, f, d, nfl_game::MODEL_VERSION),
             Err(e) => return err(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, e),
         },
-        other => return err(actix_web::http::StatusCode::BAD_REQUEST, format!("broadcast sessions are not available for '{other}' yet (nfl only)")),
+        "mlb" => match crate::mlb::new_session(&state, &b.game_id, seed,
+            crate::mlb::Overrides::scenario(b.away_qb.clone(), b.home_qb.clone(), b.out.clone(), b.lineup.as_deref())).await {
+            Ok((m, e, f, d)) => (m, e, f, d, crate::mlb::SIM_MODEL),
+            Err(e) => return err(actix_web::http::StatusCode::UNPROCESSABLE_ENTITY, e),
+        },
+        other => return err(actix_web::http::StatusCode::BAD_REQUEST, format!("broadcast sessions are not available for '{other}' yet (nfl, mlb)")),
     };
     let id = format!("sim_{:016x}", nfl_sim::derive_seed(seed, &[&b.sport, &b.game_id, &chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string()]));
     let n_events = events.len();

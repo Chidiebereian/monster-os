@@ -981,6 +981,10 @@ pub struct SimQuery {
     home_lineup: Option<String>,
     away_sp: Option<String>,
     home_sp: Option<String>,
+    /// alternate reality: comma-separated MLB person ids ruled out
+    out: Option<String>,
+    /// projected | confirmed (default) | actual
+    lineup: Option<String>,
     #[serde(default = "d_bat_hl")] batter_halflife: f64,
     #[serde(default = "d_pit_hl")] pitcher_halflife: f64,
     #[serde(default = "d_hook_starts")] hook_starts: usize,
@@ -1243,57 +1247,17 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
     let t0 = Instant::now();
     let db = &state.db;
 
-    // game context (teams, date, probable pitchers, posted lineups)
-    let url = format!("{API}/schedule?gamePk={pk}&hydrate=probablePitcher,lineups,venue");
-    let sched = match get_json(&state.http, &url).await { Ok(v) => v, Err(e) => return internal(e) };
-    let Some(g) = sched["dates"][0]["games"][0].as_object().cloned() else { return bad_request("unknown gamePk") };
-    let g = Value::Object(g);
-    let Some(date) = g["officialDate"].as_str().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) else {
-        return internal("game has no date");
+    let ov = Overrides {
+        away_lineup: q.away_lineup.clone(), home_lineup: q.home_lineup.clone(), away_sp: q.away_sp.clone(), home_sp: q.home_sp.clone(),
+        out: split_ids(&q.out).unwrap_or_default(),
+        lineup_mode: q.lineup.clone().unwrap_or_else(|| "confirmed".into()),
+        batter_halflife: q.batter_halflife, pitcher_halflife: q.pitcher_halflife, hook: Hook { starts: q.hook_starts, prior: q.hook_prior },
     };
-    let season: i32 = g["season"].as_str().and_then(|s| s.parse().ok()).unwrap_or(date.format("%Y").to_string().parse().unwrap_or(0));
-    let gtype = game_type(g["gameType"].as_str().unwrap_or(""));
-    let (params, baserunning, provenance) = match load_params(db, season, gtype == "POST").await { Ok(x) => x, Err(e) => return unprocessable(e) };
-    let abbr = team_abbrs(&state.http, season).await.unwrap_or_default();
-    let team = |s: &str| abbr.get(&g["teams"][s]["team"]["id"].as_i64().unwrap_or(0)).cloned().unwrap_or_default();
-    let (away, home) = (team("away"), team("home"));
-    let cutoff = date; // strictly earlier games only
-
-    // lineups: query override > official posted lineup > last game's order (projected)
-    let mut lineups: Vec<(Vec<String>, &str)> = Vec::new();
-    for (side, key, ov, team_code) in [("away", "awayPlayers", &q.away_lineup, &away), ("home", "homePlayers", &q.home_lineup, &home)] {
-        let posted = ids(&g["lineups"][key]);
-        let (lu, src) = if let Some(o) = split_ids(ov) {
-            (o, "override")
-        } else if posted.len() == 9 {
-            (posted, "official (posted by MLB)")
-        } else {
-            match last_lineup(db, team_code, cutoff).await {
-                Ok(l) => (l, "projected (team's previous game batting order)"),
-                Err(e) => return internal(e),
-            }
-        };
-        if lu.len() != 9 {
-            return unprocessable(format!("{side} lineup has {} batters (need 9); pass {side}_lineup", lu.len()));
-        }
-        lineups.push((lu, src));
-    }
-    let mut starters: Vec<(String, &str)> = Vec::new();
-    for (side, ov) in [("away", &q.away_sp), ("home", &q.home_sp)] {
-        let probable = g["teams"][side]["probablePitcher"]["id"].as_i64().map(|x| x.to_string());
-        match (ov.clone(), probable) {
-            (Some(o), _) => starters.push((o, "override")),
-            (None, Some(p)) => starters.push((p, "probable (announced by MLB)")),
-            (None, None) => return unprocessable(format!("no announced {side} starter yet; pass {side}_sp=<MLB person id>")),
-        }
-    }
-    let built = match build_input(
-        db, &params, baserunning,
-        Side { team: &away, lineup: &lineups[0].0, starter: &starters[0].0, lineup_source: lineups[0].1, starter_source: starters[0].1 },
-        Side { team: &home, lineup: &lineups[1].0, starter: &starters[1].0, lineup_source: lineups[1].1, starter_source: starters[1].1 },
-        cutoff, season, q.batter_halflife, q.pitcher_halflife, Hook { starts: q.hook_starts, prior: q.hook_prior },
-    ).await { Ok(b) => b, Err(e) => return unprocessable(e) };
-    let Built { game, inputs: inputs_json, flags } = built;
+    let Prepared { game, inputs: inputs_json, flags, lineups, starters, away, home, date, season, gtype, params, provenance, g, .. } =
+        match prepare(&state, &pk, &ov).await { Ok(p) => p, Err((code, e)) => return err_code(code, e) };
+    let cutoff = date;
+    let lineups: Vec<(Vec<String>, &str)> = lineups.iter().map(|(l, s)| (l.clone(), s.as_str())).collect();
+    let starters: Vec<(String, &str)> = starters.iter().map(|(l, s)| (l.clone(), s.as_str())).collect();
 
     let seed = q.seed.unwrap_or_else(|| mlb_sim::derive_seed(0x6d6c62, &[&pk, &chrono::Utc::now().timestamp_millis().to_string()]));
     let (n, draws) = (q.n, q.draws);
@@ -1367,6 +1331,294 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
     body["inputs"] = Value::Object(inputs_json);
     body["simulation"]["total_ms"] = json!(t0.elapsed().as_millis() as u64);
     HttpResponse::Ok().json(body)
+}
+
+fn err_code(code: u16, m: String) -> HttpResponse {
+    match code {
+        400 => bad_request(m),
+        422 => unprocessable(m),
+        _ => internal(m),
+    }
+}
+
+/// Lineup / starter overrides and the alternate-reality "out" list.
+pub struct Overrides {
+    pub away_lineup: Option<String>,
+    pub home_lineup: Option<String>,
+    pub away_sp: Option<String>,
+    pub home_sp: Option<String>,
+    /// players ruled out: a batter's slot goes to the team's next most-used
+    /// starter; a ruled-out starting pitcher is replaced by the team's most
+    /// recent other starter (unless a starter is chosen explicitly)
+    pub out: Vec<String>,
+    /// "projected" | "confirmed" (default) | "actual"
+    pub lineup_mode: String,
+    pub batter_halflife: f64,
+    pub pitcher_halflife: f64,
+    hook: Hook,
+}
+impl Overrides {
+    pub fn scenario(away_sp: Option<String>, home_sp: Option<String>, out: Vec<String>, lineup: Option<&str>) -> Self {
+        Overrides { away_lineup: None, home_lineup: None, away_sp, home_sp, out, lineup_mode: lineup.unwrap_or("confirmed").to_string(),
+            batter_halflife: d_bat_hl(), pitcher_halflife: d_pit_hl(),
+            hook: Hook { starts: d_hook_starts(), prior: d_hook_prior() } }
+    }
+}
+
+pub struct Prepared {
+    pub game: GameInput,
+    pub inputs: serde_json::Map<String, Value>,
+    pub flags: Vec<String>,
+    pub lineups: Vec<(Vec<String>, String)>,
+    pub starters: Vec<(String, String)>,
+    pub away: String,
+    pub home: String,
+    pub date: chrono::NaiveDate,
+    pub season: i32,
+    pub gtype: &'static str,
+    params: Params,
+    pub provenance: Value,
+    pub g: Value,
+    /// per side: lineup with names, bench options, starting-pitcher options, substitutions made
+    pub roster: Value,
+}
+
+/// The batting order and starting pitcher that actually played this game
+/// (from the stored box score), if it has been played and ingested.
+async fn actual_lineup(db: &tokio_postgres::Client, pk: &str, team: &str) -> Option<(Vec<String>, Option<String>)> {
+    let rows = db.query(
+        "SELECT player_id, (stats->>'bat_start')::float8, (stats->>'bat_order')::float8, (stats->>'p_gs')::float8 \
+         FROM player_game_logs WHERE sport = 'mlb' AND week = $1 AND team = $2", &[&pk, &team]).await.ok()?;
+    let mut bat: Vec<(f64, String)> = rows.iter().filter(|r| r.get::<_, Option<f64>>(1) == Some(1.0))
+        .map(|r| (r.get::<_, Option<f64>>(2).unwrap_or(99.0), r.get::<_, String>(0))).collect();
+    bat.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sp = rows.iter().find(|r| r.get::<_, Option<f64>>(3) == Some(1.0)).map(|r| r.get::<_, String>(0));
+    if bat.len() == 9 { Some((bat.into_iter().map(|x| x.1).collect(), sp)) } else { None }
+}
+
+/// Recent starters (batters with bat_start = 1, or pitchers with p_gs = 1) for a team before `cutoff`, most used first.
+async fn recent_starters(db: &tokio_postgres::Client, team: &str, cutoff: chrono::NaiveDate, pitchers: bool, days: i32) -> Vec<String> {
+    let col = if pitchers { "p_gs" } else { "bat_start" };
+    let sql = format!(
+        "SELECT player_id FROM player_game_logs WHERE sport = 'mlb' AND team = $1 AND game_date < $2 AND game_date >= $2 - $3::int \
+         AND (stats->>'{col}')::float8 = 1 GROUP BY 1 ORDER BY {} DESC", if pitchers { "max(game_date)" } else { "count(*)" });
+    db.query(sql.as_str(), &[&team, &cutoff, &days]).await.map(|r| r.iter().map(|x| x.get::<_, String>(0)).collect()).unwrap_or_default()
+}
+
+/// Everything needed to simulate one MLB game: context from the MLB Stats API,
+/// lineups (override > official posted > projected), starters (override >
+/// announced probable), alternate-reality substitutions, and model inputs built
+/// strictly from earlier games.
+pub async fn prepare(state: &State, pk: &str, ov: &Overrides) -> Result<Prepared, (u16, String)> {
+    let db = &state.db;
+    let url = format!("{API}/schedule?gamePk={pk}&hydrate=probablePitcher,lineups,venue");
+    let sched = get_json(&state.http, &url).await.map_err(|e| (500, e))?;
+    let g = sched["dates"][0]["games"][0].as_object().cloned().map(Value::Object).ok_or((400, "unknown gamePk".to_string()))?;
+    let date = g["officialDate"].as_str().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()).ok_or((500, "game has no date".to_string()))?;
+    let season: i32 = g["season"].as_str().and_then(|s| s.parse().ok()).unwrap_or(date.format("%Y").to_string().parse().unwrap_or(0));
+    let gtype = game_type(g["gameType"].as_str().unwrap_or(""));
+    let (params, baserunning, provenance) = load_params(db, season, gtype == "POST").await.map_err(|e| (422, e))?;
+    let abbr = team_abbrs(&state.http, season).await.unwrap_or_default();
+    let team = |s: &str| abbr.get(&g["teams"][s]["team"]["id"].as_i64().unwrap_or(0)).cloned().unwrap_or_default();
+    let (away, home) = (team("away"), team("home"));
+    let cutoff = date;
+    let mut flags_pre: Vec<String> = Vec::new();
+    let mut lineups: Vec<(Vec<String>, String)> = Vec::new();
+    // projected / confirmed / actual lineups and starters, per side
+    let mut views = vec![json!({ "projected": {}, "confirmed": {}, "actual": {} }); 2];
+    let mut actual_sp: Vec<Option<String>> = vec![None, None];
+    let mut subs_all: Vec<Vec<Value>> = vec![Vec::new(), Vec::new()];
+    let mut bench_opts: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+    for (si, (side, key, lo, team_code)) in [("away", "awayPlayers", &ov.away_lineup, &away), ("home", "homePlayers", &ov.home_lineup, &home)].into_iter().enumerate() {
+        let posted = ids(&g["lineups"][key]);
+        let projected = last_lineup(db, team_code, cutoff).await.map_err(|e| (500, e))?;
+        let actual = actual_lineup(db, pk, team_code).await;
+        views[si]["projected"]["lineup"] = json!(projected);
+        views[si]["confirmed"]["lineup"] = if posted.len() == 9 { json!(posted) } else { Value::Null };
+        views[si]["actual"]["lineup"] = actual.as_ref().map(|a| json!(a.0)).unwrap_or(Value::Null);
+        actual_sp[si] = actual.as_ref().and_then(|a| a.1.clone());
+        let (mut lu, src) = if let Some(o) = split_ids(lo) {
+            (o, "override".to_string())
+        } else {
+            match ov.lineup_mode.as_str() {
+                "actual" => match actual {
+                    Some(a) => (a.0, "actual (box score of this game)".to_string()),
+                    None => return Err((422, format!("{side}: actual lineup not available (game not played or not ingested yet)"))),
+                },
+                "projected" => (projected, "projected (team's previous game batting order)".to_string()),
+                _ if posted.len() == 9 => (posted, "confirmed (official lineup posted by MLB)".to_string()),
+                _ => {
+                    flags_pre.push(format!("{side}: lineup not posted yet; using the projected batting order"));
+                    (projected, "projected (lineup not posted yet)".to_string())
+                }
+            }
+        };
+        if lu.len() != 9 {
+            return Err((422, format!("{side} lineup has {} batters (need 9); pass {side}_lineup", lu.len())));
+        }
+        let pool = recent_starters(db, team_code, cutoff, false, 30).await;
+        let mut bench: Vec<String> = pool.iter().filter(|p| !lu.contains(p) && !ov.out.contains(p)).cloned().collect();
+        bench_opts[si] = bench.iter().take(8).cloned().collect();
+        for slot in 0..9 {
+            if ov.out.contains(&lu[slot]) {
+                if bench.is_empty() {
+                    return Err((422, format!("{side}: no replacement available for ruled-out batter {}", lu[slot])));
+                }
+                let rep = bench.remove(0);
+                subs_all[si].push(json!({ "slot": slot + 1, "out": lu[slot], "in": rep }));
+                lu[slot] = rep;
+            }
+        }
+        lineups.push((lu, src));
+    }
+    let mut starters: Vec<(String, String)> = Vec::new();
+    let mut sp_opts: Vec<Vec<String>> = vec![Vec::new(), Vec::new()];
+    for (si, (side, so, team_code)) in [("away", &ov.away_sp, &away), ("home", &ov.home_sp, &home)].into_iter().enumerate() {
+        let recent = recent_starters(db, team_code, cutoff, true, 45).await;
+        sp_opts[si] = recent.iter().take(8).cloned().collect();
+        let probable = g["teams"][side]["probablePitcher"]["id"].as_i64().map(|x| x.to_string());
+        let projected_sp = probable.clone().or_else(|| recent.first().cloned());
+        views[si]["projected"]["starter"] = json!(projected_sp);
+        views[si]["confirmed"]["starter"] = json!(probable);
+        views[si]["actual"]["starter"] = json!(actual_sp[si]);
+        if ov.lineup_mode == "actual" && so.is_none() {
+            match actual_sp[si].clone() {
+                Some(a) => { starters.push((a, "actual (started this game)".to_string())); continue; }
+                None => return Err((422, format!("{side}: actual starter not available (game not played or not ingested yet)"))),
+            }
+        }
+        let probable = if ov.lineup_mode == "projected" { projected_sp.clone() } else { probable };
+        let chosen = match (so.clone(), probable) {
+            (Some(o), _) => (o, "scenario / override".to_string()),
+            (None, Some(p)) if !ov.out.contains(&p) => (p, "probable (announced by MLB)".to_string()),
+            (None, Some(p)) => {
+                let alt = recent.iter().find(|x| **x != p && !ov.out.contains(*x)).cloned()
+                    .ok_or((422, format!("{side}: announced starter ruled out and no other recent starter found; choose {side}_sp")))?;
+                flags_pre.push(format!("{side}: announced starter ruled out; using the team's most recent other starter"));
+                (alt, "scenario: replacement starter (team's most recent other starter)".to_string())
+            }
+            (None, None) => match recent.first() {
+                Some(p) if !ov.out.contains(p) => {
+                    flags_pre.push(format!("{side}: no announced starter; using the team's most recent starter (choose {side}_sp to change)"));
+                    (p.clone(), "projected (no announced starter)".to_string())
+                }
+                _ => return Err((422, format!("no announced {side} starter yet; pass {side}_sp=<MLB person id>"))),
+            },
+        };
+        starters.push(chosen);
+    }
+    let built = build_input(
+        db, &params, baserunning,
+        Side { team: &away, lineup: &lineups[0].0, starter: &starters[0].0, lineup_source: &lineups[0].1, starter_source: &starters[0].1 },
+        Side { team: &home, lineup: &lineups[1].0, starter: &starters[1].0, lineup_source: &lineups[1].1, starter_source: &starters[1].1 },
+        cutoff, season, ov.batter_halflife, ov.pitcher_halflife, ov.hook,
+    ).await.map_err(|e| (422, e))?;
+    let Built { game, inputs, mut flags } = built;
+    flags.splice(0..0, flags_pre);
+    // names for everyone the UI may show
+    let mut all: Vec<String> = lineups.iter().flat_map(|l| l.0.clone()).collect();
+    all.extend(starters.iter().map(|s| s.0.clone()));
+    all.extend(bench_opts.iter().flatten().cloned());
+    all.extend(sp_opts.iter().flatten().cloned());
+    all.extend(ov.out.iter().cloned());
+    for v in &views {
+        for k in ["projected", "confirmed", "actual"] {
+            all.extend(v[k]["lineup"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)));
+            if let Some(sp) = v[k]["starter"].as_str() { all.push(sp.to_string()); }
+        }
+    }
+    let names = names_of(db, &all).await;
+    let person = |id: &str| json!({ "id": id, "name": names.get(id).map(|x| x.0.clone()).unwrap_or_else(|| id.to_string()),
+        "pos": names.get(id).map(|x| x.1.clone()).unwrap_or_default() });
+    let roster = json!({
+        "away": { "lineup": lineups[0].0.iter().map(|x| person(x)).collect::<Vec<_>>(), "lineup_source": lineups[0].1,
+                  "starter": person(&starters[0].0), "starter_source": starters[0].1,
+                  "bench": bench_opts[0].iter().map(|x| person(x)).collect::<Vec<_>>(), "starter_options": sp_opts[0].iter().map(|x| person(x)).collect::<Vec<_>>(),
+                  "substitutions": subs_all[0] },
+        "home": { "lineup": lineups[1].0.iter().map(|x| person(x)).collect::<Vec<_>>(), "lineup_source": lineups[1].1,
+                  "starter": person(&starters[1].0), "starter_source": starters[1].1,
+                  "bench": bench_opts[1].iter().map(|x| person(x)).collect::<Vec<_>>(), "starter_options": sp_opts[1].iter().map(|x| person(x)).collect::<Vec<_>>(),
+                  "substitutions": subs_all[1] },
+        "scenario_out": ov.out,
+        "lineup_mode": ov.lineup_mode,
+        "views": ([0, 1].map(|si| {
+            let v = &views[si];
+            let conv = |k: &str| -> Value {
+                if v[k]["lineup"].is_null() && v[k]["starter"].is_null() { return Value::Null; }
+                json!({
+                    "lineup": v[k]["lineup"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| person(x)).collect::<Vec<_>>()),
+                    "starter": v[k]["starter"].as_str().map(|x| person(x)),
+                })
+            };
+            json!({ "projected": conv("projected"), "confirmed": conv("confirmed"), "actual": conv("actual") })
+        })),
+    });
+    Ok(Prepared { game, inputs, flags, lineups, starters, away, home, date, season, gtype, params, provenance, g, roster })
+}
+
+fn result_text(result: &str, name: &str, runs: u16, outs_on_play: u8, rbi: u16) -> String {
+    let base = match result {
+        "k" => format!("{name} strikes out"),
+        "bb" => format!("{name} walks"),
+        "hbp" => format!("{name} is hit by a pitch"),
+        "1b" => format!("{name} singles"),
+        "2b" => format!("{name} doubles"),
+        "3b" => format!("{name} triples"),
+        "hr" => match runs { 1 => format!("{name} hits a solo HOME RUN"), 4 => format!("{name} hits a GRAND SLAM"), n => format!("{name} hits a {n}-run HOME RUN") },
+        _ => match (outs_on_play, runs > 0) {
+            (2, _) => format!("{name} grounds into a double play"),
+            (3, _) => format!("{name} hits into a triple play"),
+            (_, true) if rbi > 0 => format!("{name} out on a ball in play, run{} scores", if runs > 1 { "s" } else { "" }),
+            _ => format!("{name} out on a ball in play"),
+        },
+    };
+    if result != "hr" && runs > 0 && result != "out" { format!("{base}, {runs} run{} score{}", if runs > 1 { "s" } else { "" }, if runs > 1 { "" } else { "s" }) } else { base }
+}
+
+/// Broadcast session for an MLB game: one seeded game, plate appearance by plate appearance.
+pub async fn new_session(state: &State, pk: &str, seed: u64, ov: Overrides) -> Result<(Value, Vec<Value>, Value, chrono::NaiveDate), String> {
+    let p = prepare(state, pk, &ov).await.map_err(|(_, e)| e)?;
+    let g2 = p.game.clone();
+    let (res, events) = web::block(move || mlb_sim::single_game(&g2, seed)).await.map_err(|e| e.to_string())?
+        .ok_or("simulation hit the extra-innings safety cap 20 times")?;
+    let lname = |side: usize, slot: u8| p.roster[if side == 0 { "away" } else { "home" }]["lineup"][slot as usize]["name"].as_str().unwrap_or("").to_string();
+    let events: Vec<Value> = events.into_iter().map(|e| {
+        let text = match e.kind {
+            "pa" => {
+                let nm = if e.bench { format!("Pinch hitter for {}", lname(e.batting as usize, e.slot)) } else { lname(e.batting as usize, e.slot) };
+                result_text(e.result, &nm, e.runs, e.outs_on_play, e.rbi)
+            }
+            "pitching_change" => {
+                let field = if e.batting == 0 { "home" } else { "away" };
+                let team = if e.batting == 0 { &p.home } else { &p.away };
+                let bf = e.pitching_box[1 - e.batting as usize][0][0];
+                format!("Pitching change for {team}: {} leaves after {bf} batters faced; bullpen in", p.roster[field]["starter"]["name"].as_str().unwrap_or("the starter"))
+            }
+            "inning_end" => format!("End of the {} of the {}", if e.half == 0 { "top" } else { "bottom" }, ordinal(e.inning)),
+            _ => format!("FINAL{}: {} {} — {} {}", if res.innings > 9 { format!(" ({})", res.innings) } else { String::new() },
+                p.away, res.runs[0], p.home, res.runs[1]),
+        };
+        let mut v = serde_json::to_value(&e).unwrap_or(Value::Null);
+        v["text"] = json!(text);
+        v
+    }).collect();
+    let fin = json!({ "score": res.runs, "innings": res.innings });
+    let meta = json!({
+        "sport": "mlb", "game_id": pk, "date": p.date, "season": p.season, "postseason": p.gtype == "POST",
+        "away": p.away, "home": p.home, "venue": p.g["venue"]["name"], "status": p.g["status"]["detailedState"],
+        "bat_keys": ["pa", "h", "hr", "rbi", "r", "bb", "k", "tb"], "pit_keys": ["bf", "outs", "k", "bb", "h", "hr", "r", "er"],
+        "roster": p.roster,
+        "actual": { "away_score": p.g["teams"]["away"]["score"], "home_score": p.g["teams"]["home"]["score"] },
+        "inputs": { "model_version": SIM_MODEL, "params": p.provenance, "data_cutoff": p.date, "flags": p.flags,
+                    "assumptions": LIMITATIONS, "detail": Value::Object(p.inputs) },
+    });
+    let _ = &p.params;
+    Ok((meta, events, fin, p.date))
+}
+
+fn ordinal(n: u8) -> String {
+    let suf = match (n % 10, n % 100) { (1, x) if x != 11 => "st", (2, x) if x != 12 => "nd", (3, x) if x != 13 => "rd", _ => "th" };
+    format!("{n}{suf}")
 }
 
 const LIMITATIONS: [&str; 5] = [

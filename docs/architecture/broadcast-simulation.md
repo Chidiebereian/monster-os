@@ -1,8 +1,10 @@
 # Broadcast simulation — architecture and contract
 
-Status as of 2026-10-19. NFL is implemented end to end; NBA, NHL and MLB are
-not yet available as broadcast sessions (MLB has a plate-appearance simulator,
-`mlb_sim.rs`, but it does not emit events yet).
+Status as of 2026-10-19:
+
+* **NFL and MLB** are implemented end to end, including confirmed lineups and
+  alternate realities.
+* **NBA and NHL** are not yet available as broadcast sessions.
 
 ## Principle
 
@@ -95,6 +97,35 @@ Integrity: sequence numbers are contiguous from 1. The client verifies
 continuity when loading (`loadAllEvents`) and refuses a log with a gap. Tests
 assert that scoring events sum to the final score, the QB's yards equal his
 receivers' yards, and clocks, downs and spots stay legal.
+
+## MLB events
+
+`POST /sim/sessions {"sport":"mlb","game_id":"<gamePk>","seed"?,"out"?:[ids],"away_sp"?,"home_sp"?}`
+returns a session whose events come from `mlb_sim::single_game`: one per
+plate appearance, plus pitching changes, inning ends and the final.
+
+```json
+{ "seq": 64, "kind": "pa", "inning": 7, "half": 0, "batting": 0, "slot": 7, "bench": false, "pitcher": 1,
+  "result": "bb", "outs_before": 0, "bases_before": [5, 6, null], "outs_on_play": 0, "runs": 0, "scorers": [], "rbi": 0,
+  "text": "Petey Halpin walks",
+  "state": { "inning": 7, "half": 0, "outs": 0, "bases": [7, 6, 5], "score": [2, 4],
+             "linescore": [[0,0,2,0,0,0,0],[0,0,2,0,0,2]], "hits": [7, 5], "on_mound": [1, 1], "next_up": [8, 0] },
+  "batting_box": [[[pa,h,hr,rbi,r,bb,k,tb] x 9] x 2], "pitching_box": [[[starter], [bullpen]] x 2] }
+```
+
+Conventions:
+
+* Bases hold batting-order slots (0–8) of the runners on 1B, 2B and 3B.
+* `meta.roster` gives each side's lineup (official posted, else projected),
+  starter, bench and starter options, plus any substitutions made by the
+  scenario.
+* Ruling a batter out gives his slot to the team's next most-used recent
+  starter. Ruling a starting pitcher out uses the team's most recent other
+  starter unless one is chosen.
+* `GET /mlb/simulate/{gamePk}?out=` runs the same scenario as a 100k
+  ensemble.
+* Tests check that plate-appearance runs, the line score and the final agree,
+  that sequence numbers are contiguous, and that seeds reproduce.
 
 ## Why no WebSocket (yet)
 

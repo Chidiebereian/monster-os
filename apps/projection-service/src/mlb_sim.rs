@@ -454,9 +454,108 @@ fn draw_hook(own: &[u32], league: &[u32], prior: f64, rng: &mut Rng) -> u32 {
 
 const MAX_INNINGS: u8 = 30;
 
+// --------------------------------------------------------------------------
+// Events (broadcast mode)
+// --------------------------------------------------------------------------
+
+/// Game state after an event; everything the broadcast shows comes from here.
+#[derive(Clone, serde::Serialize, Debug)]
+pub struct PaState {
+    pub inning: u8,
+    pub half: u8, // 0 top (away bats), 1 bottom
+    pub outs: u8,
+    /// batting-order slot (0-8) of the runner on 1B/2B/3B
+    pub bases: [Option<u8>; 3],
+    pub score: [u16; 2],
+    /// runs by inning, [away, home]
+    pub linescore: [Vec<u16>; 2],
+    pub hits: [u16; 2],
+    /// pitcher on the mound for each fielding side: 0 starter, 1 bullpen
+    pub on_mound: [u8; 2],
+    /// next batting-order slot due up for each team
+    pub next_up: [u8; 2],
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+pub struct PaEvent {
+    pub seq: u32,
+    /// "pa", "pitching_change", "inning_end", "game_end"
+    pub kind: &'static str,
+    pub inning: u8,
+    pub half: u8,
+    pub batting: u8,
+    pub slot: u8,
+    /// a replacement hitter batted in this slot
+    pub bench: bool,
+    pub pitcher: u8,
+    /// k, bb, hbp, 1b, 2b, 3b, hr, out
+    pub result: &'static str,
+    pub outs_before: u8,
+    pub bases_before: [Option<u8>; 3],
+    pub outs_on_play: u8,
+    pub runs: u16,
+    /// slots of the runners who scored, in order
+    pub scorers: Vec<u8>,
+    pub rbi: u16,
+    pub state: PaState,
+    /// [side][slot] = [pa, h, hr, rbi, r, bb, k, tb] (starter in the slot)
+    pub batting_box: [[[u16; 8]; 9]; 2],
+    /// [side] = (starter, bullpen) each [bf, outs, k, bb, h, hr, r, er]
+    pub pitching_box: [[[u16; 8]; 2]; 2],
+}
+
+fn bat_arr(b: &BatLine) -> [u16; 8] { [b.pa, b.h, b.hr, b.rbi, b.r, b.bb, b.k, b.tb()] }
+fn pit_arr(p: &PitLine) -> [u16; 8] { [p.bf, p.outs, p.k, p.bb, p.h, p.hr, p.r, p.er] }
+
+struct Recorder<'a> {
+    ev: &'a mut Vec<PaEvent>,
+    linescore: [Vec<u16>; 2],
+    next_up: [u8; 2],
+}
+impl<'a> Recorder<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn push(&mut self, res: &GameResult, kind: &'static str, inning: u8, half: u8, slot: u8, bench: bool, pitcher: u8, result: &'static str,
+            outs_before: u8, bases_before: [Option<u8>; 3], outs_on_play: u8, runs: u16, scorers: Vec<u8>, rbi: u16,
+            outs: u8, bases: [Option<u8>; 3], on_mound: [u8; 2]) {
+        let hits = [0, 1].map(|s: usize| res.bat[s].iter().chain(res.bench[s].iter()).map(|b| b.h).sum::<u16>());
+        let seq = self.ev.len() as u32 + 1;
+        self.ev.push(PaEvent {
+            seq, kind, inning, half, batting: half, slot, bench, pitcher, result, outs_before, bases_before, outs_on_play, runs, scorers, rbi,
+            state: PaState { inning, half, outs, bases, score: res.runs, linescore: self.linescore.clone(), hits, on_mound, next_up: self.next_up },
+            batting_box: [0, 1].map(|s: usize| {
+                let mut a = [[0u16; 8]; 9];
+                for k in 0..9 { a[k] = bat_arr(&res.bat[s][k]); }
+                a
+            }),
+            pitching_box: [0, 1].map(|s: usize| [pit_arr(&res.starter[s]), pit_arr(&res.bullpen[s])]),
+        });
+    }
+}
+
+fn slots(b: &[Option<Runner>; 3]) -> [Option<u8>; 3] { [b[0].map(|r| r.slot), b[1].map(|r| r.slot), b[2].map(|r| r.slot)] }
+
 /// Simulate one game. Returns None if it hit the safety cap on innings
 /// (counted as a rejected simulation by the caller).
 pub fn sim_game(g: &GameInput, t: &Tables, rng: &mut Rng) -> Option<GameResult> {
+    sim_game_rec(g, t, rng, None)
+}
+
+/// Broadcast mode: one game with its plate-appearance event log.
+pub fn single_game(g: &GameInput, seed: u64) -> Option<(GameResult, Vec<PaEvent>)> {
+    for attempt in 0..20u32 {
+        let mut prng = Rng::new(derive_seed(seed, &["draw", "single", &attempt.to_string()]));
+        let t = build_tables(g, &mut prng);
+        let mut rng = Rng::new(derive_seed(seed, &["game", "single", &attempt.to_string()]));
+        let mut ev = Vec::new();
+        if let Some(r) = sim_game_rec(g, &t, &mut rng, Some(&mut ev)) {
+            return Some((r, ev));
+        }
+    }
+    None
+}
+
+fn sim_game_rec(g: &GameInput, t: &Tables, rng: &mut Rng, events: Option<&mut Vec<PaEvent>>) -> Option<GameResult> {
+    let mut rec = events.map(|ev| Recorder { ev, linescore: [Vec::new(), Vec::new()], next_up: [0, 0] });
     let mut res = GameResult::default();
     let mut next_slot = [0usize; 2];
     let hooks = [
@@ -474,8 +573,12 @@ pub fn sim_game(g: &GameInput, t: &Tables, rng: &mut Rng) -> Option<GameResult> 
             // bottom of the last regulation inning (or later) isn't played if home leads
             if bat == 1 && inning >= g.innings && res.runs[1] > res.runs[0] {
                 res.innings = inning;
+                if let Some(r) = rec.as_mut() {
+                    r.push(&res, "game_end", inning, 1, 0, false, 0, "", 0, [None; 3], 0, 0, vec![], 0, 0, [None; 3], on_mound);
+                }
                 return Some(res);
             }
+            if let Some(r) = rec.as_mut() { r.linescore[bat].push(0); }
             let mut outs: u8 = 0;
             let mut bases: [Option<Runner>; 3] = [None, None, None];
             if g.ghost_runner && inning > g.innings {
@@ -495,6 +598,7 @@ pub fn sim_game(g: &GameInput, t: &Tables, rng: &mut Rng) -> Option<GameResult> 
                 let kind = on_mound[field] as usize;
                 let cat = draw_cat(&t.cum[bat][if bench { 9 } else { slot }][kind], rng);
                 let mask: u8 = (0..3).filter(|&i| bases[i].is_some()).fold(0, |m, i| m | (1 << i));
+                let (outs_before, bases_before) = (outs, slots(&bases));
                 let mv = g.baserunning.sample(cat, mask, outs, rng);
 
                 // pitcher + batter line for the event itself
@@ -566,20 +670,42 @@ pub fn sim_game(g: &GameInput, t: &Tables, rng: &mut Rng) -> Option<GameResult> 
                 pl.outs += real_outs as u16;
                 outs = outs_after;
                 bases = new_bases;
+                if let Some(r) = rec.as_mut() {
+                    r.next_up = [next_slot[0] as u8, next_slot[1] as u8];
+                    if let Some(last) = r.linescore[bat].last_mut() { *last += runs; }
+                    let sc: Vec<u8> = scorers.iter().map(|x| x.slot).collect();
+                    r.push(&res, "pa", inning, bat as u8, slot as u8, bench, kind as u8, CATS[cat], outs_before, bases_before,
+                        real_outs, runs, sc, rbi, outs, if outs >= 3 { [None; 3] } else { slots(&bases) }, on_mound);
+                }
 
                 // starter hook once he reaches his batters-faced draw
                 if kind == 0 && res.starter[field].bf as u32 >= hooks[field] {
                     on_mound[field] = 1;
+                    if let Some(r) = rec.as_mut() {
+                        if outs < 3 && !(bat == 1 && inning >= g.innings && res.runs[1] > res.runs[0]) {
+                            r.push(&res, "pitching_change", inning, bat as u8, 0, false, 1, "", outs, slots(&bases), 0, 0, vec![], 0,
+                                outs, slots(&bases), on_mound);
+                        }
+                    }
                 }
                 // walk-off ends the game immediately
                 if bat == 1 && inning >= g.innings && res.runs[1] > res.runs[0] {
                     res.innings = inning;
+                    if let Some(r) = rec.as_mut() {
+                        r.push(&res, "game_end", inning, 1, 0, false, 0, "", outs, [None; 3], 0, 0, vec![], 0, outs, [None; 3], on_mound);
+                    }
                     return Some(res);
                 }
+            }
+            if let Some(r) = rec.as_mut() {
+                r.push(&res, "inning_end", inning, bat as u8, 0, false, 0, "", 3, [None; 3], 0, 0, vec![], 0, 3, [None; 3], on_mound);
             }
         }
         if inning >= g.innings && res.runs[0] != res.runs[1] {
             res.innings = inning;
+            if let Some(r) = rec.as_mut() {
+                r.push(&res, "game_end", inning, 1, 0, false, 0, "", 3, [None; 3], 0, 0, vec![], 0, 3, [None; 3], on_mound);
+            }
             return Some(res);
         }
         inning += 1;
@@ -796,6 +922,33 @@ pub fn shrink(counts: &[f64; NCAT], league: &[f64; NCAT], kappa: &[f64; NCAT]) -
 // --------------------------------------------------------------------------
 
 #[cfg(test)]
+mod event_tests {
+    use super::*;
+    #[test]
+    fn events_are_consistent_with_the_result() {
+        let g = tests::game();
+        for seed in 0..200u64 {
+            let (r, ev) = single_game(&g, seed).expect("game");
+            assert_eq!(ev.last().unwrap().kind, "game_end");
+            assert_eq!(ev.last().unwrap().state.score, r.runs);
+            let runs: [u16; 2] = [0, 1].map(|s| ev.iter().filter(|e| e.kind == "pa" && e.batting == s).map(|e| e.runs).sum());
+            assert_eq!(runs, r.runs, "seed {seed}");
+            let ls: [u16; 2] = [0, 1].map(|s| ev.last().unwrap().state.linescore[s].iter().sum());
+            assert_eq!(ls, r.runs);
+            for (i, e) in ev.iter().enumerate() {
+                assert_eq!(e.seq as usize, i + 1);
+                assert!(e.state.outs <= 3);
+                if e.kind == "pa" { assert_eq!(e.scorers.len() as u16, e.runs); }
+            }
+        }
+        let (a, ea) = single_game(&g, 7).unwrap();
+        let (b, eb) = single_game(&g, 7).unwrap();
+        assert_eq!(a.runs, b.runs);
+        assert_eq!(ea.len(), eb.len());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -814,7 +967,7 @@ mod tests {
             bat_env: [1.0; NCAT],
         }
     }
-    fn game() -> GameInput {
+    pub(super) fn game() -> GameInput {
         GameInput {
             away: flat_team(),
             home: flat_team(),

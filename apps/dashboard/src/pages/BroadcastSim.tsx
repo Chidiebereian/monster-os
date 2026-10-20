@@ -7,6 +7,8 @@ import { BoxScorePanel, Controls, LatestPlay, PlayByPlay, PREGAME, Scoreboard, T
 import { useSimulationPlayback } from "../hooks/useSimulationPlayback";
 import { EMPTY_SCENARIO, isEmptyScenario, loadAllEvents, simApi, teamColor, type NflEnsemble, type NflSimGame, type Scenario, type SimEvent, type SimSession } from "../lib/sim";
 import { LineupPanel, ScenarioImpact } from "../components/simulation/LineupPanel";
+import { MlbBroadcast } from "../components/simulation/MlbBroadcast";
+import { StartersCompare, type LineupMode } from "../components/simulation/StartersCompare";
 import { formatPct } from "../lib/odds";
 import { Card, Msg } from "../components/ui";
 
@@ -17,10 +19,32 @@ import { Card, Msg } from "../components/ui";
 
 const SPORTS = [
   { key: "nfl", label: "NFL", ready: true },
+  { key: "mlb", label: "MLB", ready: true },
   { key: "nba", label: "NBA", ready: false },
   { key: "nhl", label: "NHL", ready: false },
-  { key: "mlb", label: "MLB", ready: false },
 ];
+
+export function BroadcastSim() {
+  const [params, setParams] = useSearchParams();
+  const sport = params.get("sport") === "mlb" ? "mlb" : "nfl";
+  return (
+    <div className="space-y-4 min-w-0">
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-lg font-semibold">Game Broadcast</h1>
+        <span className="text-sm text-gray-500">one simulated game, play by play · every outcome from the simulation engine</span>
+        <div className="ml-auto flex overflow-hidden rounded-md border border-glass">
+          {SPORTS.map((s) => (
+            <button key={s.key} disabled={!s.ready} onClick={() => setParams(s.key === "nfl" ? {} : { sport: s.key })} title={s.ready ? "" : "broadcast engine not built yet"}
+              className={clsx("px-3 py-1 text-xs", sport === s.key ? "bg-amber/20 text-amber" : "text-gray-400", !s.ready && "opacity-40 cursor-not-allowed")}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {sport === "mlb" ? <MlbBroadcast /> : <NflBroadcast />}
+    </div>
+  );
+}
 
 function GamePicker({ games, value, onPick }: { games: NflSimGame[]; value: string | null; onPick: (g: string) => void }) {
   return (
@@ -119,8 +143,7 @@ function Prediction({ q, teams }: { q: { data?: NflEnsemble; isLoading: boolean;
   );
 }
 
-export function BroadcastSim() {
-  const [sport, setSport] = useState("nfl");
+function NflBroadcast() {
   // deep links: ?game=<game_id>&seq=<play number> (seed=<n> replays a specific simulation)
   const [params] = useSearchParams();
   const games = useQuery({ queryKey: ["nfl-sim-games"], queryFn: simApi.nflGames });
@@ -136,11 +159,12 @@ export function BroadcastSim() {
   // alternate reality: `draft` is being edited, `applied` drives the broadcast + prediction
   const [draft, setDraft] = useState<Scenario>(EMPTY_SCENARIO);
   const [applied, setApplied] = useState<Scenario>(EMPTY_SCENARIO);
+  const [lineupMode, setLineupMode] = useState<LineupMode>("confirmed");
   const [events, setEvents] = useState<SimEvent[]>([]);
   const create = useMutation({
-    mutationFn: async ({ gid, scenario }: { gid: string; scenario: Scenario }) => {
+    mutationFn: async ({ gid, scenario, lineup = "confirmed" }: { gid: string; scenario: Scenario; lineup?: LineupMode }) => {
       const seedParam = params.get("seed");
-      const s = await simApi.createSession({ sport: "nfl", game_id: gid, seed: seedParam ? Number(seedParam) : undefined, ...scenario });
+      const s = await simApi.createSession({ sport: "nfl", game_id: gid, seed: seedParam ? Number(seedParam) : undefined, lineup, ...scenario });
       const ev = await loadAllEvents(s.session_id);
       return { s, ev };
     },
@@ -148,20 +172,29 @@ export function BroadcastSim() {
   });
   useEffect(() => {
     if (gameId) {
-      setSession(null); setEvents([]); setDraft(EMPTY_SCENARIO); setApplied(EMPTY_SCENARIO);
+      setSession(null); setEvents([]); setDraft(EMPTY_SCENARIO); setApplied(EMPTY_SCENARIO); setLineupMode("confirmed");
       create.mutate({ gid: gameId, scenario: EMPTY_SCENARIO });
     }
   }, [gameId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const ensemble = useQuery({ queryKey: ["nfl-ensemble", gameId], queryFn: () => simApi.nflEnsemble(gameId!), enabled: !!gameId, staleTime: 10 * 60_000 });
+  const ensemble = useQuery({ queryKey: ["nfl-ensemble", gameId, lineupMode], queryFn: () => simApi.nflEnsemble(gameId!, EMPTY_SCENARIO, lineupMode), enabled: !!gameId, staleTime: 10 * 60_000 });
   const scenarioOn = !isEmptyScenario(applied);
-  const altEnsemble = useQuery({ queryKey: ["nfl-ensemble", gameId, applied], queryFn: () => simApi.nflEnsemble(gameId!, applied),
+  const altEnsemble = useQuery({ queryKey: ["nfl-ensemble", gameId, lineupMode, applied], queryFn: () => simApi.nflEnsemble(gameId!, applied, lineupMode),
     enabled: !!gameId && scenarioOn, staleTime: 10 * 60_000 });
   const runReality = (s: Scenario) => {
     if (!gameId) return;
     setApplied(s);
-    create.mutate({ gid: gameId, scenario: s });
+    create.mutate({ gid: gameId, scenario: s, lineup: lineupMode });
   };
+  const changeLineupMode = (m: LineupMode) => {
+    if (!gameId) return;
+    setLineupMode(m);
+    create.mutate({ gid: gameId, scenario: applied, lineup: m });
+  };
+  const starterTeams = (session?.meta.inputs.starters ?? []).map((t) => ({
+    abbr: t.team,
+    rows: t.projected.map((r, i) => ({ label: r.role, projected: r.player, confirmed: t.confirmed[i]?.player ?? null, actual: t.actual ? t.actual[i]?.player ?? null : undefined })),
+  }));
   const lineupTeams = ensemble.data?.inputs.teams ?? session?.meta.inputs.teams ?? [];
   const nameOf = (id: string) => lineupTeams.flatMap((t) => t.lineup).find((e) => e.id === id)?.name ?? id;
 
@@ -185,18 +218,6 @@ export function BroadcastSim() {
 
   return (
     <div className="space-y-4 min-w-0">
-      <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-lg font-semibold">Game Broadcast</h1>
-        <span className="text-sm text-gray-500">one simulated game, play by play · every outcome from the simulation engine</span>
-        <div className="ml-auto flex overflow-hidden rounded-md border border-glass">
-          {SPORTS.map((s) => (
-            <button key={s.key} disabled={!s.ready} onClick={() => setSport(s.key)} title={s.ready ? "" : "broadcast engine not built yet"}
-              className={clsx("px-3 py-1 text-xs", sport === s.key ? "bg-amber/20 text-amber" : "text-gray-400", !s.ready && "opacity-40 cursor-not-allowed")}>
-              {s.label}
-            </button>
-          ))}
-        </div>
-      </div>
       {games.error && <Msg tone="error">{(games.error as Error).message}</Msg>}
       {games.isLoading && <Msg>Loading games…</Msg>}
       {list.length > 0 && <GamePicker games={list} value={gameId} onPick={setGameId} />}
@@ -217,7 +238,7 @@ export function BroadcastSim() {
         </div>
         <div className="mt-4 space-y-3">
           <Controls playing={pb.playing} toggle={pb.toggle} step={pb.step} restart={pb.restart} jumpEnd={() => pb.jump(pb.total)}
-            speed={pb.speed} setSpeed={pb.setSpeed} onNew={() => gameId && create.mutate({ gid: gameId, scenario: applied })} seq={pb.seq} total={pb.total} busy={create.isPending} />
+            speed={pb.speed} setSpeed={pb.setSpeed} onNew={() => gameId && create.mutate({ gid: gameId, scenario: applied, lineup: lineupMode })} seq={pb.seq} total={pb.total} busy={create.isPending} />
           {scenarioOn && <div className="text-[12px] text-amber">Alternate reality: {[
             ...applied.out.map((id) => `${nameOf(id)} out`),
             ...applied.in.map((id) => `${nameOf(id)} plays`),
@@ -229,6 +250,14 @@ export function BroadcastSim() {
           <div className="mt-3 text-sm text-gray-400">Real result of this game: {teams[0]} {actual.away_score} — {teams[1]} {actual.home_score} (the simulation used only data from before kickoff).</div>
         )}
       </div>
+
+      {starterTeams.length > 0 && (
+        <Card>
+          <div className="mb-2 text-sm font-semibold">Starters: projected vs confirmed vs actual</div>
+          <StartersCompare teams={starterTeams} mode={lineupMode} onMode={changeLineupMode} busy={create.isPending}
+            available={{ projected: true, confirmed: true, actual: !!session?.meta.inputs.actual_available }} />
+        </Card>
+      )}
 
       {lineupTeams.length > 0 && (
         <Card>

@@ -90,7 +90,13 @@ export interface SimInputs {
   flags: string[];
   assumptions: string[];
   availability: { week: number; rates: { questionable: number; doubtful: number }; rates_source: string; scenario_out: string[]; scenario_in: string[] };
+  lineup_mode: "projected" | "confirmed" | "actual";
+  actual_available: boolean;
+  starters: NflStartersTeam[];
 }
+
+export interface NflStarterRow { role: string; player: { id: string; name: string; pos: string; p_active: number } | null }
+export interface NflStartersTeam { team: string; projected: NflStarterRow[]; confirmed: NflStarterRow[]; actual: NflStarterRow[] | null }
 
 export interface SimSessionMeta {
   sport: string;
@@ -211,13 +217,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const simApi = {
   nflGames: () => req<{ today: string; plays_through: string | null; games: NflSimGame[] }>(`/nfl/sim/games?days=10&back=7`),
-  createSession: (body: { sport: string; game_id: string; seed?: number } & Partial<Scenario>) =>
+  createSession: (body: { sport: string; game_id: string; seed?: number; lineup?: string } & Partial<Scenario>) =>
     req<SimSession>(`/sim/sessions`, { method: "POST", body: JSON.stringify(body) }),
   events: (id: string, after = 0, limit = 1000) => req<SimEventsPage>(`/sim/sessions/${id}/events?after=${after}&limit=${limit}`),
   // production predictions: always 100,000 simulated games (the backend enforces the floor too)
-  nflEnsemble: (gameId: string, scenario: Scenario = EMPTY_SCENARIO) => {
+  nflEnsemble: (gameId: string, scenario: Scenario = EMPTY_SCENARIO, lineup = "confirmed") => {
     const extra = scenarioQs(scenario);
-    return req<NflEnsemble>(`/nfl/simulate/${gameId}?n=100000${extra ? `&${extra}` : ""}`);
+    return req<NflEnsemble>(`/nfl/simulate/${gameId}?n=100000&lineup=${lineup}${extra ? `&${extra}` : ""}`);
   },
   nflBacktests: () => req<{ backtests: NflBacktest[] }>(`/nfl/backtests`),
 };
