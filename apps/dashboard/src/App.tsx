@@ -12,6 +12,7 @@ import { Backtest } from "./pages/Backtest";
 import { Cheatsheets } from "./pages/Cheatsheets";
 import { HitRates } from "./pages/HitRates";
 import { MlbSim } from "./pages/MlbSim";
+import { BroadcastSim } from "./pages/BroadcastSim";
 import { MonsterGpt } from "./pages/MonsterGpt";
 
 const queryClient = new QueryClient({
@@ -31,6 +32,7 @@ export default function App() {
             <Route path="/cheatsheets" element={<Cheatsheets />} />
             <Route path="/hit-rates" element={<HitRates />} />
             <Route path="/mlb-sim" element={<MlbSim />} />
+            <Route path="/broadcast" element={<BroadcastSim />} />
             <Route path="/arbitrage" element={<Arbitrage />} />
             <Route path="/whale-watch" element={<WhaleWatch />} />
             <Route path="/signals" element={<SmartSignals />} />

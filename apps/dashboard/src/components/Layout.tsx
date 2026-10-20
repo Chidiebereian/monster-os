@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices } from "lucide-react";
+import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv } from "lucide-react";
 import clsx from "clsx";
 import { SPORTS, useSettings } from "../store/settings";
 
@@ -9,6 +9,7 @@ const NAV = [
   { to: "/projections", label: "Projections", icon: BarChart3 },
   { to: "/cheatsheets", label: "Cheat Sheets", icon: ClipboardList },
   { to: "/hit-rates", label: "Hit Rates", icon: Target },
+  { to: "/broadcast", label: "Game Broadcast", icon: Tv },
   { to: "/mlb-sim", label: "MLB Game Sim", icon: Dices },
   { to: "/arbitrage", label: "Arbitrage", icon: Scale },
   { to: "/whale-watch", label: "Whale Watch", icon: Waves },
@@ -23,7 +24,7 @@ export function Layout() {
   return (
     <div className="flex h-full">
       {/* Sidebar */}
-      <aside className="w-56 shrink-0 border-r border-glass bg-surface/60 flex flex-col">
+      <aside className="hidden md:flex w-56 shrink-0 border-r border-glass bg-surface/60 flex-col">
         <div className="h-14 flex items-center gap-2 px-4 border-b border-glass">
           <Dog className="text-violet" size={20} />
           <span className="font-semibold tracking-tight">Monster<span className="text-violet">OS</span></span>
@@ -52,7 +53,7 @@ export function Layout() {
 
       {/* Main */}
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="h-14 shrink-0 flex items-center gap-4 px-5 border-b border-glass bg-surface/40">
+        <header className="h-14 shrink-0 flex items-center gap-4 px-4 md:px-5 border-b border-glass bg-surface/40">
           <select
             value={sportKey}
             onChange={(e) => setSport(e.target.value)}
@@ -74,12 +75,22 @@ export function Layout() {
               className="w-24 bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
             />
           </label>
-          <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+          <div className="ml-auto hidden sm:flex items-center gap-2 text-xs text-gray-500">
             <span className="h-2 w-2 rounded-full bg-emerald animate-pulse" />
             gateway · :8090
           </div>
         </header>
-        <main className="flex-1 overflow-auto p-5">
+        {/* small screens: the sidebar collapses into a scrollable nav row */}
+        <nav className="md:hidden flex gap-1 overflow-x-auto border-b border-glass px-3 py-2">
+          {NAV.map(({ to, label, icon: Icon }) => (
+            <NavLink key={to} to={to}
+              className={({ isActive }) => clsx("flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs",
+                isActive ? "bg-violet/15 text-violet-light" : "text-gray-400")}>
+              <Icon size={14} />{label}
+            </NavLink>
+          ))}
+        </nav>
+        <main className="flex-1 overflow-auto p-4 md:p-5">
           <Outlet />
         </main>
       </div>
