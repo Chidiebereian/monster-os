@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv } from "lucide-react";
+import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv, Brain } from "lucide-react";
 import clsx from "clsx";
 import { SPORTS, useSettings } from "../store/settings";
 
@@ -16,6 +16,7 @@ const NAV = [
   { to: "/signals", label: "Smart Signals", icon: Radar },
   { to: "/copy", label: "Top Traders", icon: Users },
   { to: "/backtest", label: "Performance", icon: Gauge },
+  { to: "/models", label: "Model Intelligence", icon: Brain },
   { to: "/monster-gpt", label: "MonsterGPT", icon: Bot },
 ];
 

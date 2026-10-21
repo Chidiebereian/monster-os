@@ -13,10 +13,10 @@ use serde_json::{json, Value};
 
 use crate::State;
 
-struct Obs { y: f64, team: usize, opp: usize, home: f64, w: f64 }
-struct Fit { off: Vec<f64>, def: Vec<f64>, home_adv: f64, intercept: f64, dispersion: f64 }
+pub(crate) struct Obs { pub y: f64, pub team: usize, pub opp: usize, pub home: f64, pub w: f64 }
+pub(crate) struct Fit { pub off: Vec<f64>, pub def: Vec<f64>, pub home_adv: f64, pub intercept: f64, pub dispersion: f64 }
 
-fn fit(obs: &[Obs], tn: usize, epochs: usize, ridge: f64) -> Fit {
+pub(crate) fn fit(obs: &[Obs], tn: usize, epochs: usize, ridge: f64) -> Fit {
     let mut as_off: Vec<Vec<usize>> = vec![Vec::new(); tn];
     let mut as_def: Vec<Vec<usize>> = vec![Vec::new(); tn];
     for (i, o) in obs.iter().enumerate() { as_off[o.team].push(i); as_def[o.opp].push(i); }

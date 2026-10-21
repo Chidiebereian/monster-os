@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use tokio_postgres::types::Json;
 
 use crate::mlb_sim::{self, Baserunning, GameInput, Move, RatePosterior, TeamInput, TransitionObs, NCAT};
+use crate::learning::{Forecast, GameEval, Outcomes, Prediction, SlateGame};
 use crate::{fit_count, Family, Projection, State, StatDef};
 
 const API: &str = "https://statsapi.mlb.com/api/v1";
@@ -548,6 +549,12 @@ pub struct FitQuery {
     #[serde(default = "d_min_games")] min_games: usize,
     #[serde(default = "d_prior_k")] prior_k: f64,
     #[serde(default = "d_halflife")] halflife: f64,
+    /// Optional season window for the simulator parameters. Loading every
+    /// stored season at once needs more memory than a small machine has, so
+    /// history is refit a few seasons at a time. The per-player prop models
+    /// are only rewritten when the window reaches the latest stored season.
+    from: Option<i32>,
+    to: Option<i32>,
 }
 fn d_min_games() -> usize { 15 }
 fn d_prior_k() -> f64 { 10.0 }
@@ -580,19 +587,26 @@ fn rates(c: &[f64; NCAT]) -> [f64; NCAT] {
 
 pub async fn fit(state: web::Data<State>, q: web::Query<FitQuery>) -> impl Responder {
     let q = q.into_inner();
+    let stored_max: i32 = match state.db.query_one(
+        "SELECT coalesce(max(season), 0) FROM player_game_logs WHERE sport='mlb'", &[],
+    ).await { Ok(r) => r.get(0), Err(e) => return internal(e) };
+    // season S's simulator parameters also read season S-1 (pooling strengths)
+    let (lo, hi) = (q.from.map_or(i32::MIN, |f| f - 1), q.to.unwrap_or(i32::MAX));
+    let props = hi >= stored_max;
     let rows = match state.db.query(
         "SELECT player_id, season, week, team, opponent, stats FROM player_game_logs WHERE sport='mlb' \
-         ORDER BY player_id, game_date NULLS LAST, week",
-        &[],
+         AND season BETWEEN $1 AND $2 ORDER BY player_id, game_date NULLS LAST, week",
+        &[&lo, &hi],
     ).await { Ok(r) => r, Err(e) => return internal(e) };
     if rows.is_empty() {
-        return internal("no MLB game logs stored; POST /ingest/mlb first");
+        return internal("no MLB game logs stored for that window; POST /ingest/mlb first");
     }
     let latest: i32 = rows.iter().map(|r| r.get::<_, i32>("season")).max().unwrap_or(0);
 
     // ---- 1. per-stat empirical-Bayes count models (same as other sports)
+    // (skipped for a history-only window: no players, nothing persisted)
     let mut players: Vec<(String, Vec<Value>)> = Vec::new();
-    for r in &rows {
+    for r in rows.iter().filter(|_| props) {
         let pid: String = r.get("player_id");
         let s: Json<Value> = r.get("stats");
         match players.last_mut() {
@@ -635,7 +649,7 @@ pub async fn fit(state: web::Data<State>, q: web::Query<FitQuery>) -> impl Respo
     // simulated with parameters from a season that had finished before it)
     let seasons: std::collections::BTreeSet<i32> = rows.iter().map(|r| r.get::<_, i32>("season")).collect();
     let mut params = json!(null);
-    for &season in &seasons {
+    for &season in seasons.iter().filter(|&&s| s > lo) {
         let p = season_params(&rows, season);
         if let Err(e) = state.db.execute(
             "INSERT INTO mlb_model_params (key, params, source) VALUES ($1, $2, $3)              ON CONFLICT (key) DO UPDATE SET params=EXCLUDED.params, source=EXCLUDED.source, fitted_at=now()",
@@ -647,7 +661,11 @@ pub async fn fit(state: web::Data<State>, q: web::Query<FitQuery>) -> impl Respo
     let summary: Vec<Value> = all_stats().map(|s| json!({
         "stat": s.key, "league_mean": r3(*league.get(s.key).unwrap_or(&0.0)), "players_fitted": by_stat.get(s.key).copied().unwrap_or(0),
     })).collect();
-    HttpResponse::Ok().json(json!({ "sport": "mlb", "players_seen": players.len(), "stats": summary, "sim_params": params }))
+    let fitted: Vec<i32> = seasons.iter().copied().filter(|&s| s > lo).collect();
+    HttpResponse::Ok().json(json!({
+        "sport": "mlb", "players_seen": players.len(), "prop_models_updated": props, "sim_param_seasons": fitted,
+        "stats": summary, "sim_params": params,
+    }))
 }
 
 /// Season totals per player: batters (all PAs) and pitchers (starts only).
@@ -1239,10 +1257,24 @@ async fn build_input(
 }
 
 pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::Query<SimQuery>) -> impl Responder {
-    let pk = path.into_inner();
-    let q = q.into_inner();
+    match simulate_core(&state, &path.into_inner(), q.into_inner()).await { Ok(r) => HttpResponse::Ok().json(r.body), Err(resp) => resp }
+}
+
+/// A served simulation plus what the learning loop needs to score it.
+struct Ran {
+    body: Value,
+    out: mlb_sim::SimOutput,
+    lineups: Vec<Vec<String>>,
+    starters: Vec<String>,
+    date: chrono::NaiveDate,
+    season: i32,
+    start: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+async fn simulate_core(state: &State, pk: &str, q: SimQuery) -> Result<Ran, HttpResponse> {
+    let pk = pk.to_string();
     if q.n == 0 || q.n > 1_000_000 {
-        return bad_request("n must be between 1 and 1,000,000");
+        return Err(bad_request("n must be between 1 and 1,000,000"));
     }
     let t0 = Instant::now();
     let db = &state.db;
@@ -1254,7 +1286,7 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
         batter_halflife: q.batter_halflife, pitcher_halflife: q.pitcher_halflife, hook: Hook { starts: q.hook_starts, prior: q.hook_prior },
     };
     let Prepared { game, inputs: inputs_json, flags, lineups, starters, away, home, date, season, gtype, params, provenance, g, .. } =
-        match prepare(&state, &pk, &ov).await { Ok(p) => p, Err((code, e)) => return err_code(code, e) };
+        match prepare(state, &pk, &ov).await { Ok(p) => p, Err((code, e)) => return Err(err_code(code, e)) };
     let cutoff = date;
     let lineups: Vec<(Vec<String>, &str)> = lineups.iter().map(|(l, s)| (l.clone(), s.as_str())).collect();
     let starters: Vec<(String, &str)> = starters.iter().map(|(l, s)| (l.clone(), s.as_str())).collect();
@@ -1264,7 +1296,7 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
     let sim_t = Instant::now();
     let out = match web::block(move || mlb_sim::simulate(&game, n, draws, seed)).await {
         Ok(o) => o,
-        Err(e) => return internal(format!("simulation thread: {e}")),
+        Err(e) => return Err(internal(format!("simulation thread: {e}"))),
     };
     let sim_ms = sim_t.elapsed().as_millis() as u64;
 
@@ -1330,7 +1362,8 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
     body["sim_id"] = json!(sim_id);
     body["inputs"] = Value::Object(inputs_json);
     body["simulation"]["total_ms"] = json!(t0.elapsed().as_millis() as u64);
-    HttpResponse::Ok().json(body)
+    let start = g["gameDate"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&chrono::Utc));
+    Ok(Ran { body, out, lineups: lineups.iter().map(|l| l.0.clone()).collect(), starters: starters.iter().map(|s| s.0.clone()).collect(), date, season, start })
 }
 
 fn err_code(code: u16, m: String) -> HttpResponse {
@@ -2075,4 +2108,130 @@ mod tests {
         assert_eq!((t[3].1, t[3].2), (0b010, 1));
         assert_eq!(t[3].3.dest[2], 3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Learning-loop adapters (see learning.rs). Market definitions match the
+// walk-forward backtest above.
+// ---------------------------------------------------------------------------
+
+crate::learning::tuning!(Tuning {
+    batter_halflife: 150.0, 20.0, 1000.0, "batter rate recency half-life, in plate appearances";
+    pitcher_halflife: 40.0, 5.0, 300.0, "pitcher rate recency half-life, in batters faced";
+    hook_starts: 10.0, 1.0, 60.0, "recent starts used for each starter's pitch-count hook";
+    hook_prior: 1.0, 0.0, 10.0, "weight of the league hook prior";
+});
+
+/// Regular-season games from May (players need history), as in the backtest.
+pub async fn backtest_games(db: &tokio_postgres::Client, season: i32) -> Result<Vec<String>, String> {
+    let (from, to) = (chrono::NaiveDate::from_ymd_opt(season, 5, 1).unwrap(), chrono::NaiveDate::from_ymd_opt(season, 12, 31).unwrap());
+    Ok(db.query("SELECT game_id FROM sports_games WHERE sport='mlb' AND season=$1 AND game_type='REG' AND home_score IS NOT NULL \
+                 AND game_date BETWEEN $2 AND $3 ORDER BY game_date, game_id", &[&season, &from, &to]).await.map_err(|e| dberr(&e))?
+        .iter().map(|r| r.get(0)).collect())
+}
+
+/// The day's games with scheduled first-pitch times from the MLB schedule.
+pub async fn ledger_slate(state: &State, date: chrono::NaiveDate) -> Result<Vec<SlateGame>, String> {
+    let v = get_json(&state.http, &format!("{API}/schedule?sportId=1&date={date}")).await?;
+    let mut out = Vec::new();
+    for g in v["dates"].as_array().into_iter().flatten().flat_map(|d| d["games"].as_array().cloned().unwrap_or_default()) {
+        if g["status"]["abstractGameState"].as_str() != Some("Preview") { continue; }
+        let Some(pk) = g["gamePk"].as_i64() else { continue };
+        let start = g["gameDate"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&chrono::Utc));
+        out.push(SlateGame { id: pk.to_string(), date, start,
+            label: format!("{} @ {}", g["teams"]["away"]["team"]["name"].as_str().unwrap_or(""), g["teams"]["home"]["team"]["name"].as_str().unwrap_or("")) });
+    }
+    Ok(out)
+}
+
+/// Scoreable forecasts from a simulation; baselines from games before `date` and the previous season's league rates.
+async fn forecasts(db: &tokio_postgres::Client, out: &mlb_sim::SimOutput, lineups: &[Vec<String>], starters: &[String], date: chrono::NaiveDate, season: i32) -> Vec<Forecast> {
+    let rate = |sql: &'static str, d: f64| async move {
+        db.query_opt(sql, &[&(season - 1)]).await.ok().flatten().and_then(|r| r.get::<_, Option<f64>>(0)).unwrap_or(d)
+    };
+    let lhw = rate("SELECT avg((home_score > away_score)::int)::float8 FROM sports_games WHERE sport='mlb' AND season=$1 AND game_type='REG' AND home_score IS NOT NULL", 0.53).await;
+    let lover = rate("SELECT avg(((home_score + away_score) > 8.5)::int)::float8 FROM sports_games WHERE sport='mlb' AND season=$1 AND game_type='REG' AND home_score IS NOT NULL", 0.5).await;
+    let mut fs = vec![
+        Forecast::game("home_win", "prior-season home win rate", "home_margin", 0.0, out.home_win(), lhw),
+        Forecast::game("total_over_8_5", "prior-season over 8.5 rate", "total", 8.5, out.total_runs.line(8.5).over, lover),
+    ];
+    let mut ids: Vec<String> = lineups.iter().flatten().cloned().collect();
+    ids.extend(starters.iter().cloned());
+    let names = names_of(db, &ids).await;
+    let name = |id: &str| names.get(id).map(|x| x.0.clone()).unwrap_or_else(|| id.to_string());
+    let bi = |s: &str| mlb_sim::BAT_STATS.iter().position(|x| *x == s).unwrap();
+    let pi = |s: &str| mlb_sim::PIT_STATS.iter().position(|x| *x == s).unwrap();
+    for side in 0..2 {
+        for (slot, pid) in lineups[side].iter().enumerate() {
+            let h = &out.bat[side][slot];
+            for (market, stat, line) in [("bat_hits_1plus", "h", 0.5), ("bat_tb_2plus", "tb", 1.5), ("bat_hr_1plus", "hr", 0.5), ("bat_hrr_2plus", "hrr", 1.5), ("bat_k_1plus", "k", 0.5)] {
+                let hist = prior_values(db, pid, "pa", stat, date).await;
+                fs.push(Forecast::player(market, "own prior rate", pid, name(pid), stat, line, h[bi(stat)].line(line).over, freq_at_least(&hist, line.ceil())));
+            }
+        }
+        let pid = &starters[side];
+        let sp = &out.starter[side];
+        let mean_or = |v: &[f64], d: f64| if v.is_empty() { d } else { v.iter().sum::<f64>() / v.len() as f64 };
+        for (market, stat, col, d) in [("sp_k_over_avg", "k", "p_k", 4.8), ("sp_outs_over_avg", "outs", "p_outs", 15.4)] {
+            let hist = prior_values(db, pid, "p_gs", col, date).await;
+            let line = mean_or(&hist, d).floor() + 0.5;
+            fs.push(Forecast::player(market, "own prior rate", pid, name(pid), col, line, sp[pi(stat)].line(line).over, freq_at_least(&hist, line.ceil())));
+        }
+    }
+    fs
+}
+
+/// Final score and box lines; batters count if they batted, pitchers if they started.
+pub async fn outcomes(db: &tokio_postgres::Client, pk: &str) -> Result<Option<Outcomes>, String> {
+    let Some(g) = db.query_opt("SELECT home_score, away_score FROM sports_games WHERE sport='mlb' AND game_id=$1 AND status='Final'", &[&pk]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
+    let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
+    let rows = db.query("SELECT player_id, stats FROM player_game_logs WHERE sport='mlb' AND week=$1", &[&pk]).await.map_err(|e| dberr(&e))?;
+    if rows.is_empty() { return Ok(None); }
+    let mut o = Outcomes::default();
+    o.game.insert("home_margin", (hs - as_) as f64);
+    o.game.insert("total", (hs + as_) as f64);
+    for r in &rows {
+        let s: Json<Value> = r.get(1);
+        let m = o.players.entry(r.get(0)).or_default();
+        if fval(&s.0, "pa") >= 1.0 { for k in ["h", "tb", "hr", "hrr", "k"] { m.insert(k, fval(&s.0, k)); } }
+        if fval(&s.0, "p_gs") >= 1.0 { for k in ["p_k", "p_outs"] { m.insert(k, fval(&s.0, k)); } }
+    }
+    Ok(Some(o))
+}
+
+/// Walk-forward evaluation of one completed game with its real (pregame-posted)
+/// lineups and starters, as in the backtest.
+pub async fn evaluate(state: &State, pk: &str, _lineup: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+    let db = &state.db;
+    let Some(played) = played_game(db, pk).await? else { return Ok(None) };
+    let Some(outcomes) = outcomes(db, pk).await? else { return Ok(None) };
+    use chrono::Datelike;
+    let season = played.date.year();
+    let t = Tuning::from_cfg(cfg);
+    let (params, baserunning, _) = load_params(db, season, false).await?;
+    let la: Vec<String> = played.lineups[0].iter().map(|x| x.0.clone()).collect();
+    let lh: Vec<String> = played.lineups[1].iter().map(|x| x.0.clone()).collect();
+    let built = build_input(
+        db, &params, baserunning,
+        Side { team: &played.teams[0], lineup: &la, starter: &played.starters[0].0, lineup_source: "actual starting lineup", starter_source: "actual starter" },
+        Side { team: &played.teams[1], lineup: &lh, starter: &played.starters[1].0, lineup_source: "actual starting lineup", starter_source: "actual starter" },
+        played.date, season, t.batter_halflife, t.pitcher_halflife, Hook { starts: t.hook_starts.round() as usize, prior: t.hook_prior },
+    ).await?;
+    let game = built.game;
+    let out = web::block(move || mlb_sim::simulate(&game, n, draws, seed)).await.map_err(|e| e.to_string())?;
+    let starters = vec![played.starters[0].0.clone(), played.starters[1].0.clone()];
+    let forecasts = forecasts(db, &out, &[la, lh], &starters, played.date, season).await;
+    let diag = vec![("total_runs", out.total_runs.mean(), outcomes.game["total"])];
+    Ok(Some(GameEval { forecasts, outcomes, diag }))
+}
+
+/// A production prediction (≥100k games) for the ledger, with the chosen lineup source.
+pub async fn predict(state: &State, pk: &str, lineup: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
+    let t = Tuning::from_cfg(cfg);
+    let q = SimQuery { n, seed: Some(seed), draws: d_draws(), away_lineup: None, home_lineup: None, away_sp: None, home_sp: None, out: None,
+        lineup: Some(lineup.to_string()), batter_halflife: t.batter_halflife, pitcher_halflife: t.pitcher_halflife,
+        hook_starts: t.hook_starts.round() as usize, hook_prior: t.hook_prior, store: Some(true) };
+    let r = simulate_core(state, pk, q).await.map_err(|resp| format!("MLB simulation failed ({})", resp.status()))?;
+    let forecasts = forecasts(&state.db, &r.out, &r.lineups, &r.starters, r.date, r.season).await;
+    Ok(Prediction { payload: r.body, forecasts, date: r.date, start: r.start, engine: SIM_MODEL, n: r.out.valid })
 }

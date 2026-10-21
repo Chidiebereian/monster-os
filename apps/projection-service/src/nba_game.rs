@@ -12,9 +12,10 @@ use serde_json::{json, Value};
 use tokio_postgres::types::Json;
 
 use crate::nba_sim::{self as sim, GameInput, League, Rate};
+use crate::learning::{freq_over, Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
-pub const MODEL_VERSION: &str = "nba-poss-sim-v1";
+pub const MODEL_VERSION: &str = "nba-poss-sim-v2";
 
 fn internal(m: impl std::fmt::Display) -> HttpResponse {
     eprintln!("projection-service(nba-sim): {m}");
@@ -169,7 +170,19 @@ pub struct Opts {
     pub mode: LineupMode,
     pub out: HashSet<String>,
     pub force_in: HashSet<String>,
+    pub tune: Tuning,
 }
+
+crate::learning::tuning!(Tuning {
+    team_halflife: 15.0, 3.0, 60.0, "team aggregate recency half-life, in team games";
+    player_halflife: 20.0, 3.0, 80.0, "player rate recency half-life, in games played";
+    minutes_halflife: 5.0, 1.0, 20.0, "half-life of the minutes projection over the last 10 games";
+    rate_prior_min: 60.0, 5.0, 600.0, "minutes of league-average prior on per-minute rebound / assist / steal / block rates";
+    usage_prior_min: 60.0, 5.0, 600.0, "minutes of league-average prior on usage";
+    def_prior: 800.0, 50.0, 5000.0, "attempts of league-average prior on team defence (2P%, 3P%, turnovers)";
+    reb_prior: 400.0, 50.0, 4000.0, "rebound chances of league-average prior on team rebounding";
+    pace_prior_games: 8.0, 1.0, 60.0, "games of league-average prior on team pace";
+});
 
 /// ESPN injury designations -> probability of playing. Not fitted (no stored
 /// history of NBA injury reports yet): documented priors.
@@ -240,7 +253,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
         for r in &rows {
             let gid: String = r.get(0);
             let i = gi[gid.as_str()];
-            let w = 0.5f64.powf(i as f64 / 15.0);
+            let w = 0.5f64.powf(i as f64 / opts.tune.team_halflife);
             let team: String = r.get(1);
             let t = tot_from(r, 7);
             if &team == abbr { own.add(&t, w) } else { opp.add(&t, w) }
@@ -316,10 +329,10 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             let games = if reg.len() < 3 { [reg, pre.get(&c.id).cloned().unwrap_or_default()].concat() } else { reg };
             let mut t = Tot::default();
             let mut wsum = 0.0;
-            for (i, x) in games.iter().enumerate() { let w = 0.5f64.powf(i as f64 / 20.0); t.add(x, w); wsum += w; }
+            for (i, x) in games.iter().enumerate() { let w = 0.5f64.powf(i as f64 / opts.tune.player_halflife); t.add(x, w); wsum += w; }
             let mins: Vec<f64> = games.iter().take(10).map(|x| x.min).collect();
             let (mm, msd) = if mins.len() >= 3 {
-                let wts: Vec<f64> = (0..mins.len()).map(|i| 0.5f64.powf(i as f64 / 5.0)).collect();
+                let wts: Vec<f64> = (0..mins.len()).map(|i| 0.5f64.powf(i as f64 / opts.tune.minutes_halflife)).collect();
                 let ws: f64 = wts.iter().sum();
                 let m = mins.iter().zip(&wts).map(|(a, w)| a * w).sum::<f64>() / ws;
                 let v = mins.iter().zip(&wts).map(|(a, w)| w * (a - m).powi(2)).sum::<f64>() / ws;
@@ -328,14 +341,14 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             // preseason-only history (rookies, new signings): preseason minutes overstate roles
             let mm = if by.get(&c.id).map(|v| v.len()).unwrap_or(0) < 3 { mm.min(18.0) } else { mm };
             let u = t.usage();
-            let per_min = |x: f64, lgv: f64| (x + 60.0 * lgv) / (t.min + 60.0);
+            let per_min = |x: f64, lgv: f64| (x + opts.tune.rate_prior_min * lgv) / (t.min + opts.tune.rate_prior_min);
             let lg_per_min = |f: fn(&Tot) -> f64| f(&t) / t.min.max(1.0); // own, for meta
             let _ = lg_per_min;
             let shots = chart.remove(&c.id).unwrap_or_default();
             players.push(sim::Player {
                 id: c.id.clone(), name: c.name.clone(), pos: c.pos.clone(), p_active: c.p, starter: c.starter,
                 min_mean: mm, min_sd: msd,
-                usage: (u + 60.0 * 0.42) / (t.min + 60.0),
+                usage: (u + opts.tune.usage_prior_min * 0.42) / (t.min + opts.tune.usage_prior_min),
                 tov: shrink(t.tov, u, league.tov_share, lgk.tov),
                 trip: shrink(t.fta / 2.0, u, league.trip_share, lgk.trip),
                 three: shrink(t.f3a, t.fga, league.three_share, lgk.three),
@@ -370,15 +383,15 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             let gms = (own.min / 240.0).max(0.0);
             let poss = 0.5 * (own.poss() + opp.poss());
             let p = if gms > 0.0 { poss / gms } else { league.pace };
-            (p * gms + league.pace * 8.0) / (gms + 8.0)
+            (p * gms + league.pace * opts.tune.pace_prior_games) / (gms + opts.tune.pace_prior_games)
         };
         let o = |p: f64| p / (1.0 - p);
         let ratio = |made: f64, att: f64, lgp: f64, k: f64| o((made + k * lgp) / (att + k)) / o(lgp);
-        let def_fg2 = ratio(opp.fgm - opp.f3m, opp.fga - opp.f3a, league.fg2, 800.0);
-        let def_fg3 = ratio(opp.f3m, opp.f3a, league.fg3, 800.0);
-        let def_tov = ratio(opp.tov, opp.usage(), league.tov_share, 800.0);
-        let dreb = ratio(own.dreb, own.dreb + opp.oreb, 1.0 - league.oreb_pct, 400.0);
-        let oreb = ratio(own.oreb, own.oreb + opp.dreb, league.oreb_pct, 400.0);
+        let def_fg2 = ratio(opp.fgm - opp.f3m, opp.fga - opp.f3a, league.fg2, opts.tune.def_prior);
+        let def_fg3 = ratio(opp.f3m, opp.f3a, league.fg3, opts.tune.def_prior);
+        let def_tov = ratio(opp.tov, opp.usage(), league.tov_share, opts.tune.def_prior);
+        let dreb = ratio(own.dreb, own.dreb + opp.oreb, 1.0 - league.oreb_pct, opts.tune.reb_prior);
+        let oreb = ratio(own.oreb, own.oreb + opp.dreb, league.oreb_pct, opts.tune.reb_prior);
         team_meta.push(json!({
             "abbr": abbr, "recent_games": tg.len(), "pace": r3(pace), "def_fg2": r3(def_fg2), "def_fg3": r3(def_fg3), "def_tov": r3(def_tov),
             "dreb": r3(dreb), "oreb": r3(oreb), "players": pmeta,
@@ -445,7 +458,7 @@ fn ids(s: &Option<String>) -> HashSet<String> {
     s.as_deref().unwrap_or("").split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
 pub fn opts(lineup: Option<&str>, out: &[String], force_in: &[String]) -> Opts {
-    Opts { mode: LineupMode::parse(lineup), out: out.iter().cloned().collect(), force_in: force_in.iter().cloned().collect() }
+    Opts { mode: LineupMode::parse(lineup), out: out.iter().cloned().collect(), force_in: force_in.iter().cloned().collect(), tune: Tuning::default() }
 }
 
 fn hist_json(h: &sim::Hist, lines: &[f64]) -> Value {
@@ -458,14 +471,17 @@ fn hist_json(h: &sim::Hist, lines: &[f64]) -> Value {
 pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::Query<SimQuery>) -> impl Responder {
     let id = path.into_inner();
     let gref = match game_ref(&state.db, &id).await { Ok(g) => g, Err(e) => return unprocessable(e) };
-    let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: ids(&q.out), force_in: ids(&q.force_in) };
+    let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: ids(&q.out), force_in: ids(&q.force_in), tune: Tuning::default() };
     let Built { game, meta } = match build(&state, &gref, &o).await { Ok(b) => b, Err(e) => return unprocessable(e) };
     let seed = q.seed.unwrap_or_else(|| sim::derive_seed(0x6e6261, &[&id, &chrono::Utc::now().timestamp_millis().to_string()]));
     let (n, draws) = (q.n.clamp(100_000, 1_000_000), q.draws.clamp(50, 2000));
     let t = Instant::now();
     let g2 = game.clone();
     let e = match web::block(move || sim::simulate(&g2, n, draws, seed)).await { Ok(e) => e, Err(err) => return internal(err) };
-    let ms = t.elapsed().as_millis() as u64;
+    HttpResponse::Ok().json(payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64))
+}
+
+fn payload(gref: &GameRef, game: &GameInput, e: &sim::Ensemble, meta: Value, seed: u64, ms: u64) -> Value {
     let nn = e.n.max(1) as f64;
     let players: Vec<Vec<Value>> = (0..2).map(|t| game.teams[t].players.iter().enumerate().filter(|(i, _)| e.active_n[t][*i] > 0).map(|(i, p)| {
         let h = &e.player[t][i];
@@ -477,8 +493,8 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
         json!({ "idx": i, "id": p.id, "name": p.name, "pos": p.pos, "starter": p.starter, "p_active": r4(e.active_n[t][i] as f64 / nn), "stats": stats })
     }).collect()).collect();
     let spread_home = gref.spread; // negative = home favoured
-    HttpResponse::Ok().json(json!({
-        "game_id": id, "date": gref.date, "away": gref.away, "home": gref.home, "model_version": MODEL_VERSION, "seed": seed, "n": e.n, "sim_ms": ms,
+    json!({
+        "game_id": gref.id, "date": gref.date, "away": gref.away, "home": gref.home, "model_version": MODEL_VERSION, "seed": seed, "n": e.n, "sim_ms": ms,
         "win": { "home": r4(e.home_win as f64 / nn), "away": r4(1.0 - e.home_win as f64 / nn), "overtime": r4(e.overtime as f64 / nn) },
         "score": { "away": hist_json(&e.score[0], &[]), "home": hist_json(&e.score[1], &[]) },
         "total": hist_json(&e.total, &gref.over_under.into_iter().collect::<Vec<_>>()),
@@ -489,7 +505,7 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<String>, q: web::
         "players": { "away": players[0], "home": players[1] },
         "inputs": meta,
         "note": "player props are conditional on the player being active (p_active); mcse is Monte Carlo sampling error only",
-    }))
+    })
 }
 
 /// Broadcast session for an NBA game.
@@ -550,22 +566,6 @@ fn d_bt_n() -> usize { 2000 }
 fn d_bt_draws() -> usize { 20 }
 fn d_bt_seed() -> u64 { 777 }
 
-#[derive(Default)]
-struct Binary { n: f64, m: f64, b: f64, d: Vec<f64> }
-impl Binary {
-    fn add(&mut self, pm: f64, pb: f64, y: f64) {
-        let (pm, pb) = (pm.clamp(1e-4, 1.0 - 1e-4), pb.clamp(1e-4, 1.0 - 1e-4));
-        let (bm, bb) = ((pm - y).powi(2), (pb - y).powi(2));
-        self.n += 1.0; self.m += bm; self.b += bb; self.d.push(bm - bb);
-    }
-    fn report(&self, baseline: &str) -> Value {
-        let n = self.n.max(1.0);
-        let md = self.d.iter().sum::<f64>() / n;
-        let sd = (self.d.iter().map(|x| (x - md).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
-        json!({ "n": self.n, "baseline": baseline, "brier_model": r4(self.m / n), "brier_baseline": r4(self.b / n), "brier_diff": r4(md), "brier_diff_se": r4(sd / n.sqrt()) })
-    }
-}
-
 fn erf(x: f64) -> f64 {
     let s = x.signum(); let x = x.abs(); let t = 1.0 / (1.0 + 0.3275911 * x);
     s * (1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp())
@@ -576,106 +576,155 @@ fn erf(x: f64) -> f64 {
 pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> impl Responder {
     let db = &state.db;
     let from = q.from.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
-    let all: Vec<String> = match db.query("SELECT espn_id FROM nba_games_espn WHERE season = $1 AND season_type = 2 AND completed \
-                                           AND ($2::date IS NULL OR game_date >= $2) ORDER BY game_date, espn_id", &[&q.season, &from]).await {
-        Ok(r) => r.iter().map(|x| x.get(0)).collect(), Err(e) => return internal(dberr(&e)),
+    let all: Vec<String> = if from.is_none() { match backtest_games(db, q.season).await { Ok(a) => a, Err(e) => return internal(e) } } else {
+        match db.query("SELECT espn_id FROM nba_games_espn WHERE season = $1 AND season_type = 2 AND completed AND game_date >= $2 ORDER BY game_date, espn_id", &[&q.season, &from]).await {
+            Ok(r) => r.iter().map(|x| x.get(0)).collect(), Err(e) => return internal(dberr(&e)),
+        }
     };
-    // skip the first month: players need some history
-    let all: Vec<String> = if from.is_none() { all.into_iter().skip(200).collect() } else { all };
     if all.is_empty() { return unprocessable("no games"); }
     let step = (all.len() as f64 / q.games.max(1) as f64).max(1.0);
     let picked: Vec<String> = (0..q.games.min(all.len())).map(|i| all[(i as f64 * step) as usize].clone()).collect();
     let t0 = Instant::now();
-    let (mut hw, mut cover, mut over, mut pts, mut reb, mut ast, mut f3) = (Binary::default(), Binary::default(), Binary::default(), Binary::default(), Binary::default(), Binary::default(), Binary::default());
+    let lineup = LineupMode::parse(q.lineup.as_deref()).as_str();
+    let mut card = Scorecard::default();
     let (mut tot_err, mut tot_bias, mut tot_base_err, mut nt) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut poss_sim, mut poss_act) = (0.0, 0.0);
     let mut skipped = Vec::new();
     let mut sims = 0;
     for gid in &picked {
-        let gref = match game_ref(db, gid).await { Ok(g) => g, Err(e) => { skipped.push(json!({ "game": gid, "why": e })); continue } };
-        let (Some(hs), Some(as_)) = (gref.home_score, gref.away_score) else { continue };
-        let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: HashSet::new(), force_in: HashSet::new() };
-        let Built { game, .. } = match build(&state, &gref, &o).await { Ok(b) => b, Err(e) => { skipped.push(json!({ "game": gid, "why": e })); continue } };
         let seed = sim::derive_seed(q.seed, &[gid]);
-        let (n, draws) = (q.n, q.draws);
-        let g2 = game.clone();
-        let e = match web::block(move || sim::simulate(&g2, n, draws, seed)).await { Ok(e) => e, Err(err) => return internal(err) };
-        sims += 1;
-        let nn = e.n as f64;
-        let y = (hs > as_) as i32 as f64;
-        let mkt = gref.spread.map(|s| 0.5 * (1.0 + erf(-s / (12.0 * std::f64::consts::SQRT_2))));
-        hw.add(e.home_win as f64 / nn, mkt.unwrap_or(0.58), y);
-        if let Some(s) = gref.spread {
-            let (o, u) = e.margin_line(-s);
-            let m = (hs - as_) as f64;
-            if (m + s).abs() > 1e-9 { cover.add(o / (o + u).max(1e-9), 0.5, (m > -s) as i32 as f64); }
-        }
-        let tot = (hs + as_) as f64;
-        if let Some(l) = gref.over_under {
-            let (o, u, _, _) = e.total.line(l);
-            if (tot - l).abs() > 1e-9 { over.add(o / (o + u).max(1e-9), 0.5, (tot > l) as i32 as f64); }
-            tot_base_err += (l - tot).abs();
-        }
-        tot_err += (e.total.mean() - tot).abs();
-        tot_bias += e.total.mean() - tot;
-        nt += 1.0;
-        poss_sim += (e.possessions[0] + e.possessions[1]) / nn;
-        // actual box + prior per-player frequency baseline
-        let act = match db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[gid]).await {
-            Ok(r) => r, Err(err) => return internal(dberr(&err)),
+        let ev = match evaluate(&state, gid, lineup, &json!({}), q.n, q.draws, seed).await {
+            Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { skipped.push(json!({ "game": gid, "why": e })); continue }
         };
-        let mut pa = 0.0;
-        for r in &act {
-            let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
-            pa += g(7) - g(3) + g(9) + 0.44 * g(8);
-        }
-        poss_act += pa;
-        let mut actual: HashMap<String, [f64; 4]> = HashMap::new();
-        for r in &act {
-            let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
-            if r.get::<_, Option<f64>>(10).unwrap_or(0.0) <= 0.0 { continue; }
-            actual.insert(r.get(1), [g(2), g(3) + g(4), g(5), g(6)]);
-        }
-        let pids: Vec<String> = game.teams.iter().flat_map(|t| t.players.iter().map(|p| p.id.clone())).collect();
-        let hist = match db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
-                                   WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND NOT b.dnp AND COALESCE(b.min,0) > 0",
-                                  &[&pids, &gref.date]).await { Ok(r) => r, Err(err) => return internal(dberr(&err)) };
-        let mut past: HashMap<String, Vec<[f64; 4]>> = HashMap::new();
-        for r in &hist {
-            let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
-            past.entry(r.get(0)).or_default().push([g(1), g(2) + g(3), g(4), g(5)]);
-        }
-        for t in 0..2 {
-            for (i, p) in game.teams[t].players.iter().enumerate() {
-                let (Some(a), Some(ph)) = (actual.get(&p.id), past.get(&p.id)) else { continue };
-                if ph.len() < 5 || e.active_n[t][i] == 0 { continue; }
-                for (k, b, stat) in [(0usize, &mut pts, 0usize), (1, &mut reb, 1), (2, &mut ast, 2), (3, &mut f3, 3)] {
-                    let avg = ph.iter().map(|x| x[k]).sum::<f64>() / ph.len() as f64;
-                    if k == 3 && avg < 0.8 { continue; }
-                    let line = avg.floor() + 0.5;
-                    let freq = (ph.iter().filter(|x| x[k] > line).count() as f64 + 1.0) / (ph.len() as f64 + 2.0);
-                    let (o, _, _, _) = e.player[t][i][stat].line(line);
-                    b.add(o, freq, (a[k] > line) as i32 as f64);
-                }
+        sims += 1;
+        card.add_all(&ev.forecasts, &ev.outcomes);
+        for (k, s, a) in &ev.diag {
+            match *k {
+                "total_points" => { tot_err += (s - a).abs(); tot_bias += s - a; nt += 1.0; }
+                "total_line" => { tot_base_err += (s - a).abs(); }
+                "possessions" => { poss_sim += s; poss_act += a; }
+                _ => {}
             }
         }
     }
     let nt = nt.max(1.0);
     let report = json!({
-        "model_version": MODEL_VERSION, "season": q.season, "games_simulated": sims, "sims_per_game": q.n, "lineup": LineupMode::parse(q.lineup.as_deref()).as_str(),
+        "model_version": MODEL_VERSION, "season": q.season, "games_simulated": sims, "sims_per_game": q.n, "lineup": lineup,
         "secs": t0.elapsed().as_secs(), "skipped": skipped.into_iter().take(10).collect::<Vec<_>>(),
         "possessions_per_game": { "simulated": r3(poss_sim / sims.max(1) as f64), "actual": r3(poss_act / sims.max(1) as f64) },
         "total_points": { "mae_model": r3(tot_err / nt), "mae_line": r3(tot_base_err / nt), "bias": r3(tot_bias / nt) },
-        "binary": {
-            "home_win": hw.report("closing spread (normal, sd 12)"), "home_cover": cover.report("0.5 at the line"), "total_over": over.report("0.5 at the line"),
-            "pts_over_avg": pts.report("player's own prior frequency"), "reb_over_avg": reb.report("player's own prior frequency"),
-            "ast_over_avg": ast.report("player's own prior frequency"), "fg3m_over_avg": f3.report("player's own prior frequency"),
-        },
+        "binary": card.report(),
     });
     if sims >= 20 {
-        let key = format!("nba:backtest:{}:{}", q.season, LineupMode::parse(q.lineup.as_deref()).as_str());
+        let key = format!("nba:backtest:{}:{}", q.season, lineup);
         let _ = db.execute("INSERT INTO sim_model_params (key, params, source) VALUES ($1, $2, 'walk-forward backtest') \
                             ON CONFLICT (key) DO UPDATE SET params = EXCLUDED.params, fitted_at = now()", &[&key, &Json(report.clone())]).await;
     }
     HttpResponse::Ok().json(report)
+}
+
+// ---------------------------------------------------------------------------
+// Learning-loop adapters (see learning.rs)
+// ---------------------------------------------------------------------------
+
+/// Regular-season games used for walk-forward tests (the first 200 of a season are skipped so players have history).
+pub async fn backtest_games(db: &tokio_postgres::Client, season: i32) -> Result<Vec<String>, String> {
+    Ok(db.query("SELECT espn_id FROM nba_games_espn WHERE season = $1 AND season_type = 2 AND completed ORDER BY game_date, espn_id", &[&season]).await
+        .map_err(|e| dberr(&e))?.iter().map(|x| x.get::<_, String>(0)).skip(200).collect())
+}
+
+pub async fn slate(db: &tokio_postgres::Client, date: NaiveDate) -> Result<Vec<SlateGame>, String> {
+    Ok(db.query("SELECT espn_id, game_date, start_time, away, home FROM nba_games_espn WHERE game_date = $1 AND NOT completed AND season_type IN (2,3) ORDER BY start_time, espn_id",
+        &[&date]).await.map_err(|e| dberr(&e))?.iter().map(|r| SlateGame { id: r.get(0), date: r.get(1), start: r.get(2),
+            label: format!("{} @ {}", r.get::<_, String>(3), r.get::<_, String>(4)) }).collect())
+}
+
+const PROP_MARKETS: [(&str, &str); 4] = [("pts_over_avg", "pts"), ("reb_over_avg", "reb"), ("ast_over_avg", "ast"), ("fg3m_over_avg", "fg3m")];
+
+/// Scoreable forecasts. Market baselines use the line stored for the game; player baselines use only games before it.
+async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput, e: &sim::Ensemble) -> Result<Vec<Forecast>, String> {
+    let nn = e.n.max(1) as f64;
+    let mkt = gref.spread.map(|s| 0.5 * (1.0 + erf(-s / (12.0 * std::f64::consts::SQRT_2))));
+    let mut out = vec![Forecast::game("home_win", "market spread (normal, sd 12)", "home_margin", 0.0, e.home_win as f64 / nn, mkt.unwrap_or(0.58))];
+    if let Some(s) = gref.spread {
+        let (o, u) = e.margin_line(-s);
+        out.push(Forecast::game("home_cover", "0.5 at the line", "home_margin", -s, o / (o + u).max(1e-9), 0.5).pushes());
+    }
+    if let Some(l) = gref.over_under {
+        let (o, u, _, _) = e.total.line(l);
+        out.push(Forecast::game("total_over", "0.5 at the line", "total", l, o / (o + u).max(1e-9), 0.5).pushes());
+    }
+    let pids: Vec<String> = game.teams.iter().flat_map(|t| t.players.iter().map(|p| p.id.clone())).collect();
+    let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
+                         WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND NOT b.dnp AND COALESCE(b.min,0) > 0",
+                        &[&pids, &gref.date]).await.map_err(|e| dberr(&e))?;
+    let mut past: HashMap<String, [Vec<f64>; 4]> = HashMap::new();
+    for r in &hist {
+        let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
+        let v = past.entry(r.get(0)).or_default();
+        for (k, x) in [g(1), g(2) + g(3), g(4), g(5)].into_iter().enumerate() { v[k].push(x); }
+    }
+    for t in 0..2 {
+        for (i, p) in game.teams[t].players.iter().enumerate() {
+            let Some(ph) = past.get(&p.id) else { continue };
+            if ph[0].len() < 5 || e.active_n[t][i] == 0 { continue; }
+            for (k, (market, stat)) in PROP_MARKETS.iter().enumerate() {
+                let avg = ph[k].iter().sum::<f64>() / ph[k].len() as f64;
+                if k == 3 && avg < 0.8 { continue; }
+                let line = avg.floor() + 0.5;
+                out.push(Forecast::player(market, "player's own prior frequency", &p.id, &p.name, stat, line, e.player[t][i][k].line(line).0, freq_over(&ph[k], line)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Final score, possessions, and the box score of players who played; None until final.
+pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Outcomes>, String> {
+    let Some(g) = db.query_opt("SELECT home_score, away_score FROM nba_games_espn WHERE espn_id = $1 AND completed", &[&id]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
+    let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
+    let act = db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[&id]).await.map_err(|e| dberr(&e))?;
+    if act.is_empty() { return Ok(None); }
+    let mut o = Outcomes::default();
+    o.game.insert("home_margin", (hs - as_) as f64);
+    o.game.insert("total", (hs + as_) as f64);
+    let mut pa = 0.0;
+    for r in &act {
+        let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
+        pa += g(7) - g(3) + g(9) + 0.44 * g(8);
+        if r.get::<_, Option<f64>>(10).unwrap_or(0.0) <= 0.0 { continue; }
+        let m = o.players.entry(r.get(1)).or_default();
+        m.insert("pts", g(2)); m.insert("reb", g(3) + g(4)); m.insert("ast", g(5)); m.insert("fg3m", g(6));
+    }
+    o.game.insert("possessions", pa);
+    Ok(Some(o))
+}
+
+/// Walk-forward evaluation of one completed game (data strictly before tip-off).
+pub async fn evaluate(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+    let gref = game_ref(&state.db, id).await?;
+    if gref.home_score.is_none() || gref.away_score.is_none() { return Ok(None); }
+    let Some(outcomes) = outcomes(&state.db, id).await? else { return Ok(None) };
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), tune: Tuning::from_cfg(cfg) };
+    let Built { game, .. } = build(state, &gref, &o).await?;
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, draws, seed)).await.map_err(|e| e.to_string())?;
+    let forecasts = forecasts(&state.db, &gref, &game, &e).await?;
+    let nn = e.n.max(1) as f64;
+    let mut diag = vec![("total_points", e.total.mean(), outcomes.game["total"]), ("possessions", (e.possessions[0] + e.possessions[1]) / nn, outcomes.game["possessions"])];
+    if let Some(l) = gref.over_under { diag.push(("total_line", l, outcomes.game["total"])); }
+    Ok(Some(GameEval { forecasts, outcomes, diag }))
+}
+
+/// A production prediction (≥100k games) for the ledger.
+pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
+    let gref = game_ref(&state.db, id).await?;
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), tune: Tuning::from_cfg(cfg) };
+    let Built { game, meta } = build(state, &gref, &o).await?;
+    let t = Instant::now();
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, 200, seed)).await.map_err(|e| e.to_string())?;
+    let forecasts = forecasts(&state.db, &gref, &game, &e).await?;
+    let start: Option<chrono::DateTime<chrono::Utc>> = state.db.query_opt("SELECT start_time FROM nba_games_espn WHERE espn_id = $1", &[&id]).await.map_err(|e| dberr(&e))?.and_then(|r| r.get(0));
+    Ok(Prediction { payload: payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64), forecasts, date: gref.date, start, engine: MODEL_VERSION, n: e.n as usize })
 }

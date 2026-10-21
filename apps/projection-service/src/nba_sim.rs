@@ -307,6 +307,8 @@ impl<'a> G<'a> {
         // the possession's time runs off first, so every event shows the clock after it
         self.clock -= dur;
         let home_mult = if o == 1 { g.home_edge } else { 1.0 / g.home_edge };
+        // `dur` is the whole possession, second chances included: pace counts
+        // possessions the standard way (an offensive rebound continues one)
         for _attempt in 0..6 {
             let five = self.on[o];
             let w: Vec<f64> = five.iter().map(|&i| ot.players[i].usage.max(0.01)).collect();
@@ -396,12 +398,49 @@ impl<'a> G<'a> {
     }
 }
 
+const DUR_MIN: f64 = 3.0;
+const DUR_MAX: f64 = 24.0;
+
+/// Gamma(4) scale for possession lengths that reproduces `pace`, given the
+/// average possession length `mean_dur` (seconds, from pace). Two things add
+/// possessions beyond 720 / mean_dur per quarter: lengths are capped at 3–24 s,
+/// which shortens the average, and each period's last possession is cut short
+/// by the clock. Pace is measured on real games, which include that cut-short
+/// possession, so the count to match is 720 / mean_dur. For a renewal process
+/// with capped length moments μ, σ², the expected count in T seconds is
+/// T/μ + (σ² − μ²)/(2μ²), plus one for the cut-short final possession.
+pub fn dur_scale(mean_dur: f64) -> f64 {
+    // CDF of Gamma(k, 1) at y, integer k
+    let cdf = |k: u32, y: f64| {
+        let (mut term, mut sum) = (1.0, 1.0);
+        for j in 1..k { term *= y / j as f64; sum += term; }
+        1.0 - (-y).exp() * sum
+    };
+    let count = |theta: f64| {
+        let (a, b) = (DUR_MIN / theta, DUR_MAX / theta);
+        let below = cdf(4, a);
+        let above = 1.0 - cdf(4, b);
+        // E[X 1{a<X<b}] = 4θ (F5(b) − F5(a)); E[X² 1{..}] = 20θ² (F6(b) − F6(a))
+        let m = DUR_MIN * below + 4.0 * theta * (cdf(5, b) - cdf(5, a)) + DUR_MAX * above;
+        let m2 = DUR_MIN * DUR_MIN * below + 20.0 * theta * theta * (cdf(6, b) - cdf(6, a)) + DUR_MAX * DUR_MAX * above;
+        720.0 / m + (m2 - 2.0 * m * m) / (2.0 * m * m) + 1.0
+    };
+    let target = 720.0 / mean_dur;
+    // count falls as theta grows
+    let (mut lo, mut hi) = (mean_dur / 16.0, mean_dur);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if count(mid) > target { lo = mid; } else { hi = mid; }
+    }
+    0.5 * (lo + hi)
+}
+
 pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) -> GameResult {
     let n = [g.teams[0].players.len(), g.teams[1].players.len()];
     let max_segments = 24 + 3 * 6; // regulation + up to six overtimes (2.5 segments each, rounded up)
     let scheds = [rotation(&g.teams[0], rng, max_segments), rotation(&g.teams[1], rng, max_segments)];
     let pace = 0.5 * (g.teams[0].pace + g.teams[1].pace);
-    let mean_dur = 2880.0 / (2.0 * pace);
+    let theta = dur_scale(2880.0 / (2.0 * pace));
     let tip = (rng.f64() < 0.5) as u8;
     let mut s = G {
         g, rng, period: 1, clock: 720.0, score: [0, 0], pos: tip, stats: [vec![[0; NST]; n[0]], vec![[0; NST]; n[1]]],
@@ -424,8 +463,8 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
                 }
             }
         }
-        // possession length: gamma(shape 4) around the game pace, capped by the clock
-        let dur = (s.rng.gamma(4.0) * mean_dur / 4.0).clamp(3.0, 24.0).min(s.clock.max(0.5));
+        // possession length: gamma(shape 4) calibrated to the game pace, capped by the clock
+        let dur = (s.rng.gamma(4.0) * theta).clamp(DUR_MIN, DUR_MAX).min(s.clock.max(0.5));
         let before = s.clock;
         s.possession(dur);
         if s.clock < 0.0 { s.clock = 0.0; }
@@ -642,6 +681,31 @@ pub mod tests {
             assert_eq!(last.state.score, r.score);
             for (i, e) in ev.iter().enumerate() { assert_eq!(e.seq as usize, i + 1); }
         }
+    }
+
+    #[test]
+    fn possessions_match_pace() {
+        // per team per 48 minutes, for any offensive-rebound rate (second
+        // chances belong to the same possession, as in the pace data)
+        for (pace, oreb) in [(92.0, 0.25), (99.0, 0.05), (99.0, 0.45), (106.0, 0.25)] {
+            let mut g = toy();
+            g.league.oreb_pct = oreb;
+            for t in &mut g.teams { t.pace = pace; }
+            let e = simulate(&g, 3000, 10, 11);
+            let per_team = (e.possessions[0] + e.possessions[1]) / (2.0 * e.n as f64);
+            // overtime adds possessions: ~6% of games x 5 min of 48
+            let minutes = 48.0 + 5.0 * e.overtime as f64 / e.n as f64;
+            let per48 = per_team * 48.0 / minutes;
+            assert!((per48 / pace - 1.0).abs() < 0.01, "pace {pace} oreb {oreb}: {per48:.2} possessions per 48");
+        }
+    }
+
+    #[test]
+    fn dur_scale_without_caps_is_the_mean() {
+        // a long average possession is barely capped below; the scale stays
+        // within a few percent of mean/4 and grows with the mean
+        let (a, b) = (dur_scale(14.0), dur_scale(15.0));
+        assert!(b > a && (a * 4.0 / 14.0 - 1.0).abs() < 0.08, "{a} {b}");
     }
 
     #[test]

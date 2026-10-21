@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio_postgres::types::Json;
 
 use crate::nhl_sim::{self as sim, GameInput, League, Xg, EV, PP, SH};
+use crate::learning::{freq_over, Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
 pub const MODEL_VERSION: &str = "nhl-event-sim-v1";
@@ -256,7 +257,17 @@ impl LineupMode {
     pub fn parse(s: Option<&str>) -> Self { match s { Some("projected") => Self::Projected, Some("actual") => Self::Actual, _ => Self::Confirmed } }
     pub fn as_str(&self) -> &'static str { match self { Self::Projected => "projected", Self::Confirmed => "confirmed", Self::Actual => "actual" } }
 }
-pub struct Opts { pub mode: LineupMode, pub out: HashSet<i64>, pub force_in: HashSet<i64>, pub away_goalie: Option<i64>, pub home_goalie: Option<i64> }
+pub struct Opts { pub mode: LineupMode, pub out: HashSet<i64>, pub force_in: HashSet<i64>, pub away_goalie: Option<i64>, pub home_goalie: Option<i64>, pub tune: Tuning }
+
+crate::learning::tuning!(Tuning {
+    team_halflife: 20.0, 5.0, 80.0, "team-rate recency half-life, in team games";
+    rate_prior_ev_min: 300.0, 30.0, 3000.0, "even-strength minutes of league-average prior on team attempt rates";
+    rate_prior_st_min: 60.0, 10.0, 600.0, "power-play / shorthanded minutes of league-average prior";
+    block_prior: 200.0, 20.0, 2000.0, "opponent attempts of league-average prior on a team's block rate";
+    finish_prior_xg: 12.0, 2.0, 100.0, "expected goals of prior on shooter finishing (goals / xG)";
+    goalie_prior_xg: 25.0, 5.0, 200.0, "expected goals of prior on the goalie factor (goals against / xG faced)";
+    share_prior: 2.0, 0.5, 20.0, "team-games of prior on a skater's attempt / assist share";
+});
 
 fn norm_name(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
@@ -313,7 +324,7 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
         if tg.len() < 3 { return Err(format!("{abbr}: fewer than 3 completed games before {}", g.date)); }
         let ids: Vec<i64> = tg.iter().map(|x| x.0).collect();
         let gi: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, x)| (*x, i)).collect();
-        let w = |i: usize| 0.5f64.powf(i as f64 / 20.0);
+        let w = |i: usize| 0.5f64.powf(i as f64 / o.tune.team_halflife);
         let shots: Vec<Shot> = db.query(&format!("SELECT {SHOT_COLS} FROM nhl_shots_api s WHERE s.game_id = ANY($1)"), &[&ids]).await.map_err(|e| dberr(&e))?.iter().map(shot_row).collect();
         let pens = db.query("SELECT game_id, team, duration FROM nhl_penalties_api WHERE game_id = ANY($1) AND duration < 10", &[&ids]).await.map_err(|e| dberr(&e))?;
         let boxes = db.query("SELECT game_id, player_id, name, pos, COALESCE(toi_sec,0), COALESCE(blocks,0), starter, COALESCE(shots_against,0), COALESCE(goals_against,0) \
@@ -344,14 +355,14 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
             }
         }
         let shrink_ratio = |x: f64, m: f64, lg60: f64, km: f64| ((x + lg60 * km / 60.0) / (m + km)) * 60.0 / lg60;
-        let km = [300.0, 60.0, 60.0];
+        let km = [o.tune.rate_prior_ev_min, o.tune.rate_prior_st_min, o.tune.rate_prior_st_min];
         let off = [0, 1, 2].map(|k| shrink_ratio(att_f[k], mins[k], league.att60[k], km[k]));
         // attempts allowed while this team is at strength k, vs the league rate of the opponent's strength (PP <-> SH)
         let opp = |k: usize| match k { PP => SH, SH => PP, _ => EV };
         let def = [0, 1, 2].map(|k| shrink_ratio(att_a[k], mins[k], league.att60[opp(k)], km[k]));
         // the team's blocked share of all opponent attempts vs the league's even-strength share (most attempts are at EV)
         let lg_blk = league.blocked[EV];
-        let block = ((blk_f + 200.0 * lg_blk) / (opp_att + 200.0)) / lg_blk;
+        let block = ((blk_f + o.tune.block_prior * lg_blk) / (opp_att + o.tune.block_prior)) / lg_blk;
         let pen = ((pen_taken + 10.0 * league.pen60) / (wsum + 10.0)) / league.pen60;
         // skaters
         struct P { id: i64, name: String, pos: String, played: Vec<usize>, blocks: f64, toi: f64, last: bool }
@@ -419,18 +430,18 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
                 let num = m.get(&(p.id, k)).copied().unwrap_or(0.0);
                 let den: f64 = p.played.iter().map(|&i| w(i) * tot.get(&(ids[i], k)).copied().unwrap_or(0.0)).sum();
                 let per = tot.iter().filter(|((_, kk), _)| *kk == k).map(|(_, v)| v).sum::<f64>() / ids.len() as f64;
-                (num + 2.0 * per / 18.0) / (den + 2.0 * per)
+                (num + o.tune.share_prior * per / 18.0) / (den + o.tune.share_prior * per)
             };
             let (gl, xg) = p_g.get(&p.id).copied().unwrap_or((0.0, 0.0));
             let gp = p.played.len() as f64;
             skaters.push(sim::Skater {
                 id: p.id, name: p.name.clone(), pos: if p.pos == "D" { "D".into() } else { "F".into() }, p_active: pa,
                 att_share: [EV, PP, SH].map(|k| share(&p_att, &team_att, k)), ast_share: [EV, PP, SH].map(|k| share(&p_ast, &team_goal, k)),
-                finish: (gl + 12.0) / (xg + 12.0), block_share: (p.blocks + 1.0) / (gp + 2.0),
+                finish: (gl + o.tune.finish_prior_xg) / (xg + o.tune.finish_prior_xg), block_share: (p.blocks + 1.0) / (gp + 2.0),
                 shots: shot_loc.remove(&p.id).unwrap_or_default(),
             });
             meta_p.push(json!({ "id": p.id, "name": p.name, "pos": p.pos, "p_active": r3(pa), "status": reason, "games": p.played.len(),
-                "toi_mean": r3(p.toi / gp / 60.0), "finish": r3((gl + 12.0) / (xg + 12.0)), "scenario": if o.out.contains(&p.id) { "out" } else if o.force_in.contains(&p.id) { "in" } else { "auto" } }));
+                "toi_mean": r3(p.toi / gp / 60.0), "finish": r3((gl + o.tune.finish_prior_xg) / (xg + o.tune.finish_prior_xg)), "scenario": if o.out.contains(&p.id) { "out" } else if o.force_in.contains(&p.id) { "in" } else { "auto" } }));
         }
         // goalie: scenario > actual starter > projected (most recent starter)
         let override_g = if ti == 0 { o.away_goalie } else { o.home_goalie };
@@ -452,7 +463,7 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
             xga += league.xg.p(x, y, sim::shot_type_idx(&r.get::<_, String>(2)), r.get::<_, String>(3) == "PP");
             if r.get::<_, String>(4) == "goal" { ga += 1.0; }
         }
-        let gfactor = (ga + 25.0) / (xga + 25.0);
+        let gfactor = (ga + o.tune.goalie_prior_xg) / (xga + o.tune.goalie_prior_xg);
         if skaters.iter().filter(|s| s.p_active > 0.0).count() < 16 { flags.push(format!("{abbr}: fewer than 16 available skaters")); }
         team_meta.push(json!({ "abbr": abbr, "recent_games": ids.len(), "off": off.map(r3), "def": def.map(r3), "pen": r3(pen), "block": r3(block),
             "goalie": { "id": gid, "name": gname, "factor": r3(gfactor), "shots_faced": faced.len(),
@@ -500,7 +511,7 @@ fn d_draws() -> usize { 200 }
 fn ids(s: &Option<String>) -> HashSet<i64> { s.as_deref().unwrap_or("").split(',').filter_map(|x| x.trim().parse().ok()).collect() }
 pub fn opts(lineup: Option<&str>, out: &[String], force_in: &[String], away_g: Option<String>, home_g: Option<String>) -> Opts {
     Opts { mode: LineupMode::parse(lineup), out: out.iter().filter_map(|x| x.parse().ok()).collect(), force_in: force_in.iter().filter_map(|x| x.parse().ok()).collect(),
-        away_goalie: away_g.and_then(|x| x.parse().ok()), home_goalie: home_g.and_then(|x| x.parse().ok()) }
+        away_goalie: away_g.and_then(|x| x.parse().ok()), home_goalie: home_g.and_then(|x| x.parse().ok()), tune: Tuning::default() }
 }
 
 fn hist_json(h: &sim::Hist, lines: &[f64]) -> Value {
@@ -512,21 +523,24 @@ fn hist_json(h: &sim::Hist, lines: &[f64]) -> Value {
 pub async fn simulate(state: web::Data<State>, path: web::Path<i64>, q: web::Query<SimQuery>) -> impl Responder {
     let id = path.into_inner();
     let gref = match game_ref(&state.db, id).await { Ok(g) => g, Err(e) => return unprocessable(e) };
-    let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: ids(&q.out), force_in: ids(&q.force_in), away_goalie: q.away_goalie, home_goalie: q.home_goalie };
+    let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: ids(&q.out), force_in: ids(&q.force_in), away_goalie: q.away_goalie, home_goalie: q.home_goalie, tune: Tuning::default() };
     let Built { game, meta } = match build(&state, &gref, &o).await { Ok(b) => b, Err(e) => return unprocessable(e) };
     let seed = q.seed.unwrap_or_else(|| sim::derive_seed(0x6e686c, &[&id.to_string(), &chrono::Utc::now().timestamp_millis().to_string()]));
     let (n, draws) = (q.n.clamp(100_000, 1_000_000), q.draws.clamp(50, 2000));
     let t = Instant::now();
     let g2 = game.clone();
     let e = match web::block(move || sim::simulate(&g2, n, draws, seed)).await { Ok(e) => e, Err(err) => return internal(err) };
-    let ms = t.elapsed().as_millis() as u64;
+    HttpResponse::Ok().json(payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64))
+}
+
+fn payload(gref: &GameRef, game: &GameInput, e: &sim::Ensemble, meta: Value, seed: u64, ms: u64) -> Value {
     let nn = e.n.max(1) as f64;
     let players: Vec<Vec<Value>> = (0..2).map(|t| game.teams[t].skaters.iter().enumerate().filter(|(i, _)| e.active_n[t][*i] > 0).map(|(i, p)| {
         let stats: serde_json::Map<String, Value> = sim::PROPS.iter().enumerate().map(|(k, s)| (s.to_string(), hist_json(&e.player[t][i][k], &[e.player[t][i][k].mean().floor() + 0.5]))).collect();
         json!({ "idx": i, "id": p.id, "name": p.name, "pos": p.pos, "p_active": r4(e.active_n[t][i] as f64 / nn), "stats": stats })
     }).collect()).collect();
-    HttpResponse::Ok().json(json!({
-        "game_id": id.to_string(), "date": gref.date, "away": gref.away, "home": gref.home, "model_version": MODEL_VERSION, "seed": seed, "n": e.n, "sim_ms": ms,
+    json!({
+        "game_id": gref.id.to_string(), "date": gref.date, "away": gref.away, "home": gref.home, "model_version": MODEL_VERSION, "seed": seed, "n": e.n, "sim_ms": ms,
         "win": { "home": r4(e.home_win as f64 / nn), "away": r4(1.0 - e.home_win as f64 / nn), "overtime": r4(e.regulation_tie as f64 / nn) },
         "puckline": { "home_minus_1_5": r4(e.home_puckline as f64 / nn), "away_minus_1_5": r4(e.away_puckline as f64 / nn) },
         "score": { "away": hist_json(&e.score[0], &[]), "home": hist_json(&e.score[1], &[]) },
@@ -536,7 +550,7 @@ pub async fn simulate(state: web::Data<State>, path: web::Path<i64>, q: web::Que
         "players": { "away": players[0], "home": players[1] },
         "inputs": meta,
         "note": "skater props conditional on playing; mcse is Monte Carlo sampling error only",
-    }))
+    })
 }
 
 pub async fn new_session(state: &State, id: &str, seed: u64, o: Opts) -> Result<(Value, Vec<Value>, Value, NaiveDate), String> {
@@ -588,94 +602,143 @@ fn d_bt_n() -> usize { 2000 }
 fn d_bt_draws() -> usize { 20 }
 fn d_bt_seed() -> u64 { 4242 }
 
-#[derive(Default)]
-struct Binary { n: f64, m: f64, b: f64, d: Vec<f64> }
-impl Binary {
-    fn add(&mut self, pm: f64, pb: f64, y: f64) {
-        let (pm, pb) = (pm.clamp(1e-4, 1.0 - 1e-4), pb.clamp(1e-4, 1.0 - 1e-4));
-        let (bm, bb) = ((pm - y).powi(2), (pb - y).powi(2));
-        self.n += 1.0; self.m += bm; self.b += bb; self.d.push(bm - bb);
-    }
-    fn report(&self, baseline: &str) -> Value {
-        let n = self.n.max(1.0);
-        let md = self.d.iter().sum::<f64>() / n;
-        let sd = (self.d.iter().map(|x| (x - md).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
-        json!({ "n": self.n, "baseline": baseline, "brier_model": r4(self.m / n), "brier_baseline": r4(self.b / n), "brier_diff": r4(md), "brier_diff_se": r4(sd / n.sqrt()) })
-    }
-}
-
 pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> impl Responder {
     let db = &state.db;
-    let all: Vec<i64> = match db.query("SELECT game_id FROM nhl_games_api WHERE season = $1 AND game_type = 2 AND completed ORDER BY game_date, game_id", &[&q.season]).await {
-        Ok(r) => r.iter().map(|x| x.get(0)).skip(150).collect(), Err(e) => return internal(dberr(&e)),
-    };
+    let all = match backtest_games(db, q.season).await { Ok(a) => a, Err(e) => return internal(e) };
     if all.is_empty() { return unprocessable("no games"); }
     let step = (all.len() as f64 / q.games.max(1) as f64).max(1.0);
-    let picked: Vec<i64> = (0..q.games.min(all.len())).map(|i| all[(i as f64 * step) as usize]).collect();
+    let picked: Vec<String> = (0..q.games.min(all.len())).map(|i| all[(i as f64 * step) as usize].clone()).collect();
     let t0 = Instant::now();
-    let (mut hw, mut over55, mut sog, mut pts, mut sav) = (Binary::default(), Binary::default(), Binary::default(), Binary::default(), Binary::default());
+    let lineup = LineupMode::parse(q.lineup.as_deref()).as_str();
+    let mut card = Scorecard::default();
     let (mut tot_err, mut tot_bias, mut tot_base, mut ng) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut sog_sim, mut sog_act) = (0.0, 0.0);
     let mut sims = 0;
     let mut skipped = Vec::new();
     for gid in &picked {
-        let gref = match game_ref(db, *gid).await { Ok(g) => g, Err(e) => { skipped.push(e); continue } };
-        let (Some(hs), Some(as_)) = (gref.home_score, gref.away_score) else { continue };
-        let o = Opts { mode: LineupMode::parse(q.lineup.as_deref()), out: HashSet::new(), force_in: HashSet::new(), away_goalie: None, home_goalie: None };
-        let Built { game, .. } = match build(&state, &gref, &o).await { Ok(b) => b, Err(e) => { skipped.push(e); continue } };
-        let seed = sim::derive_seed(q.seed, &[&gid.to_string()]);
-        let (n, draws) = (q.n, q.draws);
-        let g2 = game.clone();
-        let e = match web::block(move || sim::simulate(&g2, n, draws, seed)).await { Ok(e) => e, Err(err) => return internal(err) };
+        let seed = sim::derive_seed(q.seed, &[gid]);
+        let ev = match evaluate(&state, gid, lineup, &json!({}), q.n, q.draws, seed).await { Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { skipped.push(e); continue } };
         sims += 1;
-        let nn = e.n as f64;
-        hw.add(e.home_win as f64 / nn, 0.535, (hs > as_) as i32 as f64);
-        let tot = (hs + as_) as f64;
-        let (o55, _, _, _) = e.total.line(5.5);
-        over55.add(o55, 0.53, (tot > 5.5) as i32 as f64);
-        tot_err += (e.total.mean() - tot).abs(); tot_bias += e.total.mean() - tot; tot_base += (6.1 - tot).abs(); ng += 1.0;
-        let act = match db.query("SELECT player_id, pos, COALESCE(sog,0), COALESCE(goals,0)+COALESCE(assists,0), COALESCE(saves,0), team, COALESCE(toi_sec,0) FROM nhl_box_api WHERE game_id = $1", &[gid]).await {
-            Ok(r) => r, Err(err) => return internal(dberr(&err)) };
-        for r in &act { if r.get::<_, String>(1) != "G" { sog_act += r.get::<_, i32>(2) as f64; } }
-        sog_sim += e.shots[0].mean() + e.shots[1].mean();
-        let pids: Vec<i64> = game.teams.iter().flat_map(|t| t.skaters.iter().map(|p| p.id)).chain(game.teams.iter().map(|t| t.goalie.id)).collect();
-        let hist = match db.query("SELECT b.player_id, COALESCE(b.sog,0), COALESCE(b.goals,0)+COALESCE(b.assists,0), COALESCE(b.saves,0) FROM nhl_box_api b JOIN nhl_games_api g USING (game_id) \
-                                   WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND COALESCE(b.toi_sec,0) > 0", &[&pids, &gref.date]).await {
-            Ok(r) => r, Err(err) => return internal(dberr(&err)) };
-        let mut past: HashMap<i64, Vec<[f64; 3]>> = HashMap::new();
-        for r in &hist { past.entry(r.get(0)).or_default().push([r.get::<_, i32>(1) as f64, r.get::<_, i32>(2) as f64, r.get::<_, i32>(3) as f64]); }
-        let actual: HashMap<i64, [f64; 3]> = act.iter().filter(|r| r.get::<_, i32>(6) > 0).map(|r| (r.get(0), [r.get::<_, i32>(2) as f64, r.get::<_, i32>(3) as f64, r.get::<_, i32>(4) as f64])).collect();
-        let freq = |ph: &Vec<[f64; 3]>, k: usize, line: f64| (ph.iter().filter(|x| x[k] > line).count() as f64 + 1.0) / (ph.len() as f64 + 2.0);
-        for t in 0..2 {
-            for (i, p) in game.teams[t].skaters.iter().enumerate() {
-                let (Some(a), Some(ph)) = (actual.get(&p.id), past.get(&p.id)) else { continue };
-                if ph.len() < 5 || e.active_n[t][i] == 0 { continue; }
-                let avg = ph.iter().map(|x| x[0]).sum::<f64>() / ph.len() as f64;
-                let line = (avg.floor() + 0.5).max(0.5);
-                sog.add(e.player[t][i][0].line(line).0, freq(ph, 0, line), (a[0] > line) as i32 as f64);
-                pts.add(e.player[t][i][3].line(0.5).0, freq(ph, 1, 0.5), (a[1] > 0.5) as i32 as f64);
-            }
-            let gk = game.teams[t].goalie.id;
-            if let (Some(a), Some(ph)) = (actual.get(&gk), past.get(&gk)) {
-                if ph.len() >= 5 {
-                    let avg = ph.iter().map(|x| x[2]).sum::<f64>() / ph.len() as f64;
-                    let line = avg.floor() + 0.5;
-                    sav.add(e.saves[t].line(line).0, freq(ph, 2, line), (a[2] > line) as i32 as f64);
-                }
+        card.add_all(&ev.forecasts, &ev.outcomes);
+        for (k, s, a) in &ev.diag {
+            match *k {
+                "total_goals" => { tot_err += (s - a).abs(); tot_bias += s - a; tot_base += (6.1 - a).abs(); ng += 1.0; }
+                "shots_on_goal" => { sog_sim += s; sog_act += a; }
+                _ => {}
             }
         }
     }
     let ng = ng.max(1.0);
-    let report = json!({ "model_version": MODEL_VERSION, "season": q.season, "lineup": LineupMode::parse(q.lineup.as_deref()).as_str(), "games_simulated": sims, "sims_per_game": q.n,
+    let report = json!({ "model_version": MODEL_VERSION, "season": q.season, "lineup": lineup, "games_simulated": sims, "sims_per_game": q.n,
         "secs": t0.elapsed().as_secs(), "skipped": skipped.into_iter().take(10).collect::<Vec<_>>(),
         "shots_on_goal_per_game": { "simulated": r3(sog_sim / sims.max(1) as f64), "actual": r3(sog_act / sims.max(1) as f64) },
         "total_goals": { "mae_model": r3(tot_err / ng), "mae_league_avg_6_1": r3(tot_base / ng), "bias": r3(tot_bias / ng) },
-        "binary": { "home_win": hw.report("league home-win rate 0.535"), "total_over_5_5": over55.report("league rate 0.53"),
-            "sog_over_avg": sog.report("player's own prior frequency"), "points_1plus": pts.report("player's own prior frequency"), "goalie_saves_over_avg": sav.report("goalie's own prior frequency") } });
+        "binary": card.report() });
     if sims >= 20 {
-        let key = format!("nhl:backtest:{}:{}", q.season, LineupMode::parse(q.lineup.as_deref()).as_str());
+        let key = format!("nhl:backtest:{}:{}", q.season, lineup);
         let _ = db.execute("INSERT INTO sim_model_params (key, params, source) VALUES ($1, $2, 'walk-forward backtest') ON CONFLICT (key) DO UPDATE SET params = EXCLUDED.params, fitted_at = now()",
             &[&key, &Json(report.clone())]).await;
     }
     HttpResponse::Ok().json(report)
+}
+
+// ---------------------------------------------------------------------------
+// Learning-loop adapters (see learning.rs)
+// ---------------------------------------------------------------------------
+
+/// Regular-season games used for walk-forward tests (the first 150 of a season are skipped so players have history).
+pub async fn backtest_games(db: &tokio_postgres::Client, season: i32) -> Result<Vec<String>, String> {
+    Ok(db.query("SELECT game_id FROM nhl_games_api WHERE season = $1 AND game_type = 2 AND completed ORDER BY game_date, game_id", &[&season]).await
+        .map_err(|e| dberr(&e))?.iter().map(|x| x.get::<_, i64>(0).to_string()).skip(150).collect())
+}
+
+pub async fn slate(db: &tokio_postgres::Client, date: NaiveDate) -> Result<Vec<SlateGame>, String> {
+    Ok(db.query("SELECT game_id, game_date, start_time, away, home FROM nhl_games_api WHERE game_date = $1 AND NOT completed AND game_type IN (2,3) ORDER BY start_time, game_id",
+        &[&date]).await.map_err(|e| dberr(&e))?.iter().map(|r| SlateGame { id: r.get::<_, i64>(0).to_string(), date: r.get(1), start: r.get(2),
+            label: format!("{} @ {}", r.get::<_, String>(3), r.get::<_, String>(4)) }).collect())
+}
+
+/// Scoreable forecasts. Baselines use only games before the game date.
+async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput, e: &sim::Ensemble) -> Result<Vec<Forecast>, String> {
+    let nn = e.n.max(1) as f64;
+    let mut out = vec![
+        Forecast::game("home_win", "league home-win rate 0.535", "home_margin", 0.0, e.home_win as f64 / nn, 0.535),
+        Forecast::game("total_over_5_5", "league rate 0.53", "total", 5.5, e.total.line(5.5).0, 0.53),
+    ];
+    let pids: Vec<i64> = game.teams.iter().flat_map(|t| t.skaters.iter().map(|p| p.id)).chain(game.teams.iter().map(|t| t.goalie.id)).collect();
+    let hist = db.query("SELECT b.player_id, COALESCE(b.sog,0), COALESCE(b.goals,0)+COALESCE(b.assists,0), COALESCE(b.saves,0) FROM nhl_box_api b JOIN nhl_games_api g USING (game_id) \
+                         WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND COALESCE(b.toi_sec,0) > 0", &[&pids, &gref.date]).await.map_err(|e| dberr(&e))?;
+    let mut past: HashMap<i64, [Vec<f64>; 3]> = HashMap::new();
+    for r in &hist {
+        let v = past.entry(r.get(0)).or_default();
+        for (k, x) in v.iter_mut().enumerate() { x.push(r.get::<_, i32>(k + 1) as f64); }
+    }
+    for t in 0..2 {
+        for (i, p) in game.teams[t].skaters.iter().enumerate() {
+            let Some(ph) = past.get(&p.id) else { continue };
+            if ph[0].len() < 5 || e.active_n[t][i] == 0 { continue; }
+            let avg = ph[0].iter().sum::<f64>() / ph[0].len() as f64;
+            let line = (avg.floor() + 0.5).max(0.5);
+            out.push(Forecast::player("sog_over_avg", "player's own prior frequency", p.id, &p.name, "sog", line, e.player[t][i][0].line(line).0, freq_over(&ph[0], line)));
+            out.push(Forecast::player("points_1plus", "player's own prior frequency", p.id, &p.name, "points", 0.5, e.player[t][i][3].line(0.5).0, freq_over(&ph[1], 0.5)));
+        }
+        let gk = &game.teams[t].goalie;
+        if let Some(ph) = past.get(&gk.id) {
+            if ph[2].len() >= 5 {
+                let line = (ph[2].iter().sum::<f64>() / ph[2].len() as f64).floor() + 0.5;
+                out.push(Forecast::player("goalie_saves_over_avg", "goalie's own prior frequency", gk.id, &gk.name, "saves", line, e.saves[t].line(line).0, freq_over(&ph[2], line)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Final scores and the box score of players who played; None until the game is final.
+pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Outcomes>, String> {
+    let gid: i64 = id.parse().map_err(|_| "NHL game id must be numeric")?;
+    let Some(g) = db.query_opt("SELECT home_score, away_score FROM nhl_games_api WHERE game_id = $1 AND completed", &[&gid]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
+    let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
+    let rows = db.query("SELECT player_id, pos, COALESCE(sog,0), COALESCE(goals,0)+COALESCE(assists,0), COALESCE(saves,0), COALESCE(toi_sec,0) FROM nhl_box_api WHERE game_id = $1", &[&gid])
+        .await.map_err(|e| dberr(&e))?;
+    if rows.is_empty() { return Ok(None); }
+    let mut o = Outcomes::default();
+    o.game.insert("home_margin", (hs - as_) as f64);
+    o.game.insert("total", (hs + as_) as f64);
+    o.game.insert("shots_on_goal", rows.iter().filter(|r| r.get::<_, String>(1) != "G").map(|r| r.get::<_, i32>(2) as f64).sum());
+    for r in rows.iter().filter(|r| r.get::<_, i32>(5) > 0) {
+        let m = o.players.entry(r.get::<_, i64>(0).to_string()).or_default();
+        m.insert("sog", r.get::<_, i32>(2) as f64);
+        m.insert("points", r.get::<_, i32>(3) as f64);
+        m.insert("saves", r.get::<_, i32>(4) as f64);
+    }
+    Ok(Some(o))
+}
+
+/// Walk-forward evaluation of one completed game (data strictly before puck drop).
+pub async fn evaluate(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+    let gid: i64 = id.parse().map_err(|_| "NHL game id must be numeric")?;
+    let gref = game_ref(&state.db, gid).await?;
+    if gref.home_score.is_none() || gref.away_score.is_none() { return Ok(None); }
+    let Some(outcomes) = outcomes(&state.db, id).await? else { return Ok(None) };
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), away_goalie: None, home_goalie: None, tune: Tuning::from_cfg(cfg) };
+    let Built { game, .. } = build(state, &gref, &o).await?;
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, draws, seed)).await.map_err(|e| e.to_string())?;
+    let forecasts = forecasts(&state.db, &gref, &game, &e).await?;
+    let diag = vec![("total_goals", e.total.mean(), outcomes.game["total"]), ("shots_on_goal", e.shots[0].mean() + e.shots[1].mean(), outcomes.game["shots_on_goal"])];
+    Ok(Some(GameEval { forecasts, outcomes, diag }))
+}
+
+/// A production prediction (≥100k games) for the ledger.
+pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
+    let gid: i64 = id.parse().map_err(|_| "NHL game id must be numeric")?;
+    let gref = game_ref(&state.db, gid).await?;
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), away_goalie: None, home_goalie: None, tune: Tuning::from_cfg(cfg) };
+    let Built { game, meta } = build(state, &gref, &o).await?;
+    let t = Instant::now();
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, 200, seed)).await.map_err(|e| e.to_string())?;
+    let forecasts = forecasts(&state.db, &gref, &game, &e).await?;
+    let start: Option<chrono::DateTime<chrono::Utc>> = state.db.query_opt("SELECT start_time FROM nhl_games_api WHERE game_id = $1", &[&gid]).await.map_err(|e| dberr(&e))?.and_then(|r| r.get(0));
+    Ok(Prediction { payload: payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64), forecasts, date: gref.date, start, engine: MODEL_VERSION, n: e.n as usize })
 }

@@ -122,7 +122,7 @@ export function Projections() {
 
       {tab === "game" ? (
         sportKey === "nfl" || sportKey === "nhl" || sportKey === "nba" ? (
-          <GameProjections sport={sportKey} />
+          <GameProjections key={sportKey} sport={sportKey} />
         ) : (
           <Msg>{sportKey === "mlb" ? <>MLB game projections come from the plate-appearance simulator — open <a href="/mlb-sim" className="text-violet-light underline">MLB Game Sim</a>.</> : <>{sport.label} team model is in the pipeline. NFL, NHL and NBA game projections are live now.</>}</Msg>
         )

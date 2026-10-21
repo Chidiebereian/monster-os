@@ -29,6 +29,9 @@ use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
 mod hitrates;
+mod learning;
+mod autopilot;
+mod team_engine;
 mod market;
 mod team_model;
 mod player_backtest;
@@ -624,6 +627,7 @@ async fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| NFLVERSE_PLAYER_STATS.to_string()),
     });
     println!("projection-service listening on 0.0.0.0:{port}");
+    autopilot::spawn(state.clone());
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
@@ -678,6 +682,21 @@ async fn main() -> std::io::Result<()> {
             .route("/backtest/nfl/sim", web::get().to(nfl_game::backtest))
             .route("/nfl/backtests", web::get().to(nfl_game::backtests))
             .route("/sim/sessions", web::post().to(sim_sessions::create))
+            .route("/learning/ledger", web::get().to(learning::ledger))
+            .route("/learning/ledger/{id}", web::get().to(learning::ledger_entry))
+            .route("/learning/summary", web::get().to(learning::summary))
+            .route("/learning/registry", web::get().to(learning::registry))
+            .route("/learning/audit", web::get().to(learning::audit_log))
+            .route("/learning/autopilot", web::get().to(autopilot::status))
+            .route("/learning/autopilot", web::post().to(autopilot::status))
+            .route("/learning/autopilot/run", web::post().to(autopilot::run_now))
+            .route("/learning/{sport}/freeze", web::post().to(learning::freeze))
+            .route("/learning/{sport}/score", web::post().to(learning::score))
+            .route("/learning/{sport}/cycle", web::post().to(learning::cycle))
+            .route("/learning/{sport}/candidates", web::post().to(learning::register))
+            .route("/learning/{sport}/evaluate", web::post().to(learning::evaluate_candidate))
+            .route("/learning/{sport}/promote", web::post().to(learning::promote))
+            .route("/learning/{sport}/rollback", web::post().to(learning::rollback))
             .route("/sim/sessions", web::get().to(sim_sessions::list))
             .route("/sim/sessions/{id}", web::get().to(sim_sessions::get))
             .route("/sim/sessions/{id}/events", web::get().to(sim_sessions::events))

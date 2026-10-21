@@ -72,7 +72,7 @@ impl Rng {
     pub fn f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
-    fn normal(&mut self) -> f64 {
+    pub fn normal(&mut self) -> f64 {
         let u1 = self.f64().max(1e-300);
         let u2 = self.f64();
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()

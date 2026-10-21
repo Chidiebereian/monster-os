@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tokio_postgres::types::{Json, ToSql};
 
 use crate::nfl_sim::{self as sim, GameInput, League, Rate};
+use crate::learning::{Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
 pub const MODEL_VERSION: &str = "nfl-play-sim-v1";
@@ -959,6 +960,20 @@ pub struct Opts {
     pub lineup_mode: LineupMode,
 }
 
+crate::learning::tuning!(Tuning {
+    share_halflife: 3.0, 1.0, 16.0, "player usage-share recency half-life, in team games";
+    team_halflife: 8.0, 2.0, 34.0, "team tendency (PROE) and defence recency half-life, in team games";
+});
+
+impl Opts {
+    pub fn tuned(mut self, cfg: &Value) -> Self {
+        let t = Tuning::from_cfg(cfg);
+        self.share_halflife = t.share_halflife;
+        self.team_halflife = t.team_halflife;
+        self
+    }
+}
+
 /// Which lineup the engine plays.
 /// * Projected — usage only (players used in the team's last 3 games), no roster or injury report.
 /// * Confirmed — this week's active roster + official injury report (default).
@@ -1824,47 +1839,6 @@ fn d_bt_draws() -> usize { 20 }
 fn d_bt_seed() -> u64 { 20260101 }
 
 #[derive(Default)]
-struct Binary {
-    n: f64,
-    model: f64,
-    base: f64,
-    diffs: Vec<f64>,
-    ll_model: f64,
-    ll_base: f64,
-    bins: [[f64; 3]; 10], // predicted sum, actual sum, n
-}
-impl Binary {
-    fn add(&mut self, pm: f64, pb: f64, y: f64) {
-        let pm = pm.clamp(1e-4, 1.0 - 1e-4);
-        let pb = pb.clamp(1e-4, 1.0 - 1e-4);
-        let bm = (pm - y).powi(2);
-        let bb = (pb - y).powi(2);
-        self.n += 1.0;
-        self.model += bm;
-        self.base += bb;
-        self.diffs.push(bm - bb);
-        self.ll_model += -(y * pm.ln() + (1.0 - y) * (1.0 - pm).ln());
-        self.ll_base += -(y * pb.ln() + (1.0 - y) * (1.0 - pb).ln());
-        let b = ((pm * 10.0) as usize).min(9);
-        self.bins[b][0] += pm;
-        self.bins[b][1] += y;
-        self.bins[b][2] += 1.0;
-    }
-    fn report(&self, baseline: &str) -> Value {
-        let n = self.n.max(1.0);
-        let md = self.diffs.iter().sum::<f64>() / n;
-        let sd = (self.diffs.iter().map(|d| (d - md).powi(2)).sum::<f64>() / (n - 1.0).max(1.0)).sqrt();
-        let ece = self.bins.iter().map(|b| if b[2] > 0.0 { b[2] / n * (b[0] / b[2] - b[1] / b[2]).abs() } else { 0.0 }).sum::<f64>();
-        json!({
-            "n": self.n, "baseline": baseline, "brier_model": r4(self.model / n), "brier_baseline": r4(self.base / n),
-            "brier_diff": r4(md), "brier_diff_se": r4(sd / n.sqrt()), "logloss_model": r4(self.ll_model / n), "logloss_baseline": r4(self.ll_base / n),
-            "ece_model": r4(ece),
-            "calibration": self.bins.iter().filter(|b| b[2] > 0.0).map(|b| json!({ "pred": r3(b[0] / b[2]), "actual": r3(b[1] / b[2]), "n": b[2] })).collect::<Vec<_>>(),
-        })
-    }
-}
-
-#[derive(Default)]
 struct Numeric {
     n: f64,
     abs_err: f64,
@@ -1999,14 +1973,7 @@ fn actual_stats(plays: &[P]) -> HashMap<String, [f64; 5]> {
 pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> impl Responder {
     let db = &state.db;
     let from_week = q.from_week.unwrap_or(3);
-    let rows = match db.query(
-        "SELECT game_id FROM sports_games WHERE sport = 'nfl' AND season = $1 AND game_type = 'REG' AND home_score IS NOT NULL \
-         AND week::int >= $2 AND game_id IN (SELECT DISTINCT game_id FROM nfl_plays WHERE season = $1) ORDER BY game_date, game_id",
-        &[&q.season, &from_week]).await {
-        Ok(r) => r,
-        Err(e) => return internal(dberr(&e)),
-    };
-    let all: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    let all = match season_games(db, q.season, from_week).await { Ok(a) => a, Err(e) => return internal(e) };
     if all.is_empty() {
         return unprocessable(format!("no completed {} regular-season games with play-by-play", q.season));
     }
@@ -2014,8 +1981,7 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
     let step = (all.len() as f64 / q.games.max(1) as f64).max(1.0);
     let picked: Vec<String> = (0..q.games.min(all.len())).map(|i| all[((i as f64) * step) as usize].clone()).collect();
     let t0 = Instant::now();
-    let (mut home_win, mut cover, mut over) = (Binary::default(), Binary::default(), Binary::default());
-    let (mut pass_y, mut rush_y, mut rec_y, mut recs, mut any_td) = (Binary::default(), Binary::default(), Binary::default(), Binary::default(), Binary::default());
+    let mut card = Scorecard::default();
     let (mut total_n, mut margin_n, mut pass_num, mut rush_num, mut rec_num) = (Numeric::default(), Numeric::default(), Numeric::default(), Numeric::default(), Numeric::default());
     let mut plays_sim = 0.0;
     let mut plays_act = 0.0;
@@ -2035,23 +2001,8 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
         let g2 = game.clone();
         let e = match web::block(move || sim::simulate(&g2, n, draws, seed)).await { Ok(e) => e, Err(err) => return internal(err) };
         sims += 1;
-        let nn = e.n as f64;
-        // team markets
-        let ph = (e.home_win as f64 + 0.5 * e.ties as f64) / nn;
-        let y = if hs > as_ { 1.0 } else if hs < as_ { 0.0 } else { 0.5 };
-        // market-implied home win from the closing spread (normal, sd 13.45) when available
-        let market_p = gref.spread_line.map(|s| 0.5 * (1.0 + erf(s / (13.45 * std::f64::consts::SQRT_2))));
-        home_win.add(ph, market_p.unwrap_or(0.55), y);
-        if let Some(s) = gref.spread_line {
-            let (o, u, _, _) = e.margin.line(s);
-            let margin = (hs - as_) as f64;
-            if (margin - s).abs() > 1e-9 { cover.add(o / (o + u).max(1e-9), 0.5, (margin > s) as i32 as f64); }
-        }
         if let Some(tl) = gref.total_line {
-            let (o, u, _, _) = e.total.line(tl);
-            let tot = (hs + as_) as f64;
-            if (tot - tl).abs() > 1e-9 { over.add(o / (o + u).max(1e-9), 0.5, (tot > tl) as i32 as f64); }
-            total_n.add(e.total.mean(), tl, e.total.quantile(0.1) as f64, e.total.quantile(0.9) as f64, tot);
+            total_n.add(e.total.mean(), tl, e.total.quantile(0.1) as f64, e.total.quantile(0.9) as f64, (hs + as_) as f64);
         }
         if let Some(s) = gref.spread_line {
             margin_n.add(e.margin.mean(), s, e.margin.quantile(0.1) as f64, e.margin.quantile(0.9) as f64, (hs - as_) as f64);
@@ -2075,47 +2026,21 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
         }).await { Ok(d) => d, Err(err) => return internal(err) };
         for k in 0..ND { diag_sim[k] += ds[k]; }
         plays_act += gplays.iter().filter(|p| p.scrimmage() || p.ptype == "qb_kneel").count() as f64;
-        let act = actual_stats(&gplays);
-        // baseline: each player's own prior frequency over the line (add-one), from the build window
-        let prior = match load_plays(db, "game_date < $1 AND season >= $2 AND (passer_id = ANY($3) OR rusher_id = ANY($3) OR receiver_id = ANY($3))",
-            &[&gref.date, &(gref.season - 1), &game.players.iter().map(|p| p.id.clone()).collect::<Vec<_>>()]).await {
-            Ok(p) => p, Err(err) => return internal(err),
-        };
-        let mut hist: HashMap<String, Vec<[f64; 5]>> = HashMap::new();
-        {
-            let mut by_game: HashMap<&str, Vec<P>> = HashMap::new();
-            for p in &prior { by_game.entry(p.game_id.as_str()).or_default().push(p.clone()); }
-            for (_, ps) in by_game {
-                for (id, s) in actual_stats(&ps) { hist.entry(id).or_default().push(s); }
-            }
-        }
-        for (i, pl) in game.players.iter().enumerate() {
-            let Some(a) = act.get(&pl.id) else { continue }; // did not record a stat: likely inactive
-            let h = &e.player[i];
-            let past = hist.get(&pl.id).cloned().unwrap_or_default();
-            let freq = |k: usize, line: f64| (past.iter().filter(|s| s[k] > line).count() as f64 + 1.0) / (past.len() as f64 + 2.0);
-            let avg = |k: usize| if past.is_empty() { 0.0 } else { past.iter().map(|s| s[k]).sum::<f64>() / past.len() as f64 };
-            let is_qb = game.teams.iter().any(|t| t.off.qb == i || t.off.backup_qb.as_ref().map(|b| b.p == i).unwrap_or(false));
-            let score = |b: &mut Binary, num: Option<&mut Numeric>, k: usize, stat: usize| {
-                if past.len() < 3 { return; }
-                let line = (avg(k)).floor() + 0.5;
-                let (o, _, _, _) = h[stat].line(line);
-                b.add(o, freq(k, line), (a[k] > line) as i32 as f64);
-                if let Some(nm) = num { nm.add(h[stat].mean(), avg(k), h[stat].quantile(0.1) as f64, h[stat].quantile(0.9) as f64, a[k]); }
+        let (fs, avgs) = match forecasts_avg(db, &gref, &game, &e).await { Ok(x) => x, Err(err) => return internal(err) };
+        let outc = outcomes_from(hs, as_, &gplays);
+        card.add_all(&fs, &outc);
+        // numeric props: model mean vs the player's prior average, on the same player set as the binary props
+        let idx: HashMap<&str, usize> = game.players.iter().enumerate().map(|(i, p)| (p.id.as_str(), i)).collect();
+        for f in &fs {
+            let (num, stat, k) = match f.market {
+                "qb_pass_yds_over_avg" => (&mut pass_num, sim::PASS_YDS, 0),
+                "rush_yds_over_avg" => (&mut rush_num, sim::RUSH_YDS, 1),
+                "rec_yds_over_avg" => (&mut rec_num, sim::REC_YDS, 2),
+                _ => continue,
             };
-            if is_qb {
-                score(&mut pass_y, Some(&mut pass_num), 0, sim::PASS_YDS);
-            } else {
-                if avg(1) >= 20.0 { score(&mut rush_y, Some(&mut rush_num), 1, sim::RUSH_YDS); }
-                if avg(2) >= 15.0 {
-                    score(&mut rec_y, Some(&mut rec_num), 2, sim::REC_YDS);
-                    score(&mut recs, None, 3, sim::REC);
-                }
-                if past.len() >= 3 {
-                    let td_freq = (past.iter().filter(|s| s[4] > 0.0).count() as f64 + 1.0) / (past.len() as f64 + 2.0);
-                    any_td.add(e.anytime_td[i] as f64 / nn, td_freq, a[4]);
-                }
-            }
+            let (Some(&i), Some(av), Some(y)) = (idx.get(f.subject.as_str()), avgs.get(&f.subject), outc.value(f)) else { continue };
+            let h = &e.player[i][stat];
+            num.add(h.mean(), av[k], h.quantile(0.1) as f64, h.quantile(0.9) as f64, y);
         }
     }
     let report = json!({
@@ -2125,16 +2050,7 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
         "plays_per_game": { "simulated": r3(plays_sim / sims.max(1) as f64), "actual": r3(plays_act / sims.max(1) as f64) },
         "per_game_both_teams": DIAG.iter().enumerate().map(|(k, name)| json!({
             "stat": name, "simulated": r3(diag_sim[k] / sims.max(1) as f64), "actual": r3(diag_act[k] / sims.max(1) as f64) })).collect::<Vec<_>>(),
-        "binary": {
-            "home_win": home_win.report("closing spread (normal, sd 13.45)"),
-            "home_cover": cover.report("0.5 (closing spread is the line)"),
-            "total_over": over.report("0.5 (closing total is the line)"),
-            "qb_pass_yds_over_avg": pass_y.report("player's own prior frequency over the line"),
-            "rush_yds_over_avg": rush_y.report("player's own prior frequency over the line"),
-            "rec_yds_over_avg": rec_y.report("player's own prior frequency over the line"),
-            "receptions_over_avg": recs.report("player's own prior frequency over the line"),
-            "anytime_td": any_td.report("player's own prior TD-game frequency"),
-        },
+        "binary": card.report(),
         "numeric": {
             "total_points": total_n.report("closing total"),
             "home_margin": margin_n.report("closing spread"),
@@ -2206,4 +2122,139 @@ mod tests {
         assert!((erf(0.5) - 0.5205).abs() < 1e-3);
         assert!((erf(-1.0) + 0.8427).abs() < 1e-3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Learning-loop adapters (see learning.rs)
+// ---------------------------------------------------------------------------
+
+/// NFL season of a calendar date (the season starts in September; Jan–Feb belong to the previous one).
+pub fn season_of(d: NaiveDate) -> i32 {
+    use chrono::Datelike;
+    if d.month() >= 3 { d.year() } else { d.year() - 1 }
+}
+
+async fn season_games(db: &tokio_postgres::Client, season: i32, from_week: i32) -> Result<Vec<String>, String> {
+    Ok(db.query(
+        "SELECT game_id FROM sports_games WHERE sport = 'nfl' AND season = $1 AND game_type = 'REG' AND home_score IS NOT NULL \
+         AND week::int >= $2 AND game_id IN (SELECT DISTINCT game_id FROM nfl_plays WHERE season = $1) ORDER BY game_date, game_id",
+        &[&season, &from_week]).await.map_err(|e| dberr(&e))?.iter().map(|r| r.get(0)).collect())
+}
+
+/// Regular-season games from week 3 (players need history), as in the backtest.
+pub async fn backtest_games(db: &tokio_postgres::Client, season: i32) -> Result<Vec<String>, String> { season_games(db, season, 3).await }
+
+/// No kickoff times are stored, so games are only frozen on an earlier calendar day.
+pub async fn slate(db: &tokio_postgres::Client, date: NaiveDate) -> Result<Vec<SlateGame>, String> {
+    Ok(db.query("SELECT game_id, game_date, away_team, home_team FROM sports_games WHERE sport = 'nfl' AND game_date = $1 AND home_score IS NULL ORDER BY game_id",
+        &[&date]).await.map_err(|e| dberr(&e))?.iter().map(|r| SlateGame { id: r.get(0), date: r.get(1), start: None,
+            label: format!("{} @ {}", r.get::<_, Option<String>>(2).unwrap_or_default(), r.get::<_, Option<String>>(3).unwrap_or_default()) }).collect())
+}
+
+/// Scoreable forecasts plus each player's prior averages (pass, rush, rec yds, receptions, TD-game rate).
+/// Baselines use plays strictly before the game date.
+async fn forecasts_avg(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput, e: &sim::Ensemble) -> Result<(Vec<Forecast>, HashMap<String, [f64; 5]>), String> {
+    let nn = e.n.max(1) as f64;
+    let mut out = Vec::new();
+    // ties are voided (a push at margin 0); the market-implied home win comes from the spread (normal, sd 13.45)
+    let ph = (e.home_win as f64 + 0.5 * e.ties as f64) / nn;
+    let market_p = gref.spread_line.map(|s| 0.5 * (1.0 + erf(s / (13.45 * std::f64::consts::SQRT_2))));
+    out.push(Forecast::game("home_win", "closing spread (normal, sd 13.45)", "home_margin", 0.0, ph, market_p.unwrap_or(0.55)).pushes());
+    if let Some(s) = gref.spread_line {
+        let (o, u, _, _) = e.margin.line(s);
+        out.push(Forecast::game("home_cover", "0.5 (closing spread is the line)", "home_margin", s, o / (o + u).max(1e-9), 0.5).pushes());
+    }
+    if let Some(tl) = gref.total_line {
+        let (o, u, _, _) = e.total.line(tl);
+        out.push(Forecast::game("total_over", "0.5 (closing total is the line)", "total", tl, o / (o + u).max(1e-9), 0.5).pushes());
+    }
+    let prior = load_plays(db, "game_date < $1 AND season >= $2 AND (passer_id = ANY($3) OR rusher_id = ANY($3) OR receiver_id = ANY($3))",
+        &[&gref.date, &(gref.season - 1), &game.players.iter().map(|p| p.id.clone()).collect::<Vec<_>>()]).await?;
+    let mut hist: HashMap<String, Vec<[f64; 5]>> = HashMap::new();
+    {
+        let mut by_game: HashMap<&str, Vec<P>> = HashMap::new();
+        for p in &prior { by_game.entry(p.game_id.as_str()).or_default().push(p.clone()); }
+        for (_, ps) in by_game {
+            for (id, s) in actual_stats(&ps) { hist.entry(id).or_default().push(s); }
+        }
+    }
+    let mut avgs = HashMap::new();
+    const B: &str = "player's own prior frequency over the line";
+    for (i, pl) in game.players.iter().enumerate() {
+        let past = hist.get(&pl.id).cloned().unwrap_or_default();
+        if past.len() < 3 { continue; }
+        let h = &e.player[i];
+        let avg = |k: usize| past.iter().map(|s| s[k]).sum::<f64>() / past.len() as f64;
+        let freq = |k: usize, line: f64| (past.iter().filter(|s| s[k] > line).count() as f64 + 1.0) / (past.len() as f64 + 2.0);
+        avgs.insert(pl.id.clone(), [avg(0), avg(1), avg(2), avg(3), avg(4)]);
+        let mut prop = |market: &'static str, stat: &'static str, k: usize, si: usize| {
+            let line = avg(k).floor() + 0.5;
+            out.push(Forecast::player(market, B, &pl.id, &pl.name, stat, line, h[si].line(line).0, freq(k, line)));
+        };
+        let is_qb = game.teams.iter().any(|t| t.off.qb == i || t.off.backup_qb.as_ref().map(|b| b.p == i).unwrap_or(false));
+        if is_qb {
+            prop("qb_pass_yds_over_avg", "pass_yds", 0, sim::PASS_YDS);
+        } else {
+            if avg(1) >= 20.0 { prop("rush_yds_over_avg", "rush_yds", 1, sim::RUSH_YDS); }
+            if avg(2) >= 15.0 {
+                prop("rec_yds_over_avg", "rec_yds", 2, sim::REC_YDS);
+                prop("receptions_over_avg", "receptions", 3, sim::REC);
+            }
+            let td_freq = (past.iter().filter(|s| s[4] > 0.0).count() as f64 + 1.0) / (past.len() as f64 + 2.0);
+            out.push(Forecast::player("anytime_td", "player's own prior TD-game frequency", &pl.id, &pl.name, "any_td", 0.5, e.anytime_td[i] as f64 / nn, td_freq));
+        }
+    }
+    Ok((out, avgs))
+}
+
+/// Outcomes from a completed game's play-by-play; players appear only if they recorded a stat.
+fn outcomes_from(hs: i32, as_: i32, plays: &[P]) -> Outcomes {
+    let mut o = Outcomes::default();
+    o.game.insert("home_margin", (hs - as_) as f64);
+    o.game.insert("total", (hs + as_) as f64);
+    for (id, a) in actual_stats(plays) {
+        let m = o.players.entry(id).or_default();
+        for (k, name) in ["pass_yds", "rush_yds", "rec_yds", "receptions", "any_td"].into_iter().enumerate() { m.insert(name, a[k]); }
+    }
+    o
+}
+
+/// None until the game is final and its play-by-play is ingested.
+pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Outcomes>, String> {
+    let g = game_ref(db, id).await?;
+    let (Some(hs), Some(as_)) = (g.home_score, g.away_score) else { return Ok(None) };
+    let plays = load_plays(db, "game_id = $1", &[&id]).await?;
+    if plays.iter().filter(|p| p.scrimmage()).count() < 40 { return Ok(None); }
+    Ok(Some(outcomes_from(hs, as_, &plays)))
+}
+
+/// Walk-forward evaluation of one completed game (inputs strictly before kickoff).
+pub async fn evaluate(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+    let db = &state.db;
+    let gref = game_ref(db, id).await?;
+    let Some(outcomes) = outcomes(db, id).await? else { return Ok(None) };
+    let mut o = opts_from(None, None).tuned(cfg);
+    o.lineup_mode = LineupMode::parse(Some(lineup));
+    let Built { game, .. } = build(db, &gref, &o).await?;
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, draws, seed)).await.map_err(|e| e.to_string())?;
+    let (forecasts, _) = forecasts_avg(db, &gref, &game, &e).await?;
+    let diag = vec![("total_points", e.total.mean(), outcomes.game["total"])];
+    Ok(Some(GameEval { forecasts, outcomes, diag }))
+}
+
+/// A production prediction (≥100k games) for the ledger.
+pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
+    let db = &state.db;
+    let gref = game_ref(db, id).await?;
+    let mut o = opts_from(None, None).tuned(cfg);
+    o.lineup_mode = LineupMode::parse(Some(lineup));
+    let Built { game, meta, .. } = build(db, &gref, &o).await?;
+    let draws = 200;
+    let t = Instant::now();
+    let g2 = game.clone();
+    let e = web::block(move || sim::simulate(&g2, n, draws, seed)).await.map_err(|e| e.to_string())?;
+    let (forecasts, _) = forecasts_avg(db, &gref, &game, &e).await?;
+    let payload = ensemble_json(&game, &e, &gref, &meta, seed, n, draws, t.elapsed().as_millis() as u64);
+    Ok(Prediction { payload, forecasts, date: gref.date, start: None, engine: MODEL_VERSION, n: e.n as usize })
 }

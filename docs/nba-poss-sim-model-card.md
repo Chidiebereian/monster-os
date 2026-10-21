@@ -1,6 +1,6 @@
-# NBA possession simulator model card — `nba-poss-sim-v1`
+# NBA possession simulator model card — `nba-poss-sim-v2`
 
-Status as of 2026-10-19. **Experimental, first version.** Every number was
+Status as of 2026-10-20. **Experimental.** Every number was
 produced by the code in this repository against real data.
 
 ## Data
@@ -38,7 +38,13 @@ After the shot or trip:
   league.
 * Pooling strengths are fitted per season by beta-binomial method of moments.
 * Pace is a team's recent possessions per 48, shrunk to the league; it sets
-  possession length.
+  possession length. Possessions are counted the standard way (an offensive
+  rebound continues the same one), so one drawn length covers a possession's
+  second chances.
+* Lengths are Gamma(4), capped at 3–24 s. Both the cap and each period's
+  cut-short last possession add possessions, so the Gamma scale is solved so
+  that the expected count equals pace (`dur_scale`; renewal-theory count with
+  the capped length's exact moments).
 
 **Rotation.**
 
@@ -68,30 +74,37 @@ documented priors, not fitted: Out 0, Doubtful 0.15, Questionable 0.5,
 Day-To-Day 0.6, Probable 0.9. ESPN's endpoint is current-only, so no history
 exists yet to fit from.
 
-## Walk-forward validation (2025-26, 149 games spread from December)
+## Walk-forward validation (full 2025-26 season, 1,031 games)
 
-Each game is simulated 2,000 times with 20 parameter draws, using 2024-25
-league parameters and data strictly before tip-off. Brier diff = model −
-baseline (negative is better).
+Each game is simulated 2,000 times with 20 parameter draws, using league
+parameters from earlier seasons and data strictly before tip-off. Brier
+diff = model − baseline (negative is better), ± one standard error of the
+paired difference.
 
 | Market | Projected lineup | Actual lineup (hindsight) | Baseline |
 |---|---|---|---|
-| Home win | +0.0334 ± 0.0091 | +0.0273 ± 0.0089 | closing spread |
-| Home cover | +0.0167 ± 0.0091 | +0.0119 ± 0.0085 | 0.5 at the line |
-| Total over | +0.0301 ± 0.0111 | +0.0344 ± 0.0113 | 0.5 at the line |
-| Points over own avg | −0.0052 ± 0.0038 | **−0.0398 ± 0.0035** | player's prior frequency |
-| Rebounds over own avg | +0.0108 ± 0.0039 | −0.0067 ± 0.0041 | player's prior frequency |
-| Assists over own avg | +0.0026 ± 0.0036 | **−0.0203 ± 0.0035** | player's prior frequency |
-| Threes over own avg | +0.0048 ± 0.0036 | **−0.0105 ± 0.0032** | player's prior frequency |
+| Home win | +0.0148 ± 0.0038 | +0.0129 ± 0.0038 | closing spread (normal, sd 12) |
+| Home cover | +0.0114 ± 0.0036 | +0.0108 ± 0.0035 | 0.5 at the line |
+| Total over | +0.0216 ± 0.0040 | +0.0204 ± 0.0040 | 0.5 at the line |
+| Points over own avg | +0.0003 ± 0.0014 | **−0.0285 ± 0.0013** | player's prior frequency |
+| Rebounds over own avg | +0.0115 ± 0.0015 | −0.0038 ± 0.0015 | player's prior frequency |
+| Assists over own avg | +0.0069 ± 0.0014 | **−0.0140 ± 0.0013** | player's prior frequency |
+| Threes over own avg | +0.0030 ± 0.0013 | **−0.0092 ± 0.0011** | player's prior frequency |
 
-Possessions per game: 204.4 simulated vs 203.9 actual. Total points bias is
-+1.2. Mean absolute error is 14.9, against 12.7 for the closing total.
+Possessions per game: 202.3 simulated vs 203.1 actual. Total points bias is
+−0.9. Mean absolute error is 15.6, against 13.9 for the closing total.
+
+**v1 → v2.** v1 shipped with a possession-count bias: 212.1 simulated vs
+203.1 actual possessions per game, and totals 10.2 points too high. The total-over
+Brier difference was +0.064. v2 calibrates possession length (above); the
+other markets barely moved. Test: `possessions_match_pace`, which fails on
+v1 (98.4 possessions per 48 at pace 92).
 
 **Reading it honestly:**
 
 * The market is clearly better on sides and totals.
 * With projected lineups, props are about even with each player's history;
-  rebounds are slightly worse.
+  rebounds and assists are slightly worse.
 * Knowing who actually plays and starts makes props clearly better, so the
   value is in confirmed lineups.
 
@@ -109,6 +122,6 @@ Possessions per game: 204.4 simulated vs 203.9 actual. Total points bias is
 
     POST /api/projection-service/ingest/nba/espn?from=2025-10-21&to=2026-06-25
     POST /api/projection-service/fit/nba/sim
-    GET  /api/projection-service/backtest/nba/sim?season=2026&games=150&n=2000&draws=20&lineup=projected
+    GET  /api/projection-service/backtest/nba/sim?season=2026&games=100000&n=2000&draws=20&lineup=projected
     GET  /api/projection-service/nba/simulate/401909088?n=100000&lineup=confirmed
     POST /api/projection-service/sim/sessions  {"sport":"nba","game_id":"401909088","lineup":"confirmed"}
