@@ -21,6 +21,8 @@ export interface PickFacts {
   q10?: number; q50?: number; q90?: number; p_active?: number; p_push?: number; books_quoting?: number; lineup_mode?: string;
   l10_avg?: number; l10_hits?: number; l10_games?: number; l20_avg?: number; l20_hits?: number; l20_games?: number;
   l5_minutes?: number; proj_minutes?: number; open_line?: number | null; evidence_text?: string;
+  /** engine's own probability before blending; naive baseline (props); blend weights (0 = anchor, 1 = raw model) */
+  p_raw?: number; p_naive?: number | null; w_market?: number; w_naive?: number | null; blend_source?: string; blend_text?: string;
   game_log?: { opp: string; value: number | null }[];
   home_form?: { games: number; w: number; l: number; pf: number; pa: number };
   away_form?: { games: number; w: number; l: number; pf: number; pa: number };
@@ -90,7 +92,7 @@ export const signedPct = (x: number | null | undefined, d = 1) => (x == null ? "
 export const num = (x: number | null | undefined, d = 1) => (x == null ? "—" : Number.isInteger(x) ? `${x}` : x.toFixed(d));
 
 export const TIER_TEXT: Record<Tier, string> = {
-  proven: "Proven vs real lines",
+  proven: "Blended model beat real closing lines",
   baseline: "Beat a naive model in backtests (capped B+)",
   unproven: "No track record yet (capped C+)",
   losing: "Lost to the comparison in backtests (capped C)",

@@ -8,6 +8,9 @@
 //!
 //!   edge  = P(model, side) - P(market, side, de-vigged at the same book)
 //!   EV    = P(win) x (decimal - 1) - P(loss)          (pushes return the stake)
+//!   P(model) = the engine's probability blended toward the player's own prior
+//!           frequency (props) and the de-vigged market with weights fitted on
+//!           backtests and on real closing lines (blend.rs)
 //!   grade = from the edge, then CAPPED by the engine's track record on that
 //!           market (pick_evidence): proven (beat real lines) uncapped,
 //!           baseline (beat a naive model in backtests) B+, unproven C+,
@@ -31,6 +34,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::types::Json;
 
+use crate::blend;
 use crate::lines;
 use crate::State;
 
@@ -198,6 +202,15 @@ pub(crate) fn tier(rows: &[Evidence]) -> (&'static str, Option<Evidence>) {
             }
         }
     }
+    // every line this service priced and saw settled, blended out of sample
+    if let Some(l) = find("lines", "market") {
+        if let (Some(m), Some(se)) = (l.metric, l.se) {
+            if l.n >= 150 && se > 0.0 {
+                if m < -2.0 * se { return ("proven", Some(l)); }
+                if m > 2.0 * se { return ("losing", Some(l)); }
+            }
+        }
+    }
     if let Some(b) = find("backtest", "market") {
         if b.better >= 2 && b.worse == 0 { return ("proven", Some(b)); }
         if b.worse >= 2 && b.worse > b.better { return ("losing", Some(b)); }
@@ -265,6 +278,7 @@ pub(crate) fn stat_label(market: &str) -> &'static str {
 }
 
 fn signed(x: f64) -> String { if x > 0.0 { format!("+{}", fmt_num(x)) } else { fmt_num(x) } }
+fn fmt2(x: f64) -> String { format!("{:.2}", x) }
 fn fmt_num(x: f64) -> String { if (x - x.round()).abs() < 1e-9 { format!("{}", x.round() as i64) } else { format!("{:.1}", x) } }
 fn odds_str(p: i32) -> String { if p > 0 { format!("+{p}") } else { p.to_string() } }
 
@@ -298,7 +312,7 @@ async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]
             let rows = db.query("SELECT player_id, pts, COALESCE(oreb,0)+COALESCE(dreb,0), ast, fg3m, stl, blk, tov, min, CASE WHEN b.team = g.home THEN g.away ELSE g.home END FROM ( \
                 SELECT b.*, row_number() OVER (PARTITION BY b.player_id ORDER BY g2.game_date DESC) rn FROM nba_box_espn b JOIN nba_games_espn g2 USING (espn_id) \
                 WHERE b.player_id = ANY($1) AND g2.completed AND g2.season_type IN (2,3) AND NOT b.dnp AND COALESCE(b.min,0) > 0 AND g2.game_date < (now() - interval '5 hours')::date) b \
-                JOIN nba_games_espn g USING (espn_id) WHERE rn <= 40 ORDER BY player_id, g.game_date DESC", &[&ids]).await.map_err(|e| dberr(&e))?;
+                JOIN nba_games_espn g USING (espn_id) WHERE rn <= 82 ORDER BY player_id, g.game_date DESC", &[&ids]).await.map_err(|e| dberr(&e))?;
             for r in &rows {
                 let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
                 let (pts, reb, ast) = (g(1), r.get::<_, i32>(2) as f64, g(3));
@@ -312,7 +326,7 @@ async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]
             let rows = db.query("SELECT player_id, sog, goals, assists, blocks, saves, CASE WHEN b.team = g.home THEN g.away ELSE g.home END FROM ( \
                 SELECT b.*, row_number() OVER (PARTITION BY b.player_id ORDER BY g2.game_date DESC) rn FROM nhl_box_api b JOIN nhl_games_api g2 USING (game_id) \
                 WHERE b.player_id = ANY($1) AND g2.completed AND COALESCE(b.toi_sec,0) > 0 AND g2.game_date < (now() - interval '5 hours')::date) b \
-                JOIN nhl_games_api g USING (game_id) WHERE rn <= 40 ORDER BY player_id, g.game_date DESC", &[&ids_n]).await.map_err(|e| dberr(&e))?;
+                JOIN nhl_games_api g USING (game_id) WHERE rn <= 82 ORDER BY player_id, g.game_date DESC", &[&ids_n]).await.map_err(|e| dberr(&e))?;
             for r in &rows {
                 let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
                 let m: HashMap<&'static str, f64> = [("sog", g(1)), ("goals", g(2)), ("assists", g(3)), ("points", g(2) + g(3)), ("blocks", g(4)), ("saves", g(5))].into();
@@ -324,7 +338,7 @@ async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]
                 .filter_map(|k| crate::player_backtest::stat_def("nfl", k).map(|d| (*k, d.column))).collect();
             let rows = db.query("SELECT player_id, stats, COALESCE(opponent,'') FROM ( \
                 SELECT *, row_number() OVER (PARTITION BY player_id ORDER BY season DESC, game_date DESC NULLS LAST, week DESC) rn FROM player_game_logs \
-                WHERE sport='nfl' AND player_id = ANY($1) AND (game_date IS NULL OR game_date < (now() - interval '5 hours')::date)) x WHERE rn <= 20 \
+                WHERE sport='nfl' AND player_id = ANY($1) AND (game_date IS NULL OR game_date < (now() - interval '5 hours')::date)) x WHERE rn <= 34 \
                 ORDER BY player_id, rn", &[&ids]).await.map_err(|e| dberr(&e))?;
             for r in &rows {
                 let st: Json<Value> = r.get(1);
@@ -419,6 +433,12 @@ pub(crate) fn template(f: &Value) -> String {
         let parts: Vec<String> = [form(&home, "home_form"), form(&away, "away_form")].into_iter().flatten().collect();
         if !parts.is_empty() { out.push(format!("{}.", parts.join("; "))); }
     }
+    if let (Some(raw), Some(pm)) = (n("p_raw"), n("p_model")) {
+        if (pct(raw) - pct(pm)).abs() >= 0.1 {
+            out.push(format!("Those probabilities are blended: on its own the {} says {}%, and weighted against the market (trust weight {}, {}) that becomes {}%.",
+                s("engine_label"), pct(raw), fmt2(n("w_market").unwrap_or(0.0)), s("blend_text"), pct(pm)));
+        }
+    }
     if let (Some(ol), Some(l)) = (n("open_line"), n("line")) {
         if (ol - l).abs() > 1e-9 { out.push(format!("The line has moved from {} at open to {}.", fmt_num(ol), fmt_num(l))); }
     }
@@ -509,6 +529,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let min_edge = lines::setting(db, "min_edge", 0.015).await;
     // edges this large against real markets are almost always a data or model error
     let max_edge = lines::setting(db, "max_edge", 0.25).await;
+    // market weight used until one is fitted (blend.rs)
+    let default_w = lines::setting(db, "blend_default_w", 0.2).await;
     let champs = champions(db).await?;
     let ev = evidence(db, &champs).await?;
     // latest quote per book x selection (any provider; the freshest wins)
@@ -540,6 +562,15 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         if let Some((v, _)) = champs.get(e) { ledgers.insert(e, latest_ledger(db, e, v, &games).await?); }
     }
     let tier_of = |engine: &str, market: &str| prop_tier(&ev, engine, market);
+    let weights_of = |engine: &str, market: &str| blend::weights(ev.get(&(engine.to_string(), market.to_string())).map(|v| v.as_slice()).unwrap_or(&[]), default_w);
+    // every prop player's history: the naive baseline (own prior frequency over the line) and the facts
+    let pids: Vec<String> = quotes.keys().filter(|((_, _, s), _)| s != "game").map(|((_, _, s), _)| s.clone()).collect::<HashSet<_>>().into_iter().collect();
+    let hist = player_history(db, sport, &pids).await?;
+    let naive_over = |subject: &str, stat: &str, line: Option<f64>| -> Option<f64> {
+        let vals: Vec<f64> = hist.get(subject)?.iter().filter_map(|(m, _)| m.get(stat).copied()).collect();
+        if vals.len() < 5 { return None; }
+        Some(blend::freq_over(&vals, line?))
+    };
     // ESPN prop orientation check: the model and the market should agree on which side is favoured most of the time
     let (mut agree, mut checked) = (0, 0);
     for (((g, m, subj), side), qs) in &quotes {
@@ -553,7 +584,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let orientation_ok = checked < 30 || agree * 10 >= checked * 5;
 
     // candidate per selection-side: the book whose quote gives the best EV
-    struct Cand { key: Key, side: String, engine: String, ledger_id: i64, version: String, lineup: String, q: Quote, priced: Priced, p_market: f64, edge: f64, ev: f64, books: usize, tier: &'static str, evd: Option<Evidence> }
+    struct Cand { key: Key, side: String, engine: String, ledger_id: i64, version: String, lineup: String, q: Quote, priced: Priced, p_raw: f64, p_naive: Option<f64>,
+        w: blend::Weights, p_market: f64, edge: f64, ev: f64, books: usize, tier: &'static str, evd: Option<Evidence> }
     let mut cands: Vec<Cand> = Vec::new();
     let mut considered = 0;
     let mut by_selection: HashMap<Key, Vec<usize>> = HashMap::new();
@@ -568,36 +600,43 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         for e in engines {
             let Some(l) = ledgers.get(e).and_then(|m| m.get(&key.0)) else { continue };
             let team = e.ends_with("_team");
-            let mut best: Option<(Quote, Priced, f64)> = None;
+            let w = weights_of(e, &key.1);
+            // each quote: the engine's raw probability, blended toward the naive
+            // baseline (props) and the consensus at that line; the best EV wins
+            let mut best: Option<(Quote, Priced, f64, f64, Option<f64>, f64, usize)> = None;
             for q in qs {
-                let Some(p) = price(&l.payload, team, &key.1, &key.2, side, q.a_line) else { continue };
+                let Some(raw) = price(&l.payload, team, &key.1, &key.2, side, q.a_line) else { continue };
+                let same: Vec<f64> = qs.iter().filter(|x| x.a_line == q.a_line).map(|x| novig(x.a_price, x.b_price)).collect();
+                let p_market = same.iter().sum::<f64>() / same.len().max(1) as f64;
+                let p_naive = if kind_prop { naive_over(&key.2, &key.1, q.a_line).map(|o| if side == "over" { o } else { 1.0 - o }) } else { None };
+                let pb = blend::apply(&w, raw.p(), p_naive, p_market);
+                let mut p = raw.clone();
+                let decided = 1.0 - raw.push;
+                p.win = pb * decided;
+                p.loss = (1.0 - pb) * decided;
                 let evv = p.win * (decimal(q.a_price) - 1.0) - p.loss;
-                if best.as_ref().map(|b| evv > b.2).unwrap_or(true) { best = Some((q.clone(), p, evv)); }
+                if best.as_ref().map(|b| evv > b.2).unwrap_or(true) { best = Some((q.clone(), p, evv, raw.p(), p_naive, p_market, same.len())); }
             }
-            let Some((q, p, evv)) = best else { continue };
+            let Some((q, p, evv, p_raw, p_naive, p_market, books)) = best else { continue };
             considered += 1;
-            // consensus de-vigged probability across books quoting the same line
-            let same: Vec<f64> = qs.iter().filter(|x| x.a_line == q.a_line).map(|x| novig(x.a_price, x.b_price)).collect();
-            let p_market = same.iter().sum::<f64>() / same.len().max(1) as f64;
             let pm = p.p();
             let (t, evd) = tier_of(e, &key.1);
-            if !(0.03..=0.97).contains(&pm) || !(0.12..=0.88).contains(&p_market) { break; }
+            if !(0.03..=0.97).contains(&p_raw) || !(0.12..=0.88).contains(&p_market) { break; }
             if kind_prop && p.p_active.map(|a| a < 0.5).unwrap_or(false) { break; }
             let c = Cand { key: key.clone(), side: side.clone(), engine: e.to_string(), ledger_id: l.id, version: l.version.clone(), lineup: l.lineup.clone(),
-                q, priced: p, p_market, edge: pm - p_market, ev: evv, books: same.len(), tier: t, evd };
+                q, priced: p, p_raw, p_naive, w, p_market, edge: pm - p_market, ev: evv, books, tier: t, evd };
             by_selection.entry(key.clone()).or_default().push(cands.len());
             cands.push(c);
             break; // the best-evidenced engine that can price it decides
         }
     }
     // existing picks (for latest_* updates)
-    let qualifies = |c: &Cand| c.edge >= min_edge && c.ev > 0.0 && c.edge <= max_edge;
-    let implausible = cands.iter().filter(|c| c.edge > max_edge && c.ev > 0.0).count();
+    // the implausibility guard looks at the RAW model: a blend can shrink a broken forecast into a plausible-looking edge
+    let qualifies = |c: &Cand| c.edge >= min_edge && c.ev > 0.0 && (c.p_raw - c.p_market) <= max_edge;
+    let implausible = cands.iter().filter(|c| c.p_raw - c.p_market > max_edge && c.ev > 0.0).count();
     let mut keep: Vec<&Cand> = cands.iter().filter(|c| qualifies(c)).collect();
 
-    // facts inputs
-    let pids: Vec<String> = keep.iter().filter(|c| c.key.2 != "game").map(|c| c.key.2.clone()).collect::<HashSet<_>>().into_iter().collect();
-    let hist = player_history(db, sport, &pids).await?;
+    let recorded = record_lines(db, sport, &quotes, &ledgers, &champs, &starts, &naive_over).await?;
     // NBA: the simulated role must look like the player's real one. A player the
     // rotation gives a fraction of his recent minutes (or far more) is a lineup
     // problem upstream, not an edge.
@@ -657,6 +696,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         for (k, v) in [("kind", json!(kind)), ("market", json!(c.key.1)), ("side", json!(c.side)), ("line", json!(c.q.a_line)), ("price", json!(c.q.a_price)),
             ("book", json!(c.q.book)), ("book_title", json!(book_title(&c.q.book))), ("books_quoting", json!(c.books)),
             ("p_model", json!(r3(pm))), ("p_market", json!(r3(c.p_market))), ("edge", json!(r3(c.edge))), ("ev", json!(r3(c.ev))),
+            ("p_raw", json!(r3(c.p_raw))), ("p_naive", json!(c.p_naive.map(r3))), ("w_market", json!(r3(c.w.w_market))), ("w_naive", json!(c.w.w_naive.map(r3))),
+            ("blend_source", json!(c.w.market_source)), ("blend_text", json!(blend::source_text(&c.w))),
             ("p_push", json!(r3(c.priced.push))), ("projection", json!(c.priced.projection.map(|x| r1(x)))),
             ("engine", json!(c.engine)), ("engine_label", json!(engine_label(&c.engine))), ("model_version", json!(c.version)), ("lineup_mode", json!(c.lineup)),
             ("tier", json!(c.tier)), ("evidence_text", json!(evidence_sentence(c.tier, &c.evd, &c.key.1))), ("open_line", json!(c.q.open_line)),
@@ -698,6 +739,9 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             }
         }
         if c.edge > 0.15 { flags.push(json!({ "code": "edge_unusually_large", "text": "the market rarely misprices by this much; check injuries and late news" })); }
+        if c.w.market_source == "default" || c.w.market_source == "lines_partial" {
+            flags.push(json!({ "code": "blend_unfitted", "text": format!("how far to trust the model over the market is {}", blend::source_text(&c.w)) }));
+        }
         if c.lineup == "projected" { flags.push(json!({ "code": "projected_lineup", "text": "priced on projected lineups; confirmed lineups re-price closer to the start" })); }
         if c.books <= 1 { flags.push(json!({ "code": "single_book", "text": "only one book quotes this line" })); }
         if (Utc::now() - c.q.observed).num_minutes() > 90 { flags.push(json!({ "code": "stale_price", "text": format!("price last seen {} minutes ago", (Utc::now() - c.q.observed).num_minutes()) })); }
@@ -731,9 +775,40 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     }
     let _ = by_selection;
     let rewritten = rewrite_writeups(state, sport).await;
-    Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "qualifying": keep.len(), "published": published, "updated": updated,
+    Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "lines_recorded": recorded, "qualifying": keep.len(), "published": published, "updated": updated,
         "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch }, "llm_rewritten": rewritten,
         "orientation_check": { "checked": checked, "agree": agree, "ok": orientation_ok } }))
+}
+
+/// Record every selection both champion engines can price at its main line (the
+/// line most books quote), oriented over / home, for blend fitting (blend.rs).
+async fn record_lines(db: &tokio_postgres::Client, sport: &str, quotes: &HashMap<((String, String, String), String), Vec<Quote>>,
+    ledgers: &HashMap<&str, HashMap<String, Ledger>>, champs: &HashMap<String, (String, String)>, starts_at: &HashMap<String, DateTime<Utc>>,
+    naive_over: &dyn Fn(&str, &str, Option<f64>) -> Option<f64>) -> Result<u64, String> {
+    let mut n = 0;
+    for (((game, market, subject), side), qs) in quotes {
+        let kind_prop = subject != "game";
+        if side != if matches!(market.as_str(), "moneyline" | "spread") { "home" } else { "over" } { continue; }
+        // main line
+        let mut count: Vec<(Option<f64>, usize)> = Vec::new();
+        for q in qs { match count.iter_mut().find(|(l, _)| *l == q.a_line) { Some(x) => x.1 += 1, None => count.push((q.a_line, 1)) } }
+        count.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)));
+        let Some((line, books)) = count.first().copied() else { continue };
+        let same: Vec<f64> = qs.iter().filter(|x| x.a_line == line).map(|x| novig(x.a_price, x.b_price)).collect();
+        let p_market = same.iter().sum::<f64>() / same.len().max(1) as f64;
+        let starts = starts_at.get(game).copied();
+        for (engine, by_game) in ledgers {
+            let Some(l) = by_game.get(game) else { continue };
+            if kind_prop && engine.ends_with("_team") { continue; }
+            let Some(p) = price(&l.payload, engine.ends_with("_team"), market, subject, side, line) else { continue };
+            if kind_prop && p.p_active.map(|a| a < 0.5).unwrap_or(false) { continue; }
+            let code = champs.get(*engine).map(|c| c.1.as_str()).unwrap_or("");
+            let p_naive = if kind_prop { naive_over(subject, market, line) } else { None };
+            n += blend::record(db, &blend::LineEval { engine, engine_version: code, sport, game_id: game, market, subject, line: line.unwrap_or(0.0),
+                starts_at: starts, ledger_id: l.id, p_model: p.p(), p_naive, p_market, books: books as i32 }).await?;
+        }
+    }
+    Ok(n)
 }
 
 /// MonsterGPT rewrites of open picks still on the template (best grades first),
@@ -766,7 +841,7 @@ pub(crate) fn book_title(b: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Final player stats for settling props; None until the game is final.
-async fn prop_actuals(db: &tokio_postgres::Client, sport: &str, game: &str) -> Result<Option<HashMap<String, HashMap<&'static str, f64>>>, String> {
+pub(crate) async fn prop_actuals(db: &tokio_postgres::Client, sport: &str, game: &str) -> Result<Option<HashMap<String, HashMap<&'static str, f64>>>, String> {
     let mut out: HashMap<String, HashMap<&'static str, f64>> = HashMap::new();
     match sport {
         "nba" => {
@@ -850,7 +925,9 @@ pub(crate) async fn settle(state: &State, sport: &str) -> Result<Value, String> 
         }
     }
     let ev = refresh_evidence(db, sport).await?;
-    Ok(json!({ "sport": sport, "settled": settled, "games_pending": pending, "evidence_rows": ev }))
+    let lines_settled = blend::settle(db, sport).await?;
+    let lines_ev = blend::refresh_evidence(db, sport).await?;
+    Ok(json!({ "sport": sport, "settled": settled, "games_pending": pending, "evidence_rows": ev, "lines_settled": lines_settled, "lines_evidence_rows": lines_ev }))
 }
 
 /// Live evidence per (engine, market) from settled picks: did the model's

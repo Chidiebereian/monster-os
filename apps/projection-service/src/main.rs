@@ -36,6 +36,7 @@ mod team_engine;
 mod lines;
 mod picks;
 mod evidence;
+mod blend;
 mod market;
 mod team_model;
 mod player_backtest;

@@ -1,6 +1,6 @@
-# NBA possession simulator model card — `nba-poss-sim-v2`
+# NBA possession simulator model card — `nba-poss-sim-v4`
 
-Status as of 2026-10-20. **Experimental.** Every number was
+Status as of 2026-10-21. **Experimental.** Every number was
 produced by the code in this repository against real data.
 
 ## Data
@@ -50,7 +50,13 @@ After the shot or trip:
 
 * Each player's minutes are drawn from his last 10 regular-season or playoff
   games.
-* Minutes are allocated in priority order to 240.
+* **Minutes budget (v4).** When the active players' projections add up to more
+  than 240, the projected starters keep 85% protection (`starter_protect`).
+  Players outside the top 12 (`rotation_depth`) share 12 garbage-time minutes
+  (`deep_bench_minutes`). The rest of the rotation is scaled to the minutes
+  that remain. After a preseason game, the projected starters are the five who
+  started most of the team's recent games.
+* Minutes are then allocated in priority order to 240.
 * A greedy 2-minute stint schedule decides who is on the floor. Starters open
   the 1st and 3rd quarters.
 * Overtime goes to the heaviest-minute players.
@@ -107,6 +113,36 @@ v1 (98.4 possessions per 48 at pace 92).
   rebounds and assists are slightly worse.
 * Knowing who actually plays and starts makes props clearly better, so the
   value is in confirmed lineups.
+
+## v2 → v4: the minutes budget
+
+v2 handed the 240 minutes out heaviest projection first. In opening week every
+preseason participant counts as active, so projections added up to about 420
+minutes. The ninth player got almost nothing: a starting center (Poeltl, 19.5
+projected) was simulated at 2 minutes. AI Picks then priced his unders as
+locks.
+
+The fix was measured with a per-player minutes diagnostic added to
+`GET /backtest/nba/sim`:
+
+* minutes MAE, over players who played or were expected to;
+* rotation misses: played 15+ minutes but projected under 8;
+* starter bias: projected-starter simulated minus actual minutes.
+
+Each window is 56–60 games, 1,000 simulations, projected lineups:
+
+| Window | MAE v2 → v4 | Misses per game v2 → v4 | Starter bias v2 → v4 |
+|---|---|---|---|
+| Opening week 2025-26 | 10.38 → 9.32 | 3.07 → 2.26 | −1.78 → −0.28 |
+| Opening week 2024-25 | 8.89 → 7.88 | 2.57 → 2.20 | −0.46 → +0.61 |
+| Mid-January 2026 | 7.69 → 7.36 | 1.77 → 0.98 | −0.99 → −0.33 |
+| Early March 2025 | 8.54 → 8.13 | 1.75 → 0.93 | −2.28 → −1.50 |
+
+Scaling the whole rotation, starters included, was tried first. It fixed the
+misses but under-projected starters by 3–5 minutes, and starters are the
+subjects of most props. `nba-poss-sim-v3` was that interim build; it froze one
+evening of forecasts (2026-10-21) before v4 replaced it. The four settings are
+tunable, so the autopilot's tuner can move them.
 
 ## Limitations
 

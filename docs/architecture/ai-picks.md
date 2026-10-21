@@ -3,8 +3,10 @@
 Model-backed plays on player props and game lines, each with a probability, an
 edge, a projection, risk flags and a written thesis. Code:
 `apps/projection-service/src/lines.rs` (market lines), `picks.rs` (pricing,
-grading, writeups, settlement); page: `apps/dashboard/src/pages/AiPicks.tsx`
-(`/picks`). Tables: migration `0018_ai_picks.sql`; seed evidence `0019`.
+grading, writeups, settlement), `blend.rs` (market-anchored blending),
+`evidence.rs` (backtest evidence); page: `apps/dashboard/src/pages/AiPicks.tsx`
+(`/picks`). Tables: migration `0018_ai_picks.sql`; seed evidence `0019`;
+recorded lines `0020_pick_blend.sql`.
 
 ## Pipeline (every 20 minutes per sport, inside the learning autopilot)
 
@@ -33,15 +35,36 @@ grading, writeups, settlement); page: `apps/dashboard/src/pages/AiPicks.tsx`
    are conditional on playing (books void them otherwise); a player active in
    under 50% of simulations is skipped.
 
+   **Blend.** The engine's raw probability is not used as is. It is moved
+   toward anchors that are hard to beat, on the log-odds scale:
+   `blend(p, anchor, w) = σ(logit(anchor) + w·(logit(p) − logit(anchor)))`.
+   `w = 0` gives the anchor and `w = 1` the raw model.
+
+   - Props first move toward the player's own prior frequency over the line,
+     with `w_naive` fitted in backtests.
+   - Every pick then moves toward the de-vigged market consensus, with
+     `w_market`. That weight is fitted on real closing lines:
+     - from the backtests (NBA and NFL closing spreads and totals);
+     - and, once 300 have settled, from every line this service has priced
+       (`pick_line_evals`). That covers props and NHL game lines too.
+   - Until a weight is fitted, `blend_default_w` (0.2) applies and the card
+     carries a risk flag. Fewer than 300 recorded lines move the weight only
+     partway from the default toward their fit.
+
+   The market weights fitted so far are near zero: the NBA team model 0.00–0.10
+   and the NFL team model 0.00. The closing line already contains what those
+   engines know, so their edges disappear. That is the intended outcome.
+
    For each selection the book with the best expected value is chosen.
    `p_market` is the de-vigged consensus of the books quoting that same line;
-   `edge = P(model) − p_market` (both excluding pushes);
+   `edge = P(blended) − p_market` (both excluding pushes);
    `EV = P(win)·(decimal − 1) − P(loss)`. A pick is published when
    `edge ≥ min_edge` (default 1.5%) and `EV > 0`, the model probability is in
    [3%, 97%] and the market's in [12%, 88%].
 
-   Guards (counted in the build report as `suppressed`): an edge above
-   `max_edge` (default 25%) is not published — against real markets it is
+   Guards (counted in the build report as `suppressed`): a RAW edge above
+   `max_edge` (default 25%) is not published (the blend could shrink a broken
+   forecast into a plausible-looking edge, so the guard looks before it) — against real markets it is
    almost always a data or model error; and an NBA prop is skipped when the
    simulator plays the player under 60% (or over 150% + 6) of his average
    minutes over his last five regular-season or playoff games, which is a lineup
@@ -55,18 +78,21 @@ grading, writeups, settlement); page: `apps/dashboard/src/pages/AiPicks.tsx`
 
    | Tier | Evidence | Cap | Feed |
    |---|---|---|---|
-   | proven | ≥150 settled picks beating the de-vigged market by > 2 SE (paired Brier), or backtests beating real lines in ≥2 seasons and never worse | none | shown |
+   | proven | the blended model beats the de-vigged market by > 2 SE (paired Brier) over ≥150 settled picks, or over ≥150 recorded real lines (out of sample by 5 game folds), or in backtests against closing lines in ≥2 seasons (weight fitted on the other seasons) and never worse | none | shown |
    | baseline | backtests beat a naive model (player's own rate, league rate) in ≥2 seasons, never worse; not yet tested on real lines | B+ | shown |
    | unproven | no evidence | C+ | hidden by default |
    | losing | worse than the comparison in ≥2 seasons (or live by > 2 SE) | C | hidden by default |
 
-   Live evidence takes precedence once it is significant, so grades unlock (or
+   Precedence: published picks (live), then recorded lines, then backtests
+   against closing lines, then backtests against the naive model. Live evidence
+   takes precedence once it is significant, so grades unlock (or
    lock) from results with no code change. A prop market with no evidence of
    its own inherits "losing" from the same engine's measured props (PRA is the
    sum of points, rebounds and assists).
 
    Backtest evidence regenerates itself (`evidence.rs`): when a champion's
-   engine code version has no backtest rows, the autopilot's slow loop re-runs
+   engine code version has no backtest rows for the current blending method
+   (`blend-v1`), or they are older than 30 days, the autopilot's slow loop re-runs
    full-season walk-forward backtests over the last five seasons through the
    learning loop's `evaluate` and rewrites `pick_evidence`. So an engine upgrade
    (e.g. `nhl-event-sim-v2`) starts "unproven" and re-earns its caps on its own.
@@ -89,7 +115,14 @@ grading, writeups, settlement); page: `apps/dashboard/src/pages/AiPicks.tsx`
    minutes, push chance > 5%, line moved against the side since open, fewer than
    8 recent games.
 
-5. **Settle** (`picks::settle`, every tick). At the start a pick becomes
+5. **Record lines.** Each build records every selection a champion engine can
+   price, at the line most books quote. The record holds the raw engine
+   probability, the naive baseline and the consensus, and is updated until the
+   start, so the last value is the close. After the game, `blend::settle`
+   scores it, and `blend::refresh_evidence` refits `w_market` and writes the
+   `lines` evidence rows. This runs on every settle, with no manual step.
+
+6. **Settle** (`picks::settle`, every tick). At the start a pick becomes
    `started`; when final it is settled from the box score (props) or final score
    (game lines) at the **published** price: 1 unit, win = decimal − 1,
    push/void = 0. Props of players who did not play are void. CLV = de-vigged
@@ -116,7 +149,7 @@ GET  /picks/meta?sport=           filter options, line freshness, provider usage
 ```
 
 Settings live in `learning_settings` under key `picks`:
-`{"min_edge": 0.015, "max_edge": 0.25, "oddsapi_daily_credits": 9, "sgo_daily_entities": 60, "llm_per_cycle": 12}`.
+`{"min_edge": 0.015, "max_edge": 0.25, "oddsapi_daily_credits": 9, "sgo_daily_entities": 60, "llm_per_cycle": 12, "blend_default_w": 0.2}`.
 `SPORTSGAMEODDS_API_KEY` may list several comma-separated keys; a key that is
 rate limited (429) falls through to the next. SportsGameOdds requests are limited
 to the 40-hour window (`startsAfter`/`startsBefore`, `limit` = games + 5), since

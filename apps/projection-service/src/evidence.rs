@@ -10,8 +10,11 @@
 //! each game) on every completed regular-season game of the last five seasons,
 //! scoring each forecast against the baseline it carries: real lines (closing
 //! spread / total) for 'market' rows, a naive model (player's own prior rate,
-//! league rate) for 'baseline' rows. A season counts as better / worse when the
-//! paired Brier difference is beyond 2 standard errors.
+//! league rate) for 'baseline' rows. The engine's probability is blended toward
+//! that comparison (blend.rs) with a weight fitted on the other seasons, and a
+//! season counts as better / worse when the paired Brier difference is beyond 2
+//! standard errors. Evidence is re-run every 30 days, and whenever the engine's
+//! code or the blending method changes.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +23,7 @@ use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::blend;
 use crate::learning::{self, base};
 use crate::State;
 
@@ -32,6 +36,8 @@ pub const PICK_ENGINES: [&str; 6] = ["nba", "nhl", "nfl", "nba_team", "nhl_team"
 const SIMS: usize = 2_000;
 const DRAWS: usize = 20;
 const MIN_GAMES: usize = 100;
+/// Backtest evidence is re-run this often even without a code change.
+const REFRESH_DAYS: i32 = 30;
 
 /// Forecast market -> (pick market, comparison).
 pub(crate) fn pick_market(engine: &str, market: &str) -> Option<(&'static str, &'static str)> {
@@ -69,13 +75,12 @@ fn seasons(engine: &str, today: NaiveDate) -> Vec<i32> {
     }
 }
 
-#[derive(Default)]
-struct Acc { seasons: Vec<i32>, n: usize, better: i32, worse: i32, sum: f64, var_n2: f64, baseline: String }
+/// (pick market, comparison) -> (baseline description, [(season, p_model, p_base, y)]).
+type Obs = BTreeMap<(&'static str, &'static str), (String, Vec<(i32, f64, f64, f64)>)>;
 
-/// Paired Brier differences (model - baseline) per pick market for one season's games.
-async fn season_diffs(state: &State, engine: &str, season: i32, cfg: &Value) -> Result<(usize, BTreeMap<(&'static str, &'static str), (Vec<f64>, String)>), String> {
+/// One season's forecasts and outcomes per pick market.
+async fn season_obs(state: &State, engine: &str, season: i32, cfg: &Value, out: &mut Obs) -> Result<usize, String> {
     let games = learning::season_games(state, engine, season).await?;
-    let mut out: BTreeMap<(&'static str, &'static str), (Vec<f64>, String)> = BTreeMap::new();
     let mut used = 0;
     for id in &games {
         let seed = learning::fnv(&[engine, id, "evidence"]);
@@ -87,62 +92,83 @@ async fn season_diffs(state: &State, engine: &str, season: i32, cfg: &Value) -> 
             let Some((pm, cmp)) = pick_market(engine, f.market) else { continue };
             if pm == "moneyline" && cmp == "market" && !has_line { continue; }
             let Some(y) = ge.outcomes.y(f) else { continue };
-            let e = out.entry((pm, cmp)).or_insert_with(|| (Vec::new(), f.baseline.to_string()));
-            e.0.push((f.p_model - y).powi(2) - (f.p_base - y).powi(2));
+            out.entry((pm, cmp)).or_insert_with(|| (f.baseline.to_string(), Vec::new())).1.push((season, f.p_model, f.p_base, y));
         }
     }
-    Ok((used, out))
+    Ok(used)
 }
 
+/// Full-season walk-forward backtests of the champion over the last five
+/// seasons. Each pick market's rows record how the engine's probability, blended
+/// toward the comparison (blend.rs) with a weight fitted on the OTHER seasons,
+/// did against the comparison alone: real closing lines ('market') or the naive
+/// model ('baseline'). The weight fitted on all seasons is the one picks use.
 pub(crate) async fn run(state: &State, engine: &str) -> Result<Value, String> {
     let db = &state.db;
     let (version, cfg) = learning::champion(db, engine).await?;
     let code = learning::engine_of(engine);
     let started = Utc::now();
-    let mut acc: BTreeMap<(&'static str, &'static str), Acc> = BTreeMap::new();
+    let mut obs: Obs = BTreeMap::new();
     let mut per_season = Vec::new();
     for season in seasons(engine, (Utc::now() - chrono::Duration::hours(5)).date_naive()) {
-        let (used, diffs) = season_diffs(state, engine, season, &cfg).await?;
+        let mut one: Obs = BTreeMap::new();
+        let used = season_obs(state, engine, season, &cfg, &mut one).await?;
         if used < MIN_GAMES { per_season.push(json!({ "season": season, "games": used, "skipped": "too few completed games" })); continue; }
-        let mut s = serde_json::Map::new();
-        for ((pm, cmp), (d, baseline)) in diffs {
-            let n = d.len();
-            if n < 30 { continue; }
-            let mean = d.iter().sum::<f64>() / n as f64;
-            let se = (d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0) / n as f64).sqrt();
-            let a = acc.entry((pm, cmp)).or_default();
-            a.seasons.push(season); a.n += n; a.sum += mean * n as f64; a.var_n2 += (se * n as f64).powi(2); a.baseline = baseline;
-            if mean < -2.0 * se { a.better += 1; }
-            if mean > 2.0 * se { a.worse += 1; }
-            s.insert(format!("{pm}:{cmp}"), json!({ "n": n, "brier_diff": (mean * 1e4).round() / 1e4, "se": (se * 1e4).round() / 1e4 }));
-        }
-        per_season.push(json!({ "season": season, "games": used, "markets": s }));
+        per_season.push(json!({ "season": season, "games": used }));
+        for (k, (b, v)) in one { obs.entry(k).or_insert_with(|| (b, Vec::new())).1.extend(v); }
     }
     let mut rows = 0;
-    for ((pm, cmp), a) in &acc {
-        let metric = a.sum / a.n as f64;
-        let se = a.var_n2.sqrt() / a.n as f64;
-        let detail = json!({ "engine_version": code, "registry_version": version, "seasons": a.seasons, "baseline": a.baseline,
-            "source_note": format!("automatic full-season walk-forward backtests, {SIMS} sims per game, run {}", started.format("%Y-%m-%d")) });
+    let mut summary = serde_json::Map::new();
+    for ((pm, cmp), (baseline, v)) in &obs {
+        // seasons with too few forecasts of this market are left out
+        let mut per: BTreeMap<i32, usize> = BTreeMap::new();
+        for x in v { *per.entry(x.0).or_default() += 1; }
+        let v: Vec<(i32, f64, f64, f64)> = v.iter().filter(|x| per[&x.0] >= 30).copied().collect();
+        let oos = blend::out_of_sample(&v);
+        if oos.is_empty() { continue; }
+        let (mut better, mut worse) = (0, 0);
+        let mut seasons_used = Vec::new();
+        let mut seasons_json = Vec::new();
+        for (season, (d, w)) in &oos {
+            let (m, se) = blend::mean_se(d);
+            if m < -2.0 * se { better += 1; }
+            if m > 2.0 * se { worse += 1; }
+            seasons_used.push(*season);
+            let raw: Vec<f64> = v.iter().filter(|x| x.0 == *season).map(|(_, p, b, y)| (p - y).powi(2) - (b - y).powi(2)).collect();
+            let (rm, _) = blend::mean_se(&raw);
+            seasons_json.push(json!({ "season": season, "n": d.len(), "w": w, "brier_diff": (m * 1e4).round() / 1e4, "se": (se * 1e4).round() / 1e4, "raw_brier_diff": (rm * 1e4).round() / 1e4 }));
+        }
+        let all: Vec<f64> = oos.values().flat_map(|(d, _)| d.iter().copied()).collect();
+        let (metric, se) = blend::mean_se(&all);
+        let raw: Vec<f64> = v.iter().map(|(_, p, b, y)| (p - y).powi(2) - (b - y).powi(2)).collect();
+        let (raw_metric, raw_se) = blend::mean_se(&raw);
+        let w = blend::fit_w(&v.iter().map(|(_, p, b, y)| (*p, *b, *y)).collect::<Vec<_>>());
+        let detail = json!({ "engine_version": code, "registry_version": version, "method": blend::METHOD, "w": w, "seasons": seasons_used, "baseline": baseline,
+            "per_season": seasons_json, "raw_model_metric": raw_metric, "raw_model_se": raw_se,
+            "source_note": format!("automatic full-season walk-forward backtests, {SIMS} sims per game; model blended toward the {} with a weight fitted on the other seasons, run {}",
+                if *cmp == "market" { "closing line" } else { "naive baseline" }, started.format("%Y-%m-%d")) });
+        summary.insert(format!("{pm}:{cmp}"), json!({ "w": w, "better": better, "worse": worse, "metric": (metric * 1e4).round() / 1e4, "raw_metric": (raw_metric * 1e4).round() / 1e4 }));
         rows += db.execute("INSERT INTO pick_evidence (engine, market, source, comparison, n, seasons, better, worse, metric, se, detail, updated_at) \
             VALUES ($1,$2,'backtest',$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT (engine, market, source, comparison) DO UPDATE SET n=EXCLUDED.n, seasons=EXCLUDED.seasons, \
             better=EXCLUDED.better, worse=EXCLUDED.worse, metric=EXCLUDED.metric, se=EXCLUDED.se, detail=EXCLUDED.detail, updated_at=now()",
-            &[&engine, pm, cmp, &(a.n as i32), &(a.seasons.len() as i32), &a.better, &a.worse, &metric, &se, &detail]).await.map_err(|e| dberr(&e))?;
+            &[&engine, pm, cmp, &(v.len() as i32), &(seasons_used.len() as i32), &better, &worse, &metric, &se, &detail]).await.map_err(|e| dberr(&e))?;
     }
     // an engine with no testable market still gets a marker row, so it is not re-run every cycle
-    if acc.is_empty() {
-        let detail = json!({ "engine_version": code, "registry_version": version, "seasons": [], "note": "no testable markets" });
+    if rows == 0 {
+        let detail = json!({ "engine_version": code, "registry_version": version, "method": blend::METHOD, "seasons": [], "note": "no testable markets" });
         db.execute("INSERT INTO pick_evidence (engine, market, source, comparison, n, detail) VALUES ($1,'_none','backtest','baseline',0,$2) \
             ON CONFLICT (engine, market, source, comparison) DO UPDATE SET detail=EXCLUDED.detail, updated_at=now()", &[&engine, &detail]).await.map_err(|e| dberr(&e))?;
     }
-    Ok(json!({ "engine": engine, "engine_version": code, "rows": rows, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
+    Ok(json!({ "engine": engine, "engine_version": code, "rows": rows, "markets": summary, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
 }
 
-/// The next pick engine whose champion code has no backtest evidence (and did not fail in the last day).
+/// The next pick engine whose champion code has no current backtest evidence (and did not fail in the last day).
 pub(crate) async fn due(state: &State) -> Option<String> {
     for e in PICK_ENGINES {
         let code = learning::engine_of(e);
-        let have = state.db.query_opt("SELECT 1 FROM pick_evidence WHERE engine=$1 AND source='backtest' AND detail->>'engine_version'=$2 LIMIT 1", &[&e, &code]).await.ok().flatten().is_some();
+        // current code, current method, and refreshed within REFRESH_DAYS (new games accumulate in season)
+        let have = state.db.query_opt("SELECT 1 FROM pick_evidence WHERE engine=$1 AND source='backtest' AND detail->>'engine_version'=$2 \
+            AND detail->>'method'=$3 AND updated_at > now() - make_interval(days => $4) LIMIT 1", &[&e, &code, &blend::METHOD, &REFRESH_DAYS]).await.ok().flatten().is_some();
         if have { continue; }
         let failed = state.db.query_opt("SELECT 1 FROM learning_jobs WHERE job=$1 AND NOT last_ok AND last_run > now() - interval '1 day'", &[&format!("evidence:{e}")]).await.ok().flatten().is_some();
         if !failed { return Some(e.to_string()); }

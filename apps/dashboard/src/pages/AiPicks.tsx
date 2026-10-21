@@ -331,6 +331,9 @@ function Detail({ p }: { p: PickDetail }) {
           <Row k="Engine" v={`${p.engine} · ${p.model_version}`} />
           <Row k="Lineups" v={f.lineup_mode ?? "—"} />
           {f.q10 != null && <Row k="Median · 80% range" v={`${num(f.q50)} · ${num(f.q10)}–${num(f.q90)}`} />}
+          {f.p_raw != null && <Row k="Engine alone · blended" v={`${pct(f.p_raw, 1)} · ${pct(p.p_model, 1)}`} />}
+          {f.p_naive != null && <Row k="Own prior frequency" v={`${pct(f.p_naive, 1)} (naive baseline${f.w_naive != null ? `, model weight ${f.w_naive.toFixed(2)}` : ""})`} />}
+          {f.w_market != null && <Row k="Trust vs market" v={`${f.w_market.toFixed(2)} · ${f.blend_text ?? ""}`} />}
           {f.p_active != null && <Row k="Plays in" v={pct(f.p_active, 1)} />}
           {f.p_push != null && f.p_push > 0 && <Row k="Push chance" v={pct(f.p_push, 1)} />}
           {f.proj_minutes != null && <Row k="Minutes (sim · last 5)" v={`${num(f.proj_minutes)} · ${num(f.l5_minutes)}`} />}

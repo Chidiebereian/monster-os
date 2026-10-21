@@ -15,7 +15,7 @@ use crate::nba_sim::{self as sim, GameInput, League, Rate};
 use crate::learning::{freq_over, Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
-pub const MODEL_VERSION: &str = "nba-poss-sim-v2";
+pub const MODEL_VERSION: &str = "nba-poss-sim-v4";
 
 fn internal(m: impl std::fmt::Display) -> HttpResponse {
     eprintln!("projection-service(nba-sim): {m}");
@@ -182,6 +182,11 @@ crate::learning::tuning!(Tuning {
     def_prior: 800.0, 50.0, 5000.0, "attempts of league-average prior on team defence (2P%, 3P%, turnovers)";
     reb_prior: 400.0, 50.0, 4000.0, "rebound chances of league-average prior on team rebounding";
     pace_prior_games: 8.0, 1.0, 60.0, "games of league-average prior on team pace";
+    rotation_depth: 12.0, 7.0, 15.0, "players (by projected minutes) treated as the rotation; deeper players share deep_bench_minutes";
+    starter_protect: 0.85, 0.0, 1.0, "1 = projected starters keep their minutes when the rotation is scaled to 240; 0 = scaled like everyone else";
+    deep_bench_minutes: 12.0, 0.0, 48.0, "garbage-time minutes shared by all players outside the rotation (in proportion to their own projections)";
+    rotation_scale: 1.0, 0.0, 1.0, "1 = scale the rotation's projected minutes to the 240 available; 0 = leave the cut to the simulator (heaviest first)";
+    preseason_only_cap: 18.0, 4.0, 30.0, "projected-minutes cap for players whose only history is preseason (rookies, camp invites)";
 });
 
 /// ESPN injury designations -> probability of playing. Not fitted (no stored
@@ -250,6 +255,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
         let mut gw = 0.0;
         let mut pool: HashMap<String, (String, String, Vec<usize>, Option<usize>)> = HashMap::new(); // id -> name, pos, games played idx, last start idx
         let mut seen_g: HashSet<String> = HashSet::new();
+        let mut recent_starts: HashMap<String, usize> = HashMap::new(); // starts in the team's last 5 games
         for r in &rows {
             let gid: String = r.get(0);
             let i = gi[gid.as_str()];
@@ -262,6 +268,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
                 let e = pool.entry(r.get(2)).or_insert((r.get(3), r.get(4), Vec::new(), None));
                 if !r.get::<_, bool>(6) && t.min > 0.0 { e.2.push(i); }
                 if r.get::<_, bool>(5) && e.3.map(|x| i < x).unwrap_or(true) { e.3 = Some(i); }
+                if r.get::<_, bool>(5) && i < 5 { *recent_starts.entry(r.get(2)).or_default() += 1; }
             }
         }
         let _ = gw;
@@ -339,7 +346,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
                 (m, v.sqrt().clamp(2.0, 10.0))
             } else { (if c.starter { 28.0 } else { 12.0 }, 6.0) };
             // preseason-only history (rookies, new signings): preseason minutes overstate roles
-            let mm = if by.get(&c.id).map(|v| v.len()).unwrap_or(0) < 3 { mm.min(18.0) } else { mm };
+            let mm = if by.get(&c.id).map(|v| v.len()).unwrap_or(0) < 3 { mm.min(opts.tune.preseason_only_cap) } else { mm };
             let u = t.usage();
             let per_min = |x: f64, lgv: f64| (x + opts.tune.rate_prior_min * lgv) / (t.min + opts.tune.rate_prior_min);
             let lg_per_min = |f: fn(&Tot) -> f64| f(&t) / t.min.max(1.0); // own, for meta
@@ -363,10 +370,12 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
                 "games": c.games, "min_mean": r3(mm), "scenario": if opts.out.contains(&c.id) { "out" } else if opts.force_in.contains(&c.id) { "in" } else { "auto" } }));
             let _ = wsum;
         }
-        // after a preseason game the projected starters are the top five by projected minutes
+        // after a preseason game the projected starters are the five who started
+        // most of the team's recent (preseason) games, then the heaviest minutes
         if last_was_preseason && opts.mode != LineupMode::Actual {
+            let starts: Vec<usize> = cands.iter().map(|c| recent_starts.get(&c.id).copied().unwrap_or(0)).collect();
             let mut order: Vec<usize> = (0..players.len()).filter(|&i| players[i].p_active > 0.0).collect();
-            order.sort_by(|a, b| players[*b].min_mean.total_cmp(&players[*a].min_mean));
+            order.sort_by(|a, b| starts[*b].cmp(&starts[*a]).then(players[*b].min_mean.total_cmp(&players[*a].min_mean)));
             for (k, i) in order.iter().enumerate() { players[*i].starter = k < 5; pmeta[*i]["starter"] = json!(k < 5); }
         }
         // fill starters: ruled-out starters replaced by the heaviest-minute active non-starters
@@ -375,6 +384,40 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             let mut bench: Vec<usize> = (0..players.len()).filter(|&i| !players[i].starter && players[i].p_active > 0.0).collect();
             bench.sort_by(|a, b| players[*b].min_mean.total_cmp(&players[*a].min_mean));
             for i in bench.into_iter().take(5 - n_start) { players[i].starter = true; pmeta[i]["starter"] = json!(true); }
+        }
+        // Minutes budget. Projected minutes come from each player's own recent
+        // games, so when many players are active (opening week: everyone who
+        // played in the preseason) they add up to far more than 240 and the
+        // simulator's heaviest-first cut starves whoever ranks ninth (a starting
+        // center got 2 minutes). Starters keep their projection; players outside
+        // the rotation share a garbage-time allowance; the rest of the rotation is
+        // scaled to the minutes that remain.
+        if opts.mode != LineupMode::Actual {
+            let dem = |p: &sim::Player| p.min_mean * p.p_active;
+            let mut order: Vec<usize> = (0..players.len()).filter(|&i| players[i].p_active > 0.0).collect();
+            order.sort_by(|a, b| (players[*b].starter as u8).cmp(&(players[*a].starter as u8)).then(dem(&players[*b]).total_cmp(&dem(&players[*a]))));
+            if order.iter().map(|&i| dem(&players[i])).sum::<f64>() > 240.0 {
+                let depth = (opts.tune.rotation_depth.round().max(5.0) as usize).min(order.len());
+                let (rot, deep) = order.split_at(depth);
+                let d0: f64 = deep.iter().map(|&i| dem(&players[i])).sum();
+                if d0 > opts.tune.deep_bench_minutes && d0 > 0.0 {
+                    let k = opts.tune.deep_bench_minutes / d0;
+                    for &i in deep { players[i].min_mean *= k; }
+                }
+                let d: f64 = deep.iter().map(|&i| dem(&players[i])).sum();
+                let protect = opts.tune.starter_protect;
+                let fixed: f64 = rot.iter().filter(|&&i| players[i].starter).map(|&i| protect * dem(&players[i])).sum();
+                let flex: f64 = rot.iter().map(|&i| dem(&players[i])).sum::<f64>() - fixed;
+                if opts.tune.rotation_scale > 0.0 && fixed + flex + d > 240.0 && flex > 0.0 {
+                    let f = (((240.0 - d - fixed).max(0.4 * flex)) / flex).min(1.0).powf(opts.tune.rotation_scale);
+                    for &i in rot {
+                        // a protected starter scales only on the unprotected part of his projection
+                        let share = if players[i].starter { 1.0 - protect } else { 1.0 };
+                        players[i].min_mean *= 1.0 - share * (1.0 - f);
+                    }
+                }
+                for &i in &order { pmeta[i]["min_mean"] = json!(r3(players[i].min_mean)); }
+            }
         }
         if players.iter().filter(|p| p.p_active > 0.0).count() < 8 {
             flags.push(format!("{abbr}: fewer than 8 available players"));
@@ -560,6 +603,9 @@ pub struct BacktestQuery {
     #[serde(default = "d_bt_seed")] seed: u64,
     lineup: Option<String>,
     from: Option<String>,
+    /// tuning overrides as JSON (e.g. {"rotation_depth": 10})
+    cfg: Option<String>,
+    to: Option<String>,
 }
 fn d_bt_season() -> i32 { 2026 }
 fn d_bt_games() -> usize { 150 }
@@ -578,7 +624,8 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
     let db = &state.db;
     let from = q.from.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
     let all: Vec<String> = if from.is_none() { match backtest_games(db, q.season).await { Ok(a) => a, Err(e) => return internal(e) } } else {
-        match db.query("SELECT espn_id FROM nba_games_espn WHERE season = $1 AND season_type = 2 AND completed AND game_date >= $2 ORDER BY game_date, espn_id", &[&q.season, &from]).await {
+        let to = q.to.as_deref().and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).unwrap_or(NaiveDate::MAX);
+        match db.query("SELECT espn_id FROM nba_games_espn WHERE season = $1 AND season_type = 2 AND completed AND game_date >= $2 AND game_date <= $3 ORDER BY game_date, espn_id", &[&q.season, &from, &to]).await {
             Ok(r) => r.iter().map(|x| x.get(0)).collect(), Err(e) => return internal(dberr(&e)),
         }
     };
@@ -587,14 +634,17 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
     let picked: Vec<String> = (0..q.games.min(all.len())).map(|i| all[(i as f64 * step) as usize].clone()).collect();
     let t0 = Instant::now();
     let lineup = LineupMode::parse(q.lineup.as_deref()).as_str();
+    let cfg: Value = q.cfg.as_deref().and_then(|c| serde_json::from_str(c).ok()).unwrap_or_else(|| json!({}));
     let mut card = Scorecard::default();
     let (mut tot_err, mut tot_bias, mut tot_base_err, mut nt) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let (mut poss_sim, mut poss_act) = (0.0, 0.0);
+    let (mut min_err, mut min_n, mut min_miss) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut st_bias, mut st_n) = (0.0f64, 0.0f64);
     let mut skipped = Vec::new();
     let mut sims = 0;
     for gid in &picked {
         let seed = sim::derive_seed(q.seed, &[gid]);
-        let ev = match evaluate(&state, gid, lineup, &json!({}), q.n, q.draws, seed).await {
+        let ev = match evaluate(&state, gid, lineup, &cfg, q.n, q.draws, seed).await {
             Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { skipped.push(json!({ "game": gid, "why": e })); continue }
         };
         sims += 1;
@@ -604,6 +654,8 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
                 "total_points" => { tot_err += (s - a).abs(); tot_bias += s - a; nt += 1.0; }
                 "total_line" => { tot_base_err += (s - a).abs(); }
                 "possessions" => { poss_sim += s; poss_act += a; }
+                "starter_minutes" => { st_bias += s - a; st_n += 1.0; }
+                "player_minutes" => { min_err += (s - a).abs(); min_n += 1.0; if *a >= 15.0 && *s < 8.0 { min_miss += 1.0; } }
                 _ => {}
             }
         }
@@ -614,6 +666,8 @@ pub async fn backtest(state: web::Data<State>, q: web::Query<BacktestQuery>) -> 
         "secs": t0.elapsed().as_secs(), "skipped": skipped.into_iter().take(10).collect::<Vec<_>>(),
         "possessions_per_game": { "simulated": r3(poss_sim / sims.max(1) as f64), "actual": r3(poss_act / sims.max(1) as f64) },
         "total_points": { "mae_model": r3(tot_err / nt), "mae_line": r3(tot_base_err / nt), "bias": r3(tot_bias / nt) },
+        "player_minutes": { "mae": r3(min_err / min_n.max(1.0)), "players": min_n, "rotation_misses_per_game": r3(min_miss / sims.max(1) as f64),
+            "starter_bias": r3(st_bias / st_n.max(1.0)), "starters": st_n },
         "binary": card.report(),
     });
     if sims >= 20 {
@@ -696,6 +750,7 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         if r.get::<_, Option<f64>>(10).unwrap_or(0.0) <= 0.0 { continue; }
         let m = o.players.entry(r.get(1)).or_default();
         m.insert("pts", g(2)); m.insert("reb", g(3) + g(4)); m.insert("ast", g(5)); m.insert("fg3m", g(6));
+        m.insert("min", r.get::<_, Option<f64>>(10).unwrap_or(0.0));
     }
     o.game.insert("possessions", pa);
     Ok(Some(o))
@@ -714,6 +769,18 @@ pub async fn evaluate(state: &State, id: &str, lineup: &str, cfg: &Value, n: usi
     let nn = e.n.max(1) as f64;
     let mut diag = vec![("total_points", e.total.mean(), outcomes.game["total"]), ("possessions", (e.possessions[0] + e.possessions[1]) / nn, outcomes.game["possessions"])];
     if let Some(l) = gref.over_under { diag.push(("total_line", l, outcomes.game["total"])); }
+    // minutes: expected (mean if active x P(active)) vs actual, over players who played or were expected to
+    let min_k = sim::PROPS.iter().position(|s| *s == "min").unwrap_or(8);
+    for t in 0..2 {
+        for (i, p) in game.teams[t].players.iter().enumerate() {
+            let act = outcomes.players.get(&p.id).and_then(|m| m.get("min")).copied().unwrap_or(0.0);
+            let pa = e.active_n[t][i] as f64 / nn;
+            let exp = if pa > 0.0 { e.player[t][i][min_k].mean() * pa } else { 0.0 };
+            if act > 0.0 || exp > 2.0 { diag.push(("player_minutes", exp, act)); }
+            // projected starters (chosen before the game) who played: bias of the minutes props depend on
+            if p.starter && act > 0.0 && pa > 0.0 { diag.push(("starter_minutes", e.player[t][i][min_k].mean(), act)); }
+        }
+    }
     Ok(Some(GameEval { forecasts, outcomes, diag }))
 }
 
