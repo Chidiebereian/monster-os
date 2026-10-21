@@ -1,4 +1,4 @@
-# NHL event simulator model card — `nhl-event-sim-v1`
+# NHL event simulator model card — `nhl-event-sim-v3`
 
 Status as of 2026-10-20. **Experimental, first version.** Every number was
 produced by the code in this repository against real data.
@@ -113,6 +113,42 @@ league base rates, not the market.
 * Win probabilities beat a constant home-rate baseline.
 * Totals are slightly low and worse than the base rate.
 * Skater props are only about even with each player's own history.
+
+## v1 → v2 → v3 (2026-10-21): shot-quality pool
+
+Multi-season backtests exposed a v1 bug: each shooter's location/type pool, from
+which every simulated attempt draws, included **blocked** attempts. The feed logs
+those at the block with no shot type, so they became type "other". In 2019-20,
+74 of the 80 untyped unblocked shots were goals (goals missing a type), so the xG
+fit learned other = +1.93; simulating 2020-21 on those parameters put ~25% of
+shots in a category that scored at ~7x the odds: **+4.2 goals per game**. The
+bias in later seasons tracked the previous season's "other" coefficient.
+
+- **v2**: unblocked attempts only; untyped shots take the wrist baseline in the
+  xG model (no own offset). 2020-21 bias +4.2 → −0.7, but every season ran
+  −0.4 to −0.8 goals low: the pool still contained missed shots, while the xG
+  model is fitted on shots on goal and goals only.
+- **v3**: the pool for on-goal outcomes is shots on goal and goals — the xG
+  model's own population.
+
+Full-season walk-forward results (projected lineups, 2,000 sims per game; Brier
+model − baseline, * = beyond 2 SE; baselines are the league home-win rate, the
+league over-5.5 rate and each player's own prior frequency):
+
+| Season | Goals bias v1 → v2 | home win v2 | total o5.5 v2 | points 1+ v2 | SOG over avg v2 |
+|---|---|---|---|---|---|
+| 2020-21 | +4.22 → −0.72 | −0.0098* | +0.0224* | +0.0046* | +0.0060* |
+| 2021-22 | −0.17 → −0.78 | −0.0136* | +0.0165* | +0.0061* | +0.0066* |
+| 2022-23 | +1.32 → −0.38 | −0.0155* | −0.0026 | +0.0018* | +0.0019* |
+| 2023-24 | +0.24 → −0.41 | −0.0135* | +0.0062 | +0.0027* | +0.0020* |
+| 2024-25 | −0.35 → −0.62 | −0.0062* | +0.0134* | +0.0034* | +0.0017* |
+| 2025-26 | — → −0.71 | −0.0037 | +0.0172* | +0.0047* | +0.0040* |
+
+v3 on 2025-26: goals bias −0.58 (v2 −0.71); total o5.5 +0.0120* (v2 +0.0172*);
+home win −0.0033; points 1+ +0.0041*; SOG +0.0041*; saves −0.0116*. The
+remaining ~0.6 goals per game under-scoring is a calibration problem (finishing
+and goalie shrinkage), left to the autopilot's tuner. v3's five-season evidence
+for AI Picks is regenerated automatically (`pick_evidence`, engine `nhl`).
 
 ## Limitations
 

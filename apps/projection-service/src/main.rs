@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! projection-service
 //!
 //! Per-sport, per-stat player projections from decades of real game logs,
@@ -32,6 +33,9 @@ mod hitrates;
 mod learning;
 mod autopilot;
 mod team_engine;
+mod lines;
+mod picks;
+mod evidence;
 mod market;
 mod team_model;
 mod player_backtest;
@@ -690,6 +694,12 @@ async fn main() -> std::io::Result<()> {
             .route("/learning/autopilot", web::get().to(autopilot::status))
             .route("/learning/autopilot", web::post().to(autopilot::status))
             .route("/learning/autopilot/run", web::post().to(autopilot::run_now))
+            .route("/picks", web::get().to(picks::list))
+            .route("/picks/run", web::post().to(picks::run_http))
+            .route("/picks/record", web::get().to(picks::record))
+            .route("/picks/meta", web::get().to(picks::meta))
+            .route("/picks/evidence/run", web::post().to(evidence::run_http))
+            .route("/picks/{id}", web::get().to(picks::get))
             .route("/learning/{sport}/freeze", web::post().to(learning::freeze))
             .route("/learning/{sport}/score", web::post().to(learning::score))
             .route("/learning/{sport}/cycle", web::post().to(learning::cycle))

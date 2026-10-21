@@ -206,17 +206,22 @@ async fn predict(state: &State, sport: &str, id: &str, lineup: &str, cfg: &Value
 }
 
 async fn outcomes(state: &State, sport: &str, id: &str) -> Result<Option<Outcomes>, String> {
+    game_outcomes(&state.db, sport, id).await
+}
+
+/// Final outcomes of a game (None until final), for any engine of the sport.
+pub(crate) async fn game_outcomes(db: &tokio_postgres::Client, sport: &str, id: &str) -> Result<Option<Outcomes>, String> {
     match base(sport) {
-        "nhl" => crate::nhl_game::outcomes(&state.db, id).await,
-        "nba" => crate::nba_game::outcomes(&state.db, id).await,
-        "nfl" => crate::nfl_game::outcomes(&state.db, id).await,
-        "mlb" => crate::mlb::outcomes(&state.db, id).await,
+        "nhl" => crate::nhl_game::outcomes(db, id).await,
+        "nba" => crate::nba_game::outcomes(db, id).await,
+        "nfl" => crate::nfl_game::outcomes(db, id).await,
+        "mlb" => crate::mlb::outcomes(db, id).await,
         _ => Err(format!("unknown sport {sport}")),
     }
 }
 
 /// Walk-forward evaluation of one historical game under a configuration.
-async fn evaluate(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+pub(crate) async fn evaluate(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
     if is_team(sport) {
         let o = outcomes(state, sport, id).await?;
         return crate::team_engine::evaluate(state, base(sport), id, cfg, n, seed, o).await;

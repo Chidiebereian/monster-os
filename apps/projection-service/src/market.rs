@@ -115,8 +115,13 @@ async fn fetch_events(http: &reqwest::Client, key: &str, lg: &str) -> Result<Vec
     Ok(v["data"].as_array().cloned().unwrap_or_default())
 }
 
+/// SPORTSGAMEODDS_API_KEY may hold several comma-separated keys (first = primary).
+pub(crate) fn keys_from_env() -> Vec<String> {
+    std::env::var("SPORTSGAMEODDS_API_KEY").unwrap_or_default().split(',').map(|k| k.trim().trim_matches('"').to_string()).filter(|k| !k.is_empty()).collect()
+}
+
 pub(crate) fn key_from_env() -> Option<String> {
-    std::env::var("SPORTSGAMEODDS_API_KEY").ok().filter(|k| !k.is_empty())
+    keys_from_env().into_iter().next()
 }
 
 /// best book's value for an oddID: returns (odds, spread, overUnder)

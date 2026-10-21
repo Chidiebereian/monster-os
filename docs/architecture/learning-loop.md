@@ -185,3 +185,11 @@ reads. Its adapters use the same market definitions.
   MLB prop models are not refit automatically.
 * **Live sample size.** Live records start small, and a market needs a few
   hundred resolved forecasts before its standard error allows a verdict.
+
+## AI Picks
+
+The autopilot also runs AI Picks (see `ai-picks.md`): every 20 minutes per sport
+it fetches lines and reprices them from the champions' frozen forecasts, settles
+finished games every tick, and, in its slow loop, regenerates backtest evidence
+for any picks engine whose code version has none. Settled picks feed live
+evidence back into the grade caps.

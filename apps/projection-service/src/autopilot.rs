@@ -80,6 +80,18 @@ pub fn spawn(state: web::Data<State>) {
     actix_web::rt::spawn(async move {
         actix_web::rt::time::sleep(std::time::Duration::from_secs(300)).await;
         loop {
+            // AI Picks evidence first: an engine whose code changed re-earns its grade caps
+            if !paused(&s2.db).await {
+                if let Some(engine) = crate::evidence::due(&s2).await {
+                    let job = format!("evidence:{engine}");
+                    let v = match crate::evidence::run(&s2, &engine).await { Ok(v) => v, Err(e) => json!({ "error": e }) };
+                    let ok = v.get("error").is_none();
+                    println!("autopilot evidence {engine}: {}", if ok { format!("{} rows in {} s", v["rows"], v["secs"]) } else { v["error"].to_string() });
+                    mark(&s2.db, &job, ok, &v).await;
+                    actix_web::rt::time::sleep(std::time::Duration::from_secs(60)).await;
+                    continue;
+                }
+            }
             if !paused(&s2.db).await && TUNE_WINDOW_UTC.contains(&Utc::now().hour()) {
                 if let Some(engine) = next_to_tune(&s2).await {
                     let v = tune(&s2, &engine).await;
@@ -148,7 +160,21 @@ pub async fn tick(state: &State) -> Value {
     }
     let (frozen, skipped_errors) = freeze_due(state, today).await;
     errors.extend(skipped_errors);
-    let out = json!({ "at": Utc::now(), "ingested": ingested, "forecasts_scored": scored, "guard": guarded, "frozen": frozen, "errors": errors });
+    // AI Picks: fetch lines and (re)price every 20 minutes per sport; settle every tick
+    let mut picks_run = Vec::new();
+    for sport in crate::picks::SPORTS {
+        let job = format!("picks:{sport}");
+        if due(db, &job, 20).await {
+            let v = crate::picks::run(state, sport, false).await;
+            let ok = v["ok"].as_bool().unwrap_or(false);
+            if !ok { errors.push(json!({ "job": job, "detail": { "lines": v["lines"]["providers"]["espn"]["error"], "build": v["build"]["error"], "settle": v["settle"]["error"] } })); }
+            picks_run.push(json!({ "sport": sport, "published": v["build"]["published"], "settled": v["settle"]["settled"] }));
+            mark(db, &job, ok, &v).await;
+        } else if let Err(e) = crate::picks::settle(state, sport).await {
+            errors.push(json!({ "job": format!("picks-settle:{sport}"), "error": e }));
+        }
+    }
+    let out = json!({ "at": Utc::now(), "ingested": ingested, "forecasts_scored": scored, "guard": guarded, "frozen": frozen, "picks": picks_run, "errors": errors });
     mark(db, "tick", errors.is_empty(), &out).await;
     out
 }
@@ -442,6 +468,8 @@ pub async fn status(state: web::Data<State>, q: web::Query<PauseQuery>, req: act
             "freeze": format!("champion + shadows: projected lineup within {PROJECTED_HOURS} h of the start, confirmed lineup within {CONFIRMED_MINUTES} min (NFL: the days before; confirmed the day before)"),
             "tune": format!("one proposal per engine per day, {:02}:00–{:02}:00 UTC; search season + holdout of the latest {TUNE_GAMES} games, {TUNE_N} sims x {TUNE_DRAWS} draws", TUNE_WINDOW_UTC.start, TUNE_WINDOW_UTC.end),
             "promote": "a shadow is promoted after enough paired live games with no market worse by 2 SE; the old champion stays as a shadow and is restored if the new one falls 2 SE behind",
+            "picks": "AI Picks every 20 min per sport: ESPN lines each run, The Odds API at most every 6 h and SportsGameOdds every 4 h within daily budgets; reprice from the champions' frozen forecasts; settle finished games every tick",
+            "evidence": "when a champion's engine code has no backtest evidence, re-run five seasons of walk-forward backtests (one engine at a time) so AI Picks grade caps follow the code",
         },
     }))
 }

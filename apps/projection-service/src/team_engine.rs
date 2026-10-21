@@ -198,6 +198,16 @@ async fn run(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: 
     Ok((t, m, sims))
 }
 
+/// Integer distribution of simulated values: {"pmf_offset": min, "pmf": [P(min), P(min+1), ...]}.
+fn int_dist(xs: impl Iterator<Item = f64>) -> Value {
+    let v: Vec<i64> = xs.map(|x| x.round() as i64).collect();
+    let (Some(&lo), Some(&hi)) = (v.iter().min(), v.iter().max()) else { return Value::Null };
+    let mut c = vec![0u64; (hi - lo + 1) as usize];
+    for x in &v { c[(x - lo) as usize] += 1; }
+    let n = v.len() as f64;
+    json!({ "pmf_offset": lo, "pmf": c.iter().map(|k| (*k as f64 / n * 1e5).round() / 1e5).collect::<Vec<_>>() })
+}
+
 /// Production prediction for the ledger.
 pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
     let (t, m, sims) = run(state, sport, id, cfg, n, seed).await?;
@@ -208,6 +218,7 @@ pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u6
         "engine": engine(sport), "game_id": id, "date": t.date, "away": t.away, "home": t.home, "seed": seed, "n": sims.len(),
         "proj_home": (m.mu_home * 100.0).round() / 100.0, "proj_away": (m.mu_away * 100.0).round() / 100.0, "dispersion": m.dispersion,
         "margin_home": mean(|x| x.0), "total": mean(|x| x.1),
+        "dist": { "margin": int_dist(sims.iter().map(|x| x.0)), "total": int_dist(sims.iter().map(|x| x.1)) },
         "market": { "spread": t.spread, "total": t.total },
         "forecasts": fc.iter().map(|f| json!({ "market": f.market, "line": f.line, "p": f.p_model })).collect::<Vec<_>>(),
         "fit": { "games": m.games, "teams": m.teams, "tuning": tuning_for(sport, cfg).describe() },

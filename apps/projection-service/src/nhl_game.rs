@@ -16,7 +16,7 @@ use crate::nhl_sim::{self as sim, GameInput, League, Xg, EV, PP, SH};
 use crate::learning::{freq_over, Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
-pub const MODEL_VERSION: &str = "nhl-event-sim-v1";
+pub const MODEL_VERSION: &str = "nhl-event-sim-v3";
 
 fn internal(m: impl std::fmt::Display) -> HttpResponse {
     eprintln!("projection-service(nhl-sim): {m}");
@@ -83,7 +83,7 @@ fn xg_features(x: f64, y: f64, ty: usize, pp: bool) -> Vec<f64> {
     let dist = (dx * dx + y * y).sqrt();
     let angle = (y.abs() / dx).atan();
     let mut f = vec![1.0, dist, angle, pp as i32 as f64];
-    for t in 1..8 { f.push((ty == t) as i32 as f64); } // wrist = baseline
+    for t in 1..7 { f.push((ty == t) as i32 as f64); } // wrist = baseline; untyped shots too (see Xg::p)
     f
 }
 
@@ -195,7 +195,7 @@ pub async fn fit(state: web::Data<State>) -> impl Responder {
         }
         let xgb = logistic(&xs, &ys, 1.0);
         let xg = Xg { b0: xgb[0], dist: xgb[1], angle: xgb[2], pp: xgb[3],
-            types: [0.0, xgb[4], xgb[5], xgb[6], xgb[7], xgb[8], xgb[9], xgb[10]] };
+            types: [0.0, xgb[4], xgb[5], xgb[6], xgb[7], xgb[8], xgb[9], 0.0] };
         let rate = |a: f64, b: f64, d: f64| if b > 0.0 { a / b } else { d };
         let league = League {
             season,
@@ -400,7 +400,10 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
             *team_att.entry((s.game, k)).or_default() += 1.0;
             if let Some(sh) = s.shooter {
                 *p_att.entry((sh, k)).or_default() += w(gi[&s.game]);
-                if let (Some(x), Some(y)) = (s.x, s.y) { let v = shot_loc.entry(sh).or_default(); if v.len() < 300 { v.push((x as f32, y as f32, s.ty as u8)); } }
+                // location/type pool for on-target outcomes: shots on goal and goals only, the
+                // population the xG model is fitted on (blocked shots are logged at the block with no
+                // type, misses come from farther out; v2 drew misses too and ran ~0.6 goals/game low)
+                if s.kind == "goal" || s.kind == "sog" { if let (Some(x), Some(y)) = (s.x, s.y) { let v = shot_loc.entry(sh).or_default(); if v.len() < 300 { v.push((x as f32, y as f32, s.ty as u8)); } } }
                 if s.kind == "goal" || s.kind == "sog" {
                     if let (Some(x), Some(y)) = (s.x, s.y) {
                         let e = p_g.entry(sh).or_default();

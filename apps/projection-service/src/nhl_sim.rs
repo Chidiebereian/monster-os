@@ -42,7 +42,9 @@ impl Xg {
         let dx = (89.0 - x).max(0.5);
         let dist = (dx * dx + y * y).sqrt();
         let angle = (y.abs() / dx).atan();
-        let z = self.b0 + self.dist * dist + self.angle * angle + if pp { self.pp } else { 0.0 } + self.types[ty.min(7)];
+        // untyped shots ("other") take the wrist baseline: in the feed they are mostly goals with a
+        // missing type, so an own offset would learn "untyped means goal" (v1 bug, up to +4 goals/game)
+        let z = self.b0 + self.dist * dist + self.angle * angle + if pp { self.pp } else { 0.0 } + if ty < 7 { self.types[ty] } else { 0.0 };
         1.0 / (1.0 + (-z).exp())
     }
 }
@@ -552,6 +554,14 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn untyped_shots_take_the_wrist_baseline() {
+        // a fitted "other" offset (2019-20 learned +1.93) must not reach the sim
+        let xg = Xg { b0: -1.2, dist: -0.055, angle: -0.6, pp: 0.25, types: [0.0, 0.1, 0.0, -0.1, 0.2, 0.2, -0.3, 1.93] };
+        assert_eq!(xg.p(70.0, 5.0, 7, false), xg.p(70.0, 5.0, 0, false));
+        assert_eq!(xg.p(70.0, 5.0, shot_type_idx("unknown"), true), xg.p(70.0, 5.0, 0, true));
+        assert!(xg.p(70.0, 5.0, 4, false) > xg.p(70.0, 5.0, 0, false));
+    }
     fn toy(playoff: bool) -> GameInput {
         let lg = League { season: 2026, att60: [55.0, 95.0, 20.0], blocked: [0.25, 0.15, 0.3], missed: [0.22, 0.22, 0.2], pen60: 3.0,
             pen_durations: vec![2, 2, 2, 2, 4, 5], xg: Xg { b0: -1.2, dist: -0.055, angle: -0.6, pp: 0.25, types: [0.0, 0.05, 0.0, -0.1, 0.2, 0.2, -0.3, 0.0] },
