@@ -138,7 +138,7 @@ keys and out-of-range values.
 | Step | Endpoint | Rule |
 |---|---|---|
 | register | `POST /learning/{sport}/candidates {"config": {...}}` | config must differ from the champion |
-| evaluate | `POST /learning/{sport}/evaluate?version=&season=&games=` | champion and candidate simulate the **same historical games with the same seeds**, inputs strictly before each game; paired Brier differences per market |
+| evaluate | `POST /learning/{sport}/evaluate?version=&season=&games=&lineup=` | champion and candidate simulate the **same historical games with the same seeds**, inputs strictly before each game; paired Brier differences per market. `lineup=actual` uses hindsight lineups (who really played) for changes that only act when availability is known; the tuner always uses projected |
 | promote | `POST /learning/{sport}/promote?version=` | only if the stored evaluation was against the current champion and passed the gate; a failed candidate is marked `rejected` |
 | rollback | `POST /learning/{sport}/rollback` | restores the most recently retired champion on the current engine |
 
@@ -195,3 +195,9 @@ for any picks engine whose code version or blending method has none (and every
 30 days). Every priced line is recorded and scored after the game, refitting how
 far each engine is trusted over the market (`blend.rs`). Settled picks and
 recorded lines feed evidence back into the grade caps.
+After each build it also scans for stale lines (a book beating Pinnacle's
+de-vigged price, `sharp.rs`) and settles them.
+
+The slow loop also keeps the NBA player impact ratings current
+(`nba_impact.rs`): one fit as of the first of each in-season month, backfilled
+over six years, checked every 6 hours.

@@ -35,6 +35,7 @@ mod autopilot;
 mod team_engine;
 mod lines;
 mod picks;
+mod sharp;
 mod evidence;
 mod blend;
 mod market;
@@ -43,6 +44,7 @@ mod player_backtest;
 mod nba;
 mod nba_espn;
 mod nba_game;
+mod nba_impact;
 mod nba_sim;
 mod nba_teams;
 mod mlb;
@@ -698,6 +700,7 @@ async fn main() -> std::io::Result<()> {
             .route("/picks", web::get().to(picks::list))
             .route("/picks/run", web::post().to(picks::run_http))
             .route("/picks/record", web::get().to(picks::record))
+            .route("/picks/edges", web::get().to(sharp::list))
             .route("/picks/meta", web::get().to(picks::meta))
             .route("/picks/evidence/run", web::post().to(evidence::run_http))
             .route("/picks/{id}", web::get().to(picks::get))
@@ -714,6 +717,8 @@ async fn main() -> std::io::Result<()> {
             .route("/sim/sessions/{id}/state", web::get().to(sim_sessions::snapshot))
             .route("/ingest/nba/espn", web::post().to(nba_espn::ingest))
             .route("/fit/nba/sim", web::post().to(nba_game::fit))
+            .route("/fit/nba/impact", web::post().to(nba_impact::fit_http))
+            .route("/nba/impact", web::get().to(nba_impact::show))
             .route("/nba/sim/games", web::get().to(nba_game::games))
             .route("/nba/simulate/{game_id}", web::get().to(nba_game::simulate))
             .route("/backtest/nba/sim", web::get().to(nba_game::backtest))

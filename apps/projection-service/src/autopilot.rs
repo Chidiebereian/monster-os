@@ -80,6 +80,15 @@ pub fn spawn(state: web::Data<State>) {
     actix_web::rt::spawn(async move {
         actix_web::rt::time::sleep(std::time::Duration::from_secs(300)).await;
         loop {
+            // NBA player impact ratings: one fit per in-season month, backfilled
+            // over the seasons the backtests cover (nba_impact.rs)
+            if !paused(&s2.db).await && due(&s2.db, "fit:nba_impact", 360).await {
+                let today = today_et();
+                let v = crate::nba_impact::ensure(&s2.db, today - Duration::days(365 * 6), today).await;
+                let fitted = v.as_ref().map(|x| x.len()).unwrap_or(0);
+                if fitted > 0 { println!("autopilot nba impact: {fitted} monthly fits"); }
+                mark(&s2.db, "fit:nba_impact", v.is_ok(), &json!({ "fitted": v.unwrap_or_else(|e| vec![json!({ "error": e })]) })).await;
+            }
             // AI Picks evidence first: an engine whose code changed re-earns its grade caps
             if !paused(&s2.db).await {
                 if let Some(engine) = crate::evidence::due(&s2).await {
@@ -388,7 +397,7 @@ async fn tune_inner(state: &State, engine: &str) -> Result<Value, String> {
 
     // 1. search: a season the holdout does not touch
     let search_games = learning::eval_games(state, engine, search_season, TUNE_GAMES).await?;
-    let mut search = learning::paired_eval(state, engine, &champ_cfg, &cfg, &search_games, TUNE_N, TUNE_DRAWS).await;
+    let mut search = learning::paired_eval(state, engine, &champ_cfg, &cfg, &search_games, TUNE_N, TUNE_DRAWS, "projected").await;
     search["season"] = json!(search_season);
     let s_pass = search["gate"]["pass"].as_bool().unwrap_or(false);
     let mut evidence = json!({ "champion": champ, "change": change, "search": search });
@@ -400,7 +409,7 @@ async fn tune_inner(state: &State, engine: &str) -> Result<Value, String> {
     // 2. holdout: the most recent games of the latest season; a market that
     // improved in the search must improve again, and none may degrade
     let hold_games: Vec<String> = hold_all.iter().rev().take(TUNE_GAMES).rev().cloned().collect();
-    let mut hold = learning::paired_eval(state, engine, &champ_cfg, &cfg, &hold_games, TUNE_N, TUNE_DRAWS).await;
+    let mut hold = learning::paired_eval(state, engine, &champ_cfg, &cfg, &hold_games, TUNE_N, TUNE_DRAWS, "projected").await;
     hold["season"] = json!(hold_season);
     let s_imp: Vec<String> = search["gate"]["improves"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
     let h_imp: Vec<String> = hold["gate"]["improves"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
@@ -469,6 +478,7 @@ pub async fn status(state: web::Data<State>, q: web::Query<PauseQuery>, req: act
             "tune": format!("one proposal per engine per day, {:02}:00–{:02}:00 UTC; search season + holdout of the latest {TUNE_GAMES} games, {TUNE_N} sims x {TUNE_DRAWS} draws", TUNE_WINDOW_UTC.start, TUNE_WINDOW_UTC.end),
             "promote": "a shadow is promoted after enough paired live games with no market worse by 2 SE; the old champion stays as a shadow and is restored if the new one falls 2 SE behind",
             "picks": "AI Picks every 20 min per sport: ESPN lines each run, The Odds API at most every 6 h and SportsGameOdds every 4 h within daily budgets; reprice from the champions' frozen forecasts; settle finished games every tick",
+            "nba_impact": "NBA player impact ratings (ridge adjusted plus-minus) fitted as of the first of each in-season month; checked every 6 h",
             "evidence": "when a champion's engine code has no backtest evidence, re-run five seasons of walk-forward backtests (one engine at a time) so AI Picks grade caps follow the code",
         },
     }))

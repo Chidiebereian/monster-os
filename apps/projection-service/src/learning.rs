@@ -222,15 +222,20 @@ pub(crate) async fn game_outcomes(db: &tokio_postgres::Client, sport: &str, id: 
 
 /// Walk-forward evaluation of one historical game under a configuration.
 pub(crate) async fn evaluate(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, draws: usize, seed: u64) -> Result<Option<GameEval>, String> {
+    evaluate_lineup(state, sport, id, cfg, n, draws, seed, "projected").await
+}
+
+/// As `evaluate`, with the simulators' lineup source ("projected", or "actual" for hindsight lineups).
+pub(crate) async fn evaluate_lineup(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, draws: usize, seed: u64, lineup: &str) -> Result<Option<GameEval>, String> {
     if is_team(sport) {
         let o = outcomes(state, sport, id).await?;
         return crate::team_engine::evaluate(state, base(sport), id, cfg, n, seed, o).await;
     }
     match sport {
-        "nhl" => crate::nhl_game::evaluate(state, id, "projected", cfg, n, draws, seed).await,
-        "nba" => crate::nba_game::evaluate(state, id, "projected", cfg, n, draws, seed).await,
-        "nfl" => crate::nfl_game::evaluate(state, id, "projected", cfg, n, draws, seed).await,
-        "mlb" => crate::mlb::evaluate(state, id, "projected", cfg, n, draws, seed).await,
+        "nhl" => crate::nhl_game::evaluate(state, id, lineup, cfg, n, draws, seed).await,
+        "nba" => crate::nba_game::evaluate(state, id, lineup, cfg, n, draws, seed).await,
+        "nfl" => crate::nfl_game::evaluate(state, id, lineup, cfg, n, draws, seed).await,
+        "mlb" => crate::mlb::evaluate(state, id, lineup, cfg, n, draws, seed).await,
         _ => Err(format!("unknown sport {sport}")),
     }
 }
@@ -641,6 +646,8 @@ pub struct EvalQuery {
     #[serde(default = "d_eval_games")] games: usize,
     #[serde(default = "d_eval_n")] n: usize,
     #[serde(default = "d_eval_draws")] draws: usize,
+    /// simulators' lineup source: projected (default, what the tuner uses) or actual (hindsight)
+    lineup: Option<String>,
 }
 fn d_eval_games() -> usize { 300 }
 fn d_eval_n() -> usize { 2000 }
@@ -667,7 +674,9 @@ pub async fn evaluate_candidate(state: web::Data<State>, path: web::Path<String>
     let season = q.season.unwrap_or(match base(&sport) { "nhl" => 20252026, "nba" => 2026, _ => 2025 });
     let picked = match eval_games(&state, &sport, season, q.games).await { Ok(p) => p, Err(e) => return internal(e) };
     if picked.is_empty() { return unprocessable("no completed games to evaluate on"); }
-    let mut report = paired_eval(&state, &sport, &champ_cfg, &cand_cfg.0, &picked, q.n, q.draws).await;
+    let lineup = if q.lineup.as_deref() == Some("actual") { "actual" } else { "projected" };
+    let mut report = paired_eval(&state, &sport, &champ_cfg, &cand_cfg.0, &picked, q.n, q.draws, lineup).await;
+    report["lineup"] = json!(lineup);
     report["candidate"] = json!(q.version);
     report["champion"] = json!(champ);
     report["season"] = json!(season);
@@ -680,15 +689,15 @@ pub async fn evaluate_candidate(state: web::Data<State>, path: web::Path<String>
 /// Champion and candidate simulate the same games with the same seeds; the
 /// report has per-market paired Brier differences (candidate − champion) and
 /// the promotion gate.
-pub(crate) async fn paired_eval(state: &State, sport: &str, champ_cfg: &Value, cand_cfg: &Value, games: &[String], n: usize, draws: usize) -> Value {
+pub(crate) async fn paired_eval(state: &State, sport: &str, champ_cfg: &Value, cand_cfg: &Value, games: &[String], n: usize, draws: usize, lineup: &str) -> Value {
     let t0 = std::time::Instant::now();
     let (mut sc_champ, mut sc_cand) = (Scorecard::default(), Scorecard::default());
     let mut paired: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     let mut used = 0;
     for gid in games {
         let seed = fnv(&["eval", sport, gid]);
-        let a = match evaluate(state, sport, gid, champ_cfg, n, draws, seed).await { Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { eprintln!("eval {gid}: {e}"); continue } };
-        let b = match evaluate(state, sport, gid, cand_cfg, n, draws, seed).await { Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { eprintln!("eval {gid}: {e}"); continue } };
+        let a = match evaluate_lineup(state, sport, gid, champ_cfg, n, draws, seed, lineup).await { Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { eprintln!("eval {gid}: {e}"); continue } };
+        let b = match evaluate_lineup(state, sport, gid, cand_cfg, n, draws, seed, lineup).await { Ok(Some(e)) => e, Ok(None) => continue, Err(e) => { eprintln!("eval {gid}: {e}"); continue } };
         used += 1;
         sc_champ.add_all(&a.forecasts, &a.outcomes);
         sc_cand.add_all(&b.forecasts, &b.outcomes);

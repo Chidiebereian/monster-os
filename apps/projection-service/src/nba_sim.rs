@@ -116,6 +116,10 @@ pub struct Team {
     pub dreb: f64,
     /// offensive rebounding odds multiplier
     pub oreb: f64,
+    /// schedule (rest, back-to-backs, time zones): odds multipliers on this
+    /// team's own shooting and on the shooting it allows; 1 = no effect
+    pub shoot: f64,
+    pub allow: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -343,7 +347,7 @@ impl<'a> G<'a> {
             // field-goal attempt
             let three = self.rng.f64() < u.three.mean;
             let (base, def) = if three { (u.fg3.mean, dt.def_fg3) } else { (u.fg2.mean, dt.def_fg2) };
-            let p_make = adj(base, def * home_mult);
+            let p_make = adj(base, def * home_mult * ot.shoot * dt.allow);
             let made = self.rng.f64() < p_make;
             let value = if three { 3 } else { 2 };
             let chart = if three { &u.shots3 } else { &u.shots2 };
@@ -656,7 +660,7 @@ pub mod tests {
             ast_w: 0.1, oreb_w: 0.05, dreb_w: 0.15, stl_w: 0.03, blk_w: 0.02, shots2: vec![(25.0, 6.0, true), (20.0, 10.0, false)], shots3: vec![(3.0, 5.0, true), (25.0, 27.0, false)],
         };
         let team = |abbr: &str| Team { abbr: abbr.into(), players: (0..10).map(|i| player(i, i < 5)).collect(), pace: 99.0,
-            def_fg2: 1.0, def_fg3: 1.0, def_tov: 1.0, dreb: 1.0, oreb: 1.0 };
+            def_fg2: 1.0, def_fg3: 1.0, def_tov: 1.0, dreb: 1.0, oreb: 1.0, shoot: 1.0, allow: 1.0 };
         GameInput { teams: [team("AWY"), team("HOM")], league: lg, home_edge: 1.0 }
     }
 

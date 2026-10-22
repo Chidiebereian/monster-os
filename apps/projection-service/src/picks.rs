@@ -20,7 +20,10 @@
 //! record is scored on them. Settled picks feed back into pick_evidence, so
 //! grades unlock (or lock) from live results without code changes.
 //!
-//!   POST /picks/run?sport=&force=      lines -> build -> settle
+//!   stake = fractional Kelly on P(model): x1 proven, x0.5 baseline, 0 otherwise,
+//!           and 0 when Pinnacle's own price makes the bet negative (sharp.rs)
+//!
+//!   POST /picks/run?sport=&force=      lines -> build -> stale lines -> settle
 //!   GET  /picks?sport=&kind=&side=&grades=&market=&game=&book=&min_edge=&min_prob=&sort=&q=&include_hidden=&status=
 //!   GET  /picks/{id}
 //!   GET  /picks/record?sport=&days=
@@ -279,6 +282,7 @@ pub(crate) fn stat_label(market: &str) -> &'static str {
 
 fn signed(x: f64) -> String { if x > 0.0 { format!("+{}", fmt_num(x)) } else { fmt_num(x) } }
 fn fmt2(x: f64) -> String { format!("{:.2}", x) }
+fn signed_pct(x: f64) -> String { let p = pct(x); if p > 0.0 { format!("+{p}%") } else { format!("{p}%") } }
 fn fmt_num(x: f64) -> String { if (x - x.round()).abs() < 1e-9 { format!("{}", x.round() as i64) } else { format!("{:.1}", x) } }
 fn odds_str(p: i32) -> String { if p > 0 { format!("+{p}") } else { p.to_string() } }
 
@@ -432,12 +436,29 @@ pub(crate) fn template(f: &Value) -> String {
         };
         let parts: Vec<String> = [form(&home, "home_form"), form(&away, "away_form")].into_iter().flatten().collect();
         if !parts.is_empty() { out.push(format!("{}.", parts.join("; "))); }
+        for (side, team) in [("home", &home), ("away", &away)] {
+            let mut why = Vec::new();
+            if n(&format!("{side}_rest_days")) == Some(1.0) { why.push("is on the second night of a back-to-back".to_string()); }
+            if let Some(tz) = n(&format!("{side}_tz_shift")) { if tz.abs() >= 1.0 {
+                why.push(format!("crossed {} time zone{} {}", fmt_num(tz.abs()), if tz.abs() > 1.0 { "s" } else { "" }, if tz > 0.0 { "east" } else { "west" })); } }
+            if n(&format!("{side}_rest_days")).map(|r| r >= 3.0).unwrap_or(false) { why.push(format!("has had {} days off", fmt_num(n(&format!("{side}_rest_days")).unwrap_or(0.0)))); }
+            let sm = n(&format!("{side}_schedule_margin")).unwrap_or(0.0);
+            if !why.is_empty() && sm.abs() >= 0.1 {
+                out.push(format!("{team} {}, worth {} points of margin in the simulation.", why.join(" and "), signed(sm)));
+            }
+            if let Some(g) = n(&format!("{side}_lineup_gap")) {
+                out.push(format!("{team}'s expected lineup rates {} points {} its last ten games on player impact.", fmt_num(g.abs()), if g > 0.0 { "better than" } else { "worse than" }));
+            }
+        }
     }
     if let (Some(raw), Some(pm)) = (n("p_raw"), n("p_model")) {
         if (pct(raw) - pct(pm)).abs() >= 0.1 {
             out.push(format!("Those probabilities are blended: on its own the {} says {}%, and weighted against the market (trust weight {}, {}) that becomes {}%.",
                 s("engine_label"), pct(raw), fmt2(n("w_market").unwrap_or(0.0)), s("blend_text"), pct(pm)));
         }
+    }
+    if let (Some(ps), Some(sev)) = (n("p_sharp"), n("sharp_ev")) {
+        out.push(format!("Sharp check: {} prices this side at {}%, so this price is worth {} per unit without the model.", s("sharp_text"), pct(ps), signed_pct(sev)));
     }
     if let (Some(ol), Some(l)) = (n("open_line"), n("line")) {
         if (ol - l).abs() > 1e-9 { out.push(format!("The line has moved from {} at open to {}.", fmt_num(ol), fmt_num(l))); }
@@ -531,6 +552,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let max_edge = lines::setting(db, "max_edge", 0.25).await;
     // market weight used until one is fitted (blend.rs)
     let default_w = lines::setting(db, "blend_default_w", 0.2).await;
+    let (kelly_f, kelly_cap) = crate::sharp::stake_settings(db).await;
+    let min_books = lines::setting(db, "stale_consensus_books", 4.0).await as usize;
     let champs = champions(db).await?;
     let ev = evidence(db, &champs).await?;
     // latest quote per book x selection (any provider; the freshest wins)
@@ -708,6 +731,24 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         if let Some(a) = c.priced.p_active { f.insert("p_active".into(), json!(r3(a))); }
         if let Some(evd) = &c.evd { f.insert("evidence".into(), json!({ "source": evd.source, "comparison": evd.comparison, "n": evd.n, "seasons": evd.seasons, "better": evd.better, "worse": evd.worse, "engine_version": evd.detail["engine_version"] })); }
         let mut flags: Vec<Value> = Vec::new();
+        // the sharp check: what Pinnacle (or the other books' consensus) makes of this exact price
+        let refs: Vec<crate::sharp::Ref> = quotes.get(&(c.key.clone(), c.side.clone())).map(|qs| qs.iter().filter(|q| q.a_line == c.q.a_line)
+            .map(|q| (q.book.as_str(), q.a_price, q.b_price, q.observed)).collect()).unwrap_or_default();
+        let mut stake = crate::sharp::kelly(pm, c.q.a_price, kelly_f, kelly_cap) * crate::sharp::tier_stake_mult(c.tier);
+        if let Some((ps, src, nb)) = crate::sharp::fair(&refs, &c.q.book, c.q.observed, min_books) {
+            let sev = ps * decimal(c.q.a_price) - 1.0;
+            f.insert("p_sharp".into(), json!(r3(ps)));
+            f.insert("sharp_ev".into(), json!(r3(sev)));
+            f.insert("sharp_source".into(), json!(src));
+            f.insert("sharp_text".into(), json!(crate::sharp::source_text(src, nb)));
+            if sev < 0.0 {
+                flags.push(json!({ "code": "against_sharp", "text": format!("{} prices this side at {}%, which makes {} a losing bet without the model",
+                    crate::sharp::source_text(src, nb), pct(ps), odds_str(c.q.a_price)) }));
+                // Pinnacle is the best-measured price there is: no stake against it
+                if src == "pinnacle" { stake = 0.0; }
+            }
+        }
+        f.insert("stake".into(), json!((stake * 10000.0).round() / 10000.0));
         if kind == "prop" {
             if let (Some(h), Some(line)) = (hist.get(&c.key.2), c.q.a_line) {
                 let stat: &str = &c.key.1;
@@ -730,6 +771,19 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             }
             if let Some(a) = c.priced.p_active { if a < 0.9 { flags.push(json!({ "code": "may_not_play", "text": format!("plays in {}% of simulations (props void if inactive)", pct(a)) })); } }
         } else {
+            // NBA simulator inputs: schedule and lineup impact per team (forecasts frozen by the engine that has them)
+            for tm in l.payload["inputs"]["teams"].as_array().into_iter().flatten() {
+                let Some(abbr) = tm["abbr"].as_str() else { continue };
+                let side = if abbr == home { "home" } else if abbr == away { "away" } else { continue };
+                let s = &tm["schedule"];
+                let used = s["own_points"].as_f64().map(|x| x.abs() > 1e-9).unwrap_or(false) || s["opponent_points"].as_f64().map(|x| x.abs() > 1e-9).unwrap_or(false);
+                if used {
+                    f.insert(format!("{side}_rest_days"), s["rest_days"].clone());
+                    f.insert(format!("{side}_tz_shift"), s["tz_shift"].clone());
+                    f.insert(format!("{side}_schedule_margin"), json!(r1(s["own_points"].as_f64().unwrap_or(0.0) - s["opponent_points"].as_f64().unwrap_or(0.0))));
+                }
+                if let Some(g) = tm["lineup_impact"]["gap"].as_f64() { if g.abs() >= 0.5 { f.insert(format!("{side}_lineup_gap"), json!(r1(g))); } }
+            }
             for (k, t) in [("home_form", &home), ("away_form", &away)] {
                 if let Some(v) = form.get(t) {
                     let w = v.iter().filter(|(a, b)| a > b).count();
@@ -758,12 +812,12 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         let head = c.q.provider_subject.as_ref().and_then(|p| heads.get(p).cloned());
         let n = db.execute("INSERT INTO ai_picks (sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
               line, book, price, link, p_model, p_market, edge, ev, projection, grade, tier, facts, risk_flags, writeup, writeup_source, \
-              latest_line, latest_price, latest_book, latest_p_market, latest_edge) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$17,$19,$18,$22,$23) \
+              latest_line, latest_price, latest_book, latest_p_market, latest_edge, stake) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$17,$19,$18,$22,$23,$32) \
             ON CONFLICT (sport, game_id, market, subject, side, engine) DO NOTHING",
             &[&sport, &c.engine, &c.version, &c.ledger_id, &c.key.0, &format!("{away} @ {home}"), &home, &away, &start, &kind, &c.key.1, &c.key.2,
               &subject_name, &subject_team, &head, &c.side, &c.q.a_line, &c.q.book, &c.q.a_price, &c.q.a_link, &pm, &c.p_market, &c.edge, &c.ev,
-              &c.priced.projection, &grade, &c.tier, &facts, &Value::Array(flags), &writeup, &wsrc]).await.map_err(|e| dberr(&e))?;
+              &c.priced.projection, &grade, &c.tier, &facts, &Value::Array(flags), &writeup, &wsrc, &stake]).await.map_err(|e| dberr(&e))?;
         published += n;
         let _ = &label;
     }
@@ -962,9 +1016,11 @@ async fn refresh_evidence(db: &tokio_postgres::Client, sport: &str) -> Result<u6
 pub(crate) async fn run(state: &State, sport: &str, force: bool) -> Value {
     let l = lines::refresh(state, sport, force).await;
     let b = match build(state, sport).await { Ok(v) => v, Err(e) => json!({ "error": e }) };
+    let e = match crate::sharp::scan(state, sport).await { Ok(v) => v, Err(e) => json!({ "error": e }) };
     let s = match settle(state, sport).await { Ok(v) => v, Err(e) => json!({ "error": e }) };
-    let ok = l["ok"].as_bool().unwrap_or(false) && b.get("error").is_none() && s.get("error").is_none();
-    json!({ "ok": ok, "sport": sport, "lines": l, "build": b, "settle": s })
+    let es = match crate::sharp::settle(state, sport).await { Ok(v) => v, Err(e) => json!({ "error": e }) };
+    let ok = l["ok"].as_bool().unwrap_or(false) && [&b, &e, &s, &es].iter().all(|v| v.get("error").is_none());
+    json!({ "ok": ok, "sport": sport, "lines": l, "build": b, "stale_lines": e, "settle": s, "stale_settle": es })
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +1046,7 @@ pub struct ListQ {
 
 const PICK_COLS: &str = "id, sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
     line, book, price, link, p_model, p_market, edge, ev, projection, grade, tier, risk_flags, writeup, writeup_source, published_at, latest_line, latest_price, latest_book, \
-    latest_p_market, latest_edge, updated_at, status, close_line, close_price, clv, actual, result, profit, settled_at";
+    latest_p_market, latest_edge, updated_at, status, close_line, close_price, clv, actual, result, profit, settled_at, stake";
 
 fn pick_json(r: &tokio_postgres::Row, full: bool) -> Value {
     let (market, side, line, home, away): (String, String, Option<f64>, Option<String>, Option<String>) = (r.get("market"), r.get("side"), r.get("line"), r.get("home"), r.get("away"));
@@ -1011,7 +1067,7 @@ fn pick_json(r: &tokio_postgres::Row, full: bool) -> Value {
         "latest": { "line": r.get::<_, Option<f64>>("latest_line"), "price": r.get::<_, Option<i32>>("latest_price"), "book": r.get::<_, Option<String>>("latest_book"),
             "p_market": r.get::<_, Option<f64>>("latest_p_market").map(r3), "edge": r.get::<_, Option<f64>>("latest_edge").map(r3), "updated_at": r.get::<_, DateTime<Utc>>("updated_at") },
         "status": r.get::<_, String>("status"), "result": r.get::<_, Option<String>>("result"), "actual": r.get::<_, Option<f64>>("actual"),
-        "profit": r.get::<_, Option<f64>>("profit").map(r3), "clv": r.get::<_, Option<f64>>("clv").map(r3),
+        "profit": r.get::<_, Option<f64>>("profit").map(r3), "clv": r.get::<_, Option<f64>>("clv").map(r3), "stake": r.get::<_, Option<f64>>("stake"),
         "close": { "line": r.get::<_, Option<f64>>("close_line"), "price": r.get::<_, Option<i32>>("close_price") }, "settled_at": r.get::<_, Option<DateTime<Utc>>>("settled_at"),
     });
     let _ = full;
@@ -1088,7 +1144,8 @@ pub async fn record(state: web::Data<State>, q: web::Query<RecordQ>) -> impl Res
     let rows = match state.db.query(
         "SELECT sport, kind, market, tier, grade, count(*) FILTER (WHERE result IN ('win','loss','push')), count(*) FILTER (WHERE result='win'), count(*) FILTER (WHERE result='loss'), \
            COALESCE(sum(profit) FILTER (WHERE result IN ('win','loss','push')),0), avg(clv), count(clv), \
-           avg(power(p_model - (result='win')::int, 2) - power(p_market - (result='win')::int, 2)) FILTER (WHERE result IN ('win','loss')) \
+           avg(power(p_model - (result='win')::int, 2) - power(p_market - (result='win')::int, 2)) FILTER (WHERE result IN ('win','loss')), \
+           sum(stake * profit) FILTER (WHERE result IN ('win','loss','push')), sum(stake) FILTER (WHERE result IN ('win','loss','push')) \
          FROM ai_picks WHERE status IN ('settled','void') AND settled_at > now() - make_interval(days => $1) AND ($2::text IS NULL OR sport=$2) \
          GROUP BY ROLLUP (sport, kind, market, tier, grade) ORDER BY 1,2,3,4,5", &[&days, &sport]).await {
         Ok(r) => r, Err(e) => return internal(dberr(&e)),
@@ -1098,7 +1155,8 @@ pub async fn record(state: web::Data<State>, q: web::Query<RecordQ>) -> impl Res
         json!({ "sport": r.get::<_, Option<String>>(0), "kind": r.get::<_, Option<String>>(1), "market": r.get::<_, Option<String>>(2), "tier": r.get::<_, Option<String>>(3),
             "grade": r.get::<_, Option<String>>(4), "graded": n, "wins": w, "losses": l, "pushes": n - w - l, "units": r3(profit),
             "roi": if n > 0 { json!(r3(profit / n as f64)) } else { Value::Null }, "win_rate": if w + l > 0 { json!(r3(w as f64 / (w + l) as f64)) } else { Value::Null },
-            "clv_mean": r.get::<_, Option<f64>>(9).map(r3), "clv_n": r.get::<_, i64>(10), "brier_vs_market": r.get::<_, Option<f64>>(11).map(|x| (x * 10000.0).round() / 10000.0) })
+            "clv_mean": r.get::<_, Option<f64>>(9).map(r3), "clv_n": r.get::<_, i64>(10), "brier_vs_market": r.get::<_, Option<f64>>(11).map(|x| (x * 10000.0).round() / 10000.0),
+            "kelly_roi": match (r.get::<_, Option<f64>>(12), r.get::<_, Option<f64>>(13)) { (Some(a), Some(b)) if b > 0.0 => json!(r3(a / b)), _ => Value::Null } })
     }).collect();
     let ev = state.db.query("SELECT engine, market, source, comparison, n, seasons, better, worse, metric, se, detail, updated_at FROM pick_evidence ORDER BY engine, market, source", &[]).await;
     let evidence: Vec<Value> = ev.map(|rows| rows.iter().map(|r| json!({ "engine": r.get::<_, String>(0), "market": r.get::<_, String>(1), "source": r.get::<_, String>(2),
@@ -1263,6 +1321,16 @@ mod tests {
         assert_eq!(result_of("spread", "away", Some(3.5), 3.0), "win");
         assert_eq!(result_of("total", "under", Some(220.5), 221.0), "loss");
         assert_eq!(result_of("pts", "over", Some(24.5), 25.0), "win");
+    }
+
+    #[test]
+    fn game_writeup_names_schedule_and_lineup() {
+        let f = json!({ "kind": "game", "market": "spread", "side": "home", "line": -4.5, "home_team": "DEN", "away_team": "LAL", "pick_team": "DEN",
+            "engine_label": "possession simulator", "projection": 6.2, "p_model": 0.55, "p_market": 0.52, "edge": 0.03, "book_title": "FanDuel",
+            "away_rest_days": 1, "away_tz_shift": 1, "away_schedule_margin": -3.1, "home_lineup_gap": -1.4, "evidence_text": "" });
+        let t = template(&f);
+        assert!(t.contains("LAL is on the second night of a back-to-back and crossed 1 time zone east, worth -3.1 points of margin"), "{t}");
+        assert!(t.contains("DEN's expected lineup rates 1.4 points worse than its last ten games"), "{t}");
     }
 
     #[test]

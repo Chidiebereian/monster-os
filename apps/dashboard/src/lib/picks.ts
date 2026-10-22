@@ -15,6 +15,8 @@ export interface Pick {
   latest: { line: number | null; price: number | null; book: string | null; p_market: number | null; edge: number | null; updated_at: string } | null;
   status: "open" | "started" | "settled" | "void"; result: "win" | "loss" | "push" | "void" | null; actual: number | null;
   profit: number | null; clv: number | null; close: { line: number | null; price: number | null }; settled_at: string | null;
+  /** suggested stake, fraction of bankroll (fractional Kelly scaled by track record); null on picks published before stakes */
+  stake: number | null;
 }
 
 export interface PickFacts {
@@ -23,6 +25,8 @@ export interface PickFacts {
   l5_minutes?: number; proj_minutes?: number; open_line?: number | null; evidence_text?: string;
   /** engine's own probability before blending; naive baseline (props); blend weights (0 = anchor, 1 = raw model) */
   p_raw?: number; p_naive?: number | null; w_market?: number; w_naive?: number | null; blend_source?: string; blend_text?: string;
+  /** the sharp check: Pinnacle (or the other books' consensus) de-vigged, and this price's EV against it */
+  p_sharp?: number; sharp_ev?: number; sharp_source?: string; sharp_text?: string; stake?: number;
   game_log?: { opp: string; value: number | null }[];
   home_form?: { games: number; w: number; l: number; pf: number; pa: number };
   away_form?: { games: number; w: number; l: number; pf: number; pa: number };
@@ -49,13 +53,32 @@ export interface PickMeta {
 export interface RecordRow {
   sport: string | null; kind: string | null; market: string | null; tier: string | null; grade: string | null;
   graded: number; wins: number; losses: number; pushes: number; units: number; roi: number | null; win_rate: number | null;
-  clv_mean: number | null; clv_n: number; brier_vs_market: number | null;
+  clv_mean: number | null; clv_n: number; brier_vs_market: number | null; kelly_roi: number | null;
 }
 export interface EvidenceRow {
   engine: string; market: string; source: string; comparison: string; n: number; seasons: number; better: number; worse: number;
   metric: number | null; se: number | null; detail: Record<string, unknown>; updated_at: string;
 }
 export interface PickRecord { days: number; rows: RecordRow[]; evidence: EvidenceRow[]; tiers: { engine: string; market: string; tier: Tier; cap: string }[] }
+
+/** A stale line: a book's price that beats the sharp fair price (no model involved). */
+export interface Edge {
+  id: number; sport: string; game_id: string; game_label: string; home: string | null; away: string | null; starts_at: string | null;
+  kind: "prop" | "game"; market: string; market_label: string; subject: string; subject_name: string; side: string; label: string; line: number | null;
+  book: string; book_title: string; price: number; link: string | null; fair_source: "pinnacle" | "consensus"; fair_books: number; fair_text: string;
+  p_fair: number; p_book: number; ev: number; stake: number; observed_at: string; published_at: string;
+  latest: { price: number | null; ev: number | null; updated_at: string };
+  status: "open" | "started" | "settled" | "void"; close_p_fair: number | null; close_ev: number | null;
+  actual: number | null; result: "win" | "loss" | "push" | "void" | null; profit: number | null; settled_at: string | null;
+}
+export interface EdgeRecord {
+  fair_source: string | null; graded: number; wins: number; losses: number; pushes: number; units: number; roi: number | null;
+  kelly_roi: number | null; close_ev_mean: number | null; close_ev_n: number; ev_mean: number | null;
+}
+export interface EdgesResponse {
+  count: number; edges: Edge[]; record: EdgeRecord[]; days: number;
+  settings: { min_ev: number; max_ev: number; consensus_books: number; kelly_fraction: number; kelly_cap: number };
+}
 
 export interface PickFilters {
   sport?: string; kind?: string; side?: string; grades?: string; market?: string; game?: string; book?: string;
@@ -81,8 +104,14 @@ export const picksApi = {
   get: (id: number) => req<PickDetail>(`/picks/${id}`),
   meta: (sport?: string) => req<PickMeta>(`/picks/meta?${qs({ sport })}`),
   record: (sport?: string, days = 90) => req<PickRecord>(`/picks/record?${qs({ sport, days })}`),
+  edges: (sport?: string, status = "open", days = 90) => req<EdgesResponse>(`/picks/edges?${qs({ sport, status, days })}`),
   run: (sport?: string, force = false) => req<{ runs: unknown[] }>(`/picks/run?${qs({ sport, force })}`, { method: "POST" }),
 };
+
+/** The bankroll stakes are shown against (per browser). */
+export const BANKROLL_KEY = "aiPicks.bankroll";
+export const readBankroll = () => { try { const v = Number(localStorage.getItem(BANKROLL_KEY)); return v > 0 ? v : 1000; } catch { return 1000; } };
+export const money = (x: number) => `$${x >= 100 ? Math.round(x).toLocaleString() : x.toFixed(2)}`;
 
 export const GRADES = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
 

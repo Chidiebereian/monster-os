@@ -187,6 +187,12 @@ crate::learning::tuning!(Tuning {
     deep_bench_minutes: 12.0, 0.0, 48.0, "garbage-time minutes shared by all players outside the rotation (in proportion to their own projections)";
     rotation_scale: 1.0, 0.0, 1.0, "1 = scale the rotation's projected minutes to the 240 available; 0 = leave the cut to the simulator (heaviest first)";
     preseason_only_cap: 18.0, 4.0, 30.0, "projected-minutes cap for players whose only history is preseason (rookies, camp invites)";
+    b2b_pts: 2.4, 0.0, 6.0, "points of margin a team loses on the second night of a back-to-back";
+    tz_east_pts: 0.7, 0.0, 2.0, "points of margin lost per time zone crossed eastward since the previous game";
+    tz_west_pts: 0.3, 0.0, 2.0, "points of margin lost per time zone crossed westward since the previous game";
+    rest_total_pts: 0.9, -2.0, 3.0, "points added to the game total per team with three or more days off";
+    schedule_scale: 0.0, 0.0, 1.0, "1 = apply the schedule effects above; 0 = ignore the schedule";
+    impact_weight: 0.0, 0.0, 1.5, "share of the lineup gap (player impact ratings, tonight vs the team's last ten games) added to the margin; 0 = off";
 });
 
 /// ESPN injury designations -> probability of playing. Not fitted (no stored
@@ -219,6 +225,59 @@ pub struct Built {
 
 fn shrink(x: f64, n: f64, lg: f64, k: f64) -> Rate { Rate { mean: (x + k * lg) / (n + k), n: n + k } }
 
+/// Arena time zone (standard-time UTC offset), by home team. A game's venue is
+/// its home team's arena (neutral-site games are rare enough to ignore).
+fn arena_tz(team: &str) -> Option<i32> {
+    Some(match team {
+        "ATL" | "BOS" | "BKN" | "CHA" | "CLE" | "DET" | "IND" | "MIA" | "NY" | "ORL" | "PHI" | "TOR" | "WSH" => -5,
+        "CHI" | "DAL" | "HOU" | "MEM" | "MIL" | "MIN" | "NO" | "OKC" | "SA" => -6,
+        "DEN" | "PHX" | "UTAH" => -7,
+        "GS" | "LAC" | "LAL" | "POR" | "SAC" => -8,
+        _ => return None,
+    })
+}
+
+/// A team's schedule going into a game: days since its previous game (same
+/// season, regular season or playoffs; 5 when it is the first) and the time
+/// zones crossed to get here (positive = travelled east).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Schedule { pub rest_days: i64, pub tz_shift: i32 }
+
+async fn schedule(db: &tokio_postgres::Client, team: &str, g: &GameRef) -> Result<Schedule, String> {
+    let prev = db.query_opt("SELECT game_date, home FROM nba_games_espn WHERE (home=$1 OR away=$1) AND season=$2 AND season_type IN (2,3) AND game_date < $3 \
+        ORDER BY game_date DESC LIMIT 1", &[&team, &g.season, &g.date]).await.map_err(|e| dberr(&e))?;
+    Ok(match prev {
+        Some(r) => {
+            let (d, venue): (NaiveDate, String) = (r.get(0), r.get(1));
+            let tz = match (arena_tz(&g.home), arena_tz(&venue)) { (Some(a), Some(b)) => a - b, _ => 0 };
+            Schedule { rest_days: (g.date - d).num_days(), tz_shift: tz }
+        }
+        None => Schedule { rest_days: 5, tz_shift: 0 },
+    })
+}
+
+/// Points a schedule adds to the team's own scoring and to its opponent's
+/// (measured on 6,153 regular-season games 2022-2026 with team-season strength
+/// held fixed: a back-to-back costs 2.4 points of margin, each time zone
+/// crossed eastward 0.7 and westward 0.3; three or more days off add 0.9 to
+/// the total). Margin effects are split evenly between offence and defence.
+pub(crate) fn schedule_points(s: &Schedule, t: &Tuning) -> (f64, f64) {
+    let mut margin = 0.0;
+    if s.rest_days == 1 { margin -= t.b2b_pts; }
+    margin -= if s.tz_shift > 0 { t.tz_east_pts * s.tz_shift as f64 } else { t.tz_west_pts * (-s.tz_shift) as f64 };
+    let total = if s.rest_days >= 3 { t.rest_total_pts } else { 0.0 };
+    let (own, opp) = (margin / 2.0 + total / 2.0, -margin / 2.0 + total / 2.0);
+    (own * t.schedule_scale, opp * t.schedule_scale)
+}
+
+/// Points per unit of log shooting odds for one team-game: turns a points
+/// effect into the odds multiplier the simulator applies to made shots.
+fn points_per_logodds(lg: &League, pace: f64) -> f64 {
+    let shots = pace * (1.0 - lg.tov_share - lg.trip_share).max(0.4) * (1.0 + lg.oreb_pct * 0.5);
+    let var = lg.three_share * lg.fg3 * (1.0 - lg.fg3) * 3.0 + (1.0 - lg.three_share) * lg.fg2 * (1.0 - lg.fg2) * 2.0;
+    (shots * var).max(10.0)
+}
+
 pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, String> {
     let db = &state.db;
     let params_season = if g.season_type == 3 { g.season } else { g.season - 1 };
@@ -236,6 +295,10 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
     let mut team_inputs = Vec::new();
     let mut team_meta = Vec::new();
     let mut flags: Vec<String> = Vec::new();
+    // player impact ratings in force before this game (nba_impact.rs)
+    // only when availability is known (confirmed: the injury report; actual: hindsight). A
+    // projected lineup is "whoever played lately", so its gap would be noise.
+    let (impact, impact_asof) = if opts.tune.impact_weight > 0.0 && opts.mode != LineupMode::Projected { crate::nba_impact::load(db, g.date).await? } else { (HashMap::new(), None) };
     for (ti, abbr) in teams.iter().enumerate() {
         // team's recent completed games
         let tg: Vec<(String, NaiveDate, i32)> = db.query(
@@ -435,9 +498,37 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
         let def_tov = ratio(opp.tov, opp.usage(), league.tov_share, opts.tune.def_prior);
         let dreb = ratio(own.dreb, own.dreb + opp.oreb, 1.0 - league.oreb_pct, opts.tune.reb_prior);
         let oreb = ratio(own.oreb, own.oreb + opp.dreb, league.oreb_pct, opts.tune.reb_prior);
+        let sched = schedule(db, abbr, g).await?;
+        let (mut own_pts, mut opp_pts) = schedule_points(&sched, &opts.tune);
+        // lineup impact: tonight's expected minutes against the team's normal
+        // (its last ten games), both at the players' ratings; the minutes of
+        // anyone missing go to whoever plays, so the gap is who, not how many
+        let lineup_gap = if impact.is_empty() { None } else {
+            let mut normal_min: HashMap<String, f64> = HashMap::new();
+            let n10 = tg.len().min(10) as f64;
+            for r in &rows {
+                let (gid, team, pid): (String, String, String) = (r.get(0), r.get(1), r.get(2));
+                if &team != abbr || gi[gid.as_str()] >= 10 { continue; }
+                *normal_min.entry(pid).or_default() += tot_from(r, 7).min / n10;
+            }
+            let normal: f64 = normal_min.iter().map(|(p, m)| impact.get(p).copied().unwrap_or(0.0) * m / 48.0).sum();
+            let exp: Vec<(f64, f64)> = players.iter().map(|p| (impact.get(&p.id).copied().unwrap_or(0.0), p.min_mean * p.p_active)).collect();
+            let mins: f64 = exp.iter().map(|x| x.1).sum();
+            let tonight = exp.iter().map(|(r, m)| r * m / 48.0).sum::<f64>() * 240.0 / mins.max(1.0);
+            Some((tonight - normal, tonight, normal))
+        };
+        if let Some((gap, _, _)) = lineup_gap {
+            own_pts += opts.tune.impact_weight * gap / 2.0;
+            opp_pts -= opts.tune.impact_weight * gap / 2.0;
+        }
+        let k = points_per_logodds(&league, pace);
+        let (shoot, allow) = ((own_pts / k).exp(), (opp_pts / k).exp());
         team_meta.push(json!({
             "abbr": abbr, "recent_games": tg.len(), "pace": r3(pace), "def_fg2": r3(def_fg2), "def_fg3": r3(def_fg3), "def_tov": r3(def_tov),
             "dreb": r3(dreb), "oreb": r3(oreb), "players": pmeta,
+            "schedule": { "rest_days": sched.rest_days, "back_to_back": sched.rest_days == 1, "tz_shift": sched.tz_shift,
+                "own_points": r3(own_pts), "opponent_points": r3(opp_pts), "shoot": r4(shoot), "allow": r4(allow) },
+            "lineup_impact": lineup_gap.map(|(gap, tonight, normal)| json!({ "gap": r3(gap), "tonight": r3(tonight), "normal": r3(normal), "ratings_asof": impact_asof })),
             "starters": {
                 "projected": if last_was_preseason { players.iter().filter(|p| p.starter).map(|p| p.id.clone()).collect::<Vec<_>>() } else { last_game_starters },
                 "actual": actual.iter().filter(|(_, v)| v.0 && &v.2 == abbr).map(|(k, _)| k.clone()).collect::<Vec<_>>(),
@@ -445,7 +536,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             },
         }));
         let _ = ti;
-        team_inputs.push(sim::Team { abbr: abbr.clone(), players, pace, def_fg2, def_fg3, def_tov, dreb, oreb });
+        team_inputs.push(sim::Team { abbr: abbr.clone(), players, pace, def_fg2, def_fg3, def_tov, dreb, oreb, shoot, allow });
     }
     if opts.mode == LineupMode::Confirmed && g.date < today {
         flags.push("past game: the injury report is only available for upcoming games, so 'confirmed' = projected availability".into());
@@ -458,6 +549,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             "possession model: usage x outcome (turnover / two-shot trip / 2 or 3 FGA) with player x defence odds ratios; no fouls, and-1s or timeouts",
             "rotation: minutes from each player's recent games, greedy 2-minute stints, starters open the 1st and 3rd quarters",
             "injury designations -> play probabilities are documented priors (Out 0, Doubtful 0.15, Questionable 0.5, Day-To-Day 0.6, Probable 0.9), not fitted",
+            "schedule: back-to-backs, time zones crossed and 3+ days off shift each team's shooting by effects measured on 2022-2026 regular seasons (team strength held fixed)",
             "shot locations on the court are drawn from the shooter's real ESPN shot chart (display only)",
         ],
     });
@@ -795,4 +887,23 @@ pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u
     let forecasts = forecasts(&state.db, &gref, &game, &e).await?;
     let start: Option<chrono::DateTime<chrono::Utc>> = state.db.query_opt("SELECT start_time FROM nba_games_espn WHERE espn_id = $1", &[&id]).await.map_err(|e| dberr(&e))?.and_then(|r| r.get(0));
     Ok(Prediction { payload: payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64), forecasts, date: gref.date, start, engine: MODEL_VERSION, n: e.n as usize })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_effects_split_margin_and_total() {
+        let t = Tuning { schedule_scale: 1.0, ..Tuning::default() };
+        // back-to-back after a game one zone west: -2.4 - 0.7 margin, split
+        let (own, opp) = schedule_points(&Schedule { rest_days: 1, tz_shift: 1 }, &t);
+        assert!((own + 1.55).abs() < 1e-9 && (opp - 1.55).abs() < 1e-9, "{own} {opp}");
+        // three days off, no travel: total only
+        let (own, opp) = schedule_points(&Schedule { rest_days: 3, tz_shift: 0 }, &t);
+        assert!((own - 0.45).abs() < 1e-9 && (opp - 0.45).abs() < 1e-9);
+        let off = Tuning { schedule_scale: 0.0, ..Tuning::default() };
+        assert_eq!(schedule_points(&Schedule { rest_days: 1, tz_shift: -3 }, &off), (0.0, 0.0));
+        assert_eq!(arena_tz("UTAH"), Some(-7));
+    }
 }

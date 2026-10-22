@@ -5,8 +5,8 @@ import clsx from "clsx";
 import { ExternalLink, X } from "lucide-react";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import {
-  GRADES, TIER_TEXT, num, odds, pct, picksApi, signedPct, startLabel, teamLogo,
-  type Pick, type PickDetail, type PickFilters, type Tier,
+  BANKROLL_KEY, GRADES, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, startLabel, teamLogo,
+  type Edge, type Pick, type PickDetail, type PickFilters, type Tier,
 } from "../lib/picks";
 
 // AI Picks: the curated feed. Every pick is a live two-way line priced by the
@@ -22,7 +22,7 @@ const SPORTS = [
 const KINDS = [{ key: "all", label: "All" }, { key: "prop", label: "Player Props" }, { key: "game", label: "Game Lines" }];
 const SIDES = [{ key: "all", label: "All" }, { key: "over", label: "Over" }, { key: "under", label: "Under" }];
 const SORTS = [{ key: "grade", label: "Grade" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
-const TABS = [{ key: "picks", label: "Picks" }, { key: "record", label: "Track record" }];
+const TABS = [{ key: "picks", label: "Picks" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }];
 
 const gradeTone = (g: string) =>
   g.startsWith("A") ? "bg-emerald/15 text-emerald-light border-emerald/40" : g.startsWith("B") ? "bg-violet/15 text-violet border-violet/40" : "bg-amber/15 text-amber border-amber/40";
@@ -31,8 +31,10 @@ const tierTone: Record<Tier, string> = {
 };
 
 export function AiPicks() {
-  const [tab, setTab] = useState("picks");
+  const [tab, setTab] = useState(new URLSearchParams(window.location.search).get("tab") ?? "picks");
   const [search, setSearch] = useState("");
+  const [bankroll, setBankroll] = useState(readBankroll);
+  const saveBankroll = (v: number) => { setBankroll(v); try { localStorage.setItem(BANKROLL_KEY, String(v)); } catch { /* private window */ } };
   return (
     <div className="space-y-4">
       <PageTitle
@@ -42,6 +44,11 @@ export function AiPicks() {
           <>
             <Pills options={TABS} value={tab} onChange={setTab} />
             <Link to="/projections" className="text-xs text-gray-400 hover:text-gray-200 px-2">Projections →</Link>
+            <label className="flex items-center gap-1 text-xs text-gray-500" title="Stakes are shown as dollars of this bankroll (stored in this browser only)">
+              Bankroll $
+              <input type="number" min={1} value={bankroll} onChange={(e) => Number(e.target.value) > 0 && saveBankroll(Number(e.target.value))}
+                className="w-20 rounded-md border border-glass bg-surface px-2 py-1 text-xs font-mono outline-none focus:border-violet/50" />
+            </label>
             {tab === "picks" && (
               <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search picks…"
                 className="w-48 rounded-md border border-glass bg-surface px-2.5 py-1 text-xs outline-none focus:border-violet/50" />
@@ -49,7 +56,7 @@ export function AiPicks() {
           </>
         }
       />
-      {tab === "picks" ? <Feed search={search} /> : <Record />}
+      {tab === "picks" ? <Feed search={search} bankroll={bankroll} /> : tab === "edges" ? <StaleLines bankroll={bankroll} /> : <Record />}
     </div>
   );
 }
@@ -64,7 +71,7 @@ function useDebounced<T>(v: T, ms = 300) {
   return d;
 }
 
-function Feed({ search }: { search: string }) {
+function Feed({ search, bankroll }: { search: string; bankroll: number }) {
   const qc = useQueryClient();
   // ?sport=nhl&hidden=1&pick=123 deep-link into the feed
   const url = new URLSearchParams(window.location.search);
@@ -150,9 +157,9 @@ function Feed({ search }: { search: string }) {
         </Msg>
       )}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {picks.data?.picks.map((p) => <PickCard key={p.id} p={p} onOpen={() => setOpen(p.id)} />)}
+        {picks.data?.picks.map((p) => <PickCard key={p.id} p={p} bankroll={bankroll} onOpen={() => setOpen(p.id)} />)}
       </div>
-      {open != null && <PickModal id={open} onClose={() => setOpen(null)} />}
+      {open != null && <PickModal id={open} bankroll={bankroll} onClose={() => setOpen(null)} />}
     </div>
   );
 }
@@ -220,7 +227,14 @@ function ProjChip({ p }: { p: Pick }) {
   return <Chip>Proj {num(p.projection, 2)} <span className="text-gray-500">/ {num(p.line)}</span> <span className={d >= 0 ? "text-emerald-light" : "text-crimson-light"}>({d >= 0 ? "+" : ""}{d.toFixed(2)})</span></Chip>;
 }
 
-function PickCard({ p, onOpen }: { p: Pick; onOpen: () => void }) {
+/** Suggested stake: fraction of bankroll and dollars. */
+function StakeChip({ stake, bankroll }: { stake: number | null; bankroll: number }) {
+  if (stake == null) return null;
+  if (stake <= 0) return <Chip tone="plain"><span className="text-gray-500" title="No stake: the engine has no track record on this market, or Pinnacle's price makes the bet negative">No stake</span></Chip>;
+  return <Chip tone="plain"><span title="Fractional Kelly on the blended probability, scaled by track record">Stake {pct(stake, 1)} · {money(stake * bankroll)}</span></Chip>;
+}
+
+function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: () => void }) {
   const title = p.kind === "prop" ? p.subject_name : p.game_label;
   return (
     <div onClick={onOpen} className="cursor-pointer rounded-xl border border-glass bg-surface/60 p-4 space-y-3 hover:border-violet/40 transition-colors flex flex-col">
@@ -241,6 +255,7 @@ function PickCard({ p, onOpen }: { p: Pick; onOpen: () => void }) {
         <ProjChip p={p} />
         <Chip>Prob {pct(p.p_model)}</Chip>
         <Chip tone="pos">Edge {signedPct(p.edge)}</Chip>
+        <StakeChip stake={p.stake} bankroll={bankroll} />
       </div>
       <p className="text-xs text-gray-400 line-clamp-2 flex-1">{p.writeup}</p>
       <BetButton p={p} />
@@ -262,7 +277,7 @@ function BetButton({ p }: { p: Pick }) {
 // Detail
 // ---------------------------------------------------------------------------
 
-function PickModal({ id, onClose }: { id: number; onClose: () => void }) {
+function PickModal({ id, bankroll, onClose }: { id: number; bankroll: number; onClose: () => void }) {
   const q = useQuery({ queryKey: ["pick", id], queryFn: () => picksApi.get(id) });
   useEffect(() => {
     const k = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -275,13 +290,13 @@ function PickModal({ id, onClose }: { id: number; onClose: () => void }) {
         <button onClick={onClose} className="float-right text-gray-400 hover:text-gray-200" aria-label="Close"><X size={18} /></button>
         {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
         {q.isLoading && <Msg>Loading…</Msg>}
-        {q.data && <Detail p={q.data} />}
+        {q.data && <Detail p={q.data} bankroll={bankroll} />}
       </div>
     </div>
   );
 }
 
-function Detail({ p }: { p: PickDetail }) {
+function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
   const f = p.facts;
   const moved = p.latest && p.latest.line != null && p.line != null && p.latest.line !== p.line;
   return (
@@ -345,6 +360,8 @@ function Detail({ p }: { p: PickDetail }) {
           {p.latest && <Row k="Now" v={<span className={moved ? "text-amber" : ""}>{num(p.latest.line)} at {odds(p.latest.price)} · edge {signedPct(p.latest.edge)}</span>} />}
           {f.open_line != null && <Row k="Opened at" v={num(f.open_line)} />}
           <Row k="Books quoting" v={f.books_quoting ?? 1} />
+          {f.p_sharp != null && <Row k="Sharp check" v={<span className={(f.sharp_ev ?? 0) < 0 ? "text-amber" : "text-emerald-light"}>{f.sharp_text}: {pct(f.p_sharp, 1)} · {signedPct(f.sharp_ev)} per unit at this price</span>} />}
+          {p.stake != null && <Row k="Suggested stake" v={p.stake > 0 ? `${pct(p.stake, 2)} of bankroll · ${money(p.stake * bankroll)}` : "none"} />}
           {p.status !== "open" && <Row k="Result" v={p.result ? `${p.result}${p.actual != null ? ` (actual ${num(p.actual)})` : ""} · ${p.profit != null ? `${p.profit >= 0 ? "+" : ""}${p.profit.toFixed(2)}u` : ""}${p.clv != null ? ` · CLV ${signedPct(p.clv)}` : ""}` : p.status} />}
         </Card>
       </section>
@@ -430,13 +447,13 @@ function Record() {
         <Pills options={[{ key: "30", label: "30d" }, { key: "90", label: "90d" }, { key: "365", label: "1y" }, { key: "3650", label: "All" }]} value={days} onChange={setDays} />
       </div>
       <p className="text-xs text-gray-500 max-w-3xl">
-        Picks are scored at the price they were published at (1 unit each). CLV compares the de-vigged closing price at the same book with the published one; positive means the market moved toward the pick.
+        Picks are scored at the price they were published at (1 unit each); Kelly ROI weights each pick by its suggested stake. CLV compares the de-vigged closing price at the same book with the published one; positive means the market moved toward the pick.
         Brier vs market below zero means the model's probabilities beat the market's on these picks. Grades unlock automatically: an engine-market pair is "proven" after 150+ settled picks that beat the market by more than two standard errors.
       </p>
       {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
       {d && (
         <>
-          <Table head={<tr><Th>Scope</Th><Th>Graded</Th><Th>W-L-P</Th><Th>Win %</Th><Th>Units</Th><Th>ROI</Th><Th>CLV</Th><Th>Brier vs mkt</Th></tr>}>
+          <Table head={<tr><Th>Scope</Th><Th>Graded</Th><Th>W-L-P</Th><Th>Win %</Th><Th>Units</Th><Th>ROI</Th><Th>Kelly ROI</Th><Th>CLV</Th><Th>Brier vs mkt</Th></tr>}>
             {[...top, ...byMarket].map((r, i) => (
               <tr key={i} className="border-t border-glass">
                 <Td className="text-xs">{r.sport ? `${r.sport.toUpperCase()}${r.kind ? ` · ${r.kind}` : ""}${r.market ? ` · ${r.market}` : ""}` : "All picks"}</Td>
@@ -445,6 +462,7 @@ function Record() {
                 <Td className="font-mono">{pct(r.win_rate, 1)}</Td>
                 <Td className={clsx("font-mono", r.units >= 0 ? "text-emerald-light" : "text-crimson-light")}>{r.units >= 0 ? "+" : ""}{r.units.toFixed(2)}</Td>
                 <Td className="font-mono">{signedPct(r.roi)}</Td>
+                <Td className="font-mono">{signedPct(r.kelly_roi)}</Td>
                 <Td className="font-mono">{r.clv_n ? `${signedPct(r.clv_mean)} (${r.clv_n})` : "—"}</Td>
                 <Td className="font-mono">{r.brier_vs_market == null ? "—" : r.brier_vs_market.toFixed(4)}</Td>
               </tr>
@@ -474,5 +492,74 @@ function Record() {
         </>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stale lines
+// ---------------------------------------------------------------------------
+
+function StaleLines({ bankroll }: { bankroll: number }) {
+  const [sport, setSport] = useState("all");
+  const [status, setStatus] = useState("open");
+  const s = sport === "all" ? undefined : sport;
+  const q = useQuery({ queryKey: ["picks-edges", s, status], queryFn: () => picksApi.edges(s, status), refetchInterval: 60_000 });
+  const d = q.data;
+  const all = d?.record.find((r) => r.fair_source == null);
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pills options={SPORTS} value={sport} onChange={setSport} />
+        <Pills options={[{ key: "open", label: "Open" }, { key: "settled", label: "Settled" }]} value={status} onChange={setStatus} />
+      </div>
+      <p className="text-xs text-gray-500 max-w-3xl">
+        No model here. Pinnacle moves first and charges the least vig, so its de-vigged price is the best free estimate of the true odds. A book still offering a price that beats it
+        {d ? ` by ${pct(d.settings.min_ev, 0)} EV or more` : ""} is listed (when Pinnacle does not quote the line, the median of {d ? d.settings.consensus_books : 4}+ other books from the same snapshot stands in, at half stake).
+        Gaps above {d ? pct(d.settings.max_ev, 0) : "12%"} are dropped as mismatched lines. Stale prices get corrected fast: check the price is still there before betting.
+      </p>
+      {all && all.graded > 0 && (
+        <div className="flex flex-wrap gap-2 text-xs">
+          <Chip tone="plain">{all.graded} settled · {all.wins}-{all.losses}-{all.pushes}</Chip>
+          <Chip tone={all.units >= 0 ? "pos" : "neg"}>{all.units >= 0 ? "+" : ""}{all.units.toFixed(2)}u · ROI {signedPct(all.roi)}</Chip>
+          <Chip tone="plain">Kelly ROI {signedPct(all.kelly_roi)}</Chip>
+          <Chip tone="plain">EV at the close {signedPct(all.close_ev_mean)} ({all.close_ev_n})</Chip>
+        </div>
+      )}
+      {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
+      {q.isLoading && <Msg>Loading…</Msg>}
+      {d && d.edges.length === 0 && <Msg>{status === "open" ? "No stale lines right now. They appear when a book lags the sharp price; lines refresh every few hours." : "Nothing settled yet."}</Msg>}
+      {d && d.edges.length > 0 && (
+        <Table head={<tr><Th>Selection</Th><Th>Game</Th><Th>Book</Th><Th>Price</Th><Th>Fair</Th><Th>EV</Th><Th>Stake</Th>{status === "open" ? <><Th>Now</Th><Th>Seen</Th><Th> </Th></> : <><Th>Result</Th><Th>EV at close</Th></>}</tr>}>
+          {d.edges.map((e) => <EdgeRow key={e.id} e={e} bankroll={bankroll} open={status === "open"} />)}
+        </Table>
+      )}
+    </div>
+  );
+}
+
+function EdgeRow({ e, bankroll, open }: { e: Edge; bankroll: number; open: boolean }) {
+  const gone = e.latest.price != null && e.latest.price !== e.price;
+  return (
+    <tr className="border-t border-glass text-sm">
+      <Td><div className="font-medium">{e.kind === "prop" ? e.subject_name : e.label}</div><div className="text-xs text-gray-500">{e.kind === "prop" ? e.label : e.market_label}</div></Td>
+      <Td className="text-xs text-gray-400">{e.away} @ {e.home}<div>{startLabel(e.starts_at)}</div></Td>
+      <Td className="text-xs">{e.book_title}</Td>
+      <Td className="font-mono text-violet">{odds(e.price)}</Td>
+      <Td className="text-xs"><span className="font-mono">{pct(e.p_fair, 1)}</span> <span className="text-gray-500">{e.fair_source === "pinnacle" ? "Pinnacle" : `consensus of ${e.fair_books}`}</span></Td>
+      <Td className="font-mono text-emerald-light">{signedPct(e.ev)}</Td>
+      <Td className="font-mono text-xs">{pct(e.stake, 2)} · {money(e.stake * bankroll)}</Td>
+      {open ? (
+        <>
+          <Td className={clsx("font-mono text-xs", gone && "text-amber")}>{gone ? `${odds(e.latest.price)} (${signedPct(e.latest.ev)})` : "same"}</Td>
+          <Td className="text-xs text-gray-500">{ago(new Date(e.observed_at).getTime())}</Td>
+          <Td>{e.link ? <a href={e.link} target="_blank" rel="noreferrer noopener" className="text-violet text-xs inline-flex items-center gap-1">bet <ExternalLink size={11} /></a> : <span className="text-xs text-gray-600">no link</span>}</Td>
+        </>
+      ) : (
+        <>
+          <Td className={clsx("text-xs", e.result === "win" ? "text-emerald-light" : e.result === "loss" ? "text-crimson-light" : "text-gray-400")}>{e.result ?? e.status}{e.actual != null ? ` (${num(e.actual)})` : ""}</Td>
+          <Td className="font-mono text-xs">{signedPct(e.close_ev)}</Td>
+        </>
+      )}
+    </tr>
   );
 }

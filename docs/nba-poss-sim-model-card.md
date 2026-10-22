@@ -144,10 +144,62 @@ subjects of most props. `nba-poss-sim-v3` was that interim build; it froze one
 evening of forecasts (2026-10-21) before v4 replaced it. The four settings are
 tunable, so the autopilot's tuner can move them.
 
+## Schedule and player impact (2026-10-22)
+
+Both are in the engine as tunable inputs, **off by default**, so the champion
+`nba-poss-sim-v4+default` is unchanged. Each team's points effect becomes an
+odds multiplier on its own made shots (`shoot`) and on the shots it allows
+(`allow`), through points per unit of log shooting odds at the game's pace.
+
+**Schedule** (`schedule_scale`, `b2b_pts`, `tz_east_pts`, `tz_west_pts`,
+`rest_total_pts`). Measured first on 6,153 regular-season games, 2022–2026,
+with team-season strength held fixed:
+
+| Effect | True effect (points) | Missed by the closing line |
+|---|---|---|
+| Second night of a back-to-back (margin) | −2.40 ± 0.41 | −0.11 ± 0.54 |
+| Per time zone crossed east (margin) | −0.72 ± 0.35 | −0.85 ± 0.45 |
+| Per time zone crossed west (margin) | −0.31 ± 0.38 | −0.61 ± 0.48 |
+| 3+ days off (total, per team) | +0.92 ± 0.40 | — |
+| Travel distance per 1,000 km (margin) | +0.08 ± 0.27 | not used |
+
+The market prices back-to-backs fully; eastward travel is the one effect it
+may under-price. Paired walk-forward evaluation, schedule on vs off (same games
+and seeds, projected lineups; Brier diff, negative = better):
+
+| Season | Games | Home win | Notes |
+|---|---|---|---|
+| 2025-26 | 398 | −0.0014 ± 0.0015 | |
+| 2024-25 | 1,031 | −0.0016 ± 0.0009 | |
+| 2023-24 | 1,031 | −0.0000 ± 0.0010 | assists −0.0002 ± 0.0001 (passes the gate) |
+| Pooled | | **−0.0010 ± 0.0006** | no market worse in any season |
+
+`{"schedule_scale": 1}` (`nba-poss-sim-v4+cfg.3ea8f77f`) is a **live shadow**:
+frozen next to the champion on every game and promoted by the autopilot after
+50 paired live games if no market is worse.
+
+**Player impact** (`nba_impact.rs`, `impact_weight`). There is no
+play-by-play, so ratings are game-level adjusted plus-minus: each game's margin
+regressed on every player's minutes share, ridge toward 0, then toward a
+box-score prior (per-36 line and minutes), three seasons, fitted as of the first
+of each month. The lineup gap (tonight's expected minutes vs the team's last
+ten games, at those ratings) explains the closing spread with R² 0.088 (plain
+ridge 0.057), and the line moves about one point per point of gap, but the
+result beyond the line is zero (+0.04 ± 0.19): the market already prices
+lineups. In the simulator it did **not** help, even with hindsight lineups
+(2025-26, 1,031 games paired): weight 1.0 home win −0.0005 ± 0.0013, home cover
++0.0018 ± 0.0014; weight 0.5 home win −0.0008 ± 0.0008, total +0.0012 ± 0.0006.
+Redistributing the available players' own rates already captures it. So
+`impact_weight` stays 0; the ratings are still fitted monthly
+(`GET /nba/impact?date=&team=`), and it only ever applies to confirmed or
+actual lineups (a projected lineup knows nothing about absences).
+
 ## Limitations
 
 * No fouls, foul trouble, end-game fouling, and-1s or timeouts.
 * No lineup positions, and no in-game injuries or blowout rotations.
+* Neutral-site games (international, the NBA Cup final) use the home team's
+  arena for time zones.
 * Shot locations are display only: drawn from the shooter's real chart, but
   make probability is by shot type, not location.
 * Injury-status probabilities are priors.

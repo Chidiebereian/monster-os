@@ -4,9 +4,10 @@ Model-backed plays on player props and game lines, each with a probability, an
 edge, a projection, risk flags and a written thesis. Code:
 `apps/projection-service/src/lines.rs` (market lines), `picks.rs` (pricing,
 grading, writeups, settlement), `blend.rs` (market-anchored blending),
-`evidence.rs` (backtest evidence); page: `apps/dashboard/src/pages/AiPicks.tsx`
-(`/picks`). Tables: migration `0018_ai_picks.sql`; seed evidence `0019`;
-recorded lines `0020_pick_blend.sql`.
+`evidence.rs` (backtest evidence), `sharp.rs` (stale lines and stakes); page:
+`apps/dashboard/src/pages/AiPicks.tsx` (`/picks`). Tables: migration
+`0018_ai_picks.sql`; seed evidence `0019`; recorded lines `0020_pick_blend.sql`;
+stakes and stale lines `0021_market_edges.sql`.
 
 ## Pipeline (every 20 minutes per sport, inside the learning autopilot)
 
@@ -17,7 +18,7 @@ recorded lines `0020_pick_blend.sql`.
    | Provider | What | Cost / budget |
    |---|---|---|
    | ESPN (free) | DraftKings moneyline, spread, total, two-way player props, opening and current prices | every cycle |
-   | The Odds API | every US book's moneyline / spread / total, deep links when provided | 3 credits per call; at most every 6 h per sport; `oddsapi_daily_credits` (default 9). Shares the key pool with the Odds Screen |
+   | The Odds API | moneyline / spread / total from ten named books, **Pinnacle** included (the sharp reference; not in the US region), deep links when provided. `ODDS_API_BOOKMAKERS` overrides the list | 3 credits per call (ten books cost one region); at most every 6 h per sport; `oddsapi_daily_credits` (default 9). Shares the key pool with the Odds Screen |
    | SportsGameOdds | every book's game lines and props, deep links when provided | 1 entity per event; amateur tier = 2,500 a month, 10 requests a minute; at most every 4 h per sport; `sgo_daily_entities` (default 60). A 429 pauses it for the day |
 
    Games are matched by team codes (`canon`) and start time; players by id
@@ -99,6 +100,20 @@ recorded lines `0020_pick_blend.sql`.
    Manual trigger: `POST /picks/evidence/run?engine=nhl`. Where both the simulator and the team
    model price a game line, the one with the better tier decides.
 
+   **Stake.** Every pick carries a suggested stake, a fraction of bankroll:
+   fractional Kelly on the blended probability,
+   `f* = (p·decimal − 1)/(decimal − 1)`, `stake = min(kelly_fraction·f*, kelly_cap)`
+   (defaults 0.25 and 2%), times 1 for a proven engine, 0.5 for baseline and 0
+   for unproven or losing. Only engines that have beaten something get money
+   behind them.
+
+   **Sharp check.** The same price is also judged against Pinnacle de-vigged
+   at the same line (seen within 30 minutes), or, when Pinnacle does not quote
+   it, the median of 4+ other books from the same snapshot. The card shows that
+   probability and the price's EV against it. When the price is a losing bet by
+   that measure, the pick carries an `against_sharp` flag, and against Pinnacle
+   itself the stake is 0.
+
 4. **Explain.** `facts` holds every number the card can cite: projection,
    median and 80% range, model vs market probability, last 10/20 games against
    the line, minutes (NBA), recent team form, line movement, playing
@@ -110,7 +125,7 @@ recorded lines `0020_pick_blend.sql`.
    **discarded** unless every number in it appears in the facts, it keeps to
    3–5 sentences, and it makes no guarantees.
 
-   Risk flags: unproven/losing engine, edge > 15%, projected (not confirmed)
+   Risk flags: priced against the sharp line (`against_sharp`), unproven/losing engine, edge > 15%, projected (not confirmed)
    lineups, playing probability < 90%, single book, price older than 90
    minutes, push chance > 5%, line moved against the side since open, fewer than
    8 recent games.
@@ -122,7 +137,18 @@ recorded lines `0020_pick_blend.sql`.
    scores it, and `blend::refresh_evidence` refits `w_market` and writes the
    `lines` evidence rows. This runs on every settle, with no manual step.
 
-6. **Settle** (`picks::settle`, every tick). At the start a pick becomes
+6. **Stale lines** (`sharp::scan`, after each build). Model-free plays: every
+   book x selection x line whose price beats the sharp fair price (as in the
+   sharp check, the book itself excluded) by at least `stale_min_ev` (2%) EV is
+   published once to `market_edges`, with a stake of quarter Kelly on the fair
+   probability (half that when the fair price is a consensus rather than
+   Pinnacle). EVs above `stale_max_ev` (12%) are dropped as mismatched lines.
+   `latest_price` / `latest_ev` follow the book until the start; after the game
+   it is settled like a pick, and `close_ev` scores the published price against
+   the closing fair price (the CLV of a stale-line bet). Dashboard: the "Stale
+   lines" tab.
+
+7. **Settle** (`picks::settle`, every tick). At the start a pick becomes
    `started`; when final it is settled from the box score (props) or final score
    (game lines) at the **published** price: 1 unit, win = decimal − 1,
    push/void = 0. Props of players who did not play are void. CLV = de-vigged
@@ -139,17 +165,20 @@ The writeup may be regenerated; it is not part of the record.
 ## API
 
 ```
-POST /picks/run?sport=&force=     lines -> build -> settle (force ignores provider spacing, not budgets)
+POST /picks/run?sport=&force=     lines -> build -> stale lines -> settle (force ignores provider spacing, not budgets)
 POST /picks/evidence/run?engine=  regenerate backtest evidence for one engine (minutes)
 GET  /picks?sport=&kind=prop|game&side=over|under&grades=A+,A&market=&game=&book=&min_edge=&min_prob=
            &sort=grade|edge|prob|odds&q=&include_hidden=true&status=open|settled|all
 GET  /picks/{id}                  with facts and every book's current price
-GET  /picks/record?sport=&days=   W-L-P, units, ROI, CLV, Brier vs market by sport/kind/market/tier/grade + evidence + tiers
+GET  /picks/record?sport=&days=   W-L-P, units, ROI, Kelly ROI, CLV, Brier vs market by sport/kind/market/tier/grade + evidence + tiers
+GET  /picks/edges?sport=&status=open|settled|all&days=   stale lines, their record (ROI, Kelly ROI, EV at the close) and settings
 GET  /picks/meta?sport=           filter options, line freshness, provider usage today, hidden count, settings
 ```
 
 Settings live in `learning_settings` under key `picks`:
-`{"min_edge": 0.015, "max_edge": 0.25, "oddsapi_daily_credits": 9, "sgo_daily_entities": 60, "llm_per_cycle": 12, "blend_default_w": 0.2}`.
+`{"min_edge": 0.015, "max_edge": 0.25, "oddsapi_daily_credits": 9, "sgo_daily_entities": 60, "llm_per_cycle": 12, "blend_default_w": 0.2,
+"kelly_fraction": 0.25, "kelly_cap": 0.02, "stale_min_ev": 0.02, "stale_max_ev": 0.12, "stale_consensus_books": 4}`.
+The dashboard's bankroll (for showing stakes in dollars) is stored in the browser only.
 `SPORTSGAMEODDS_API_KEY` may list several comma-separated keys; a key that is
 rate limited (429) falls through to the next. SportsGameOdds requests are limited
 to the 40-hour window (`startsAfter`/`startsBefore`, `limit` = games + 5), since
@@ -169,13 +198,17 @@ The dashboard page accepts `?sport=nhl&hidden=1&pick=<id>` deep links.
   games price moneyline and total only.
 - ESPN's API is unofficial; its DraftKings links are templated, so ESPN-only
   picks show "No link available".
-- Tiers on 2026-10-21 (after the automatic evidence runs): **baseline** (cap B+)
-  for NHL moneyline (simulator and team model) and NFL rushing/receiving
-  yards and receptions props; **losing** for every NBA market (simulator and
-  team model), NFL game lines (both engines), NHL totals (simulator), NHL
-  points / SOG props (and goals / assists by inheritance); **unproven** for
-  NHL saves, NFL passing yards and the NHL team model's totals. So the default
-  feed is small until live results prove more markets; that is intended.
+- Tiers on 2026-10-22 (blend-v1 evidence): **baseline** (cap B+) for NBA
+  points / rebounds / assists / threes props, NFL passing / rushing /
+  receiving yards and receptions props, NHL points / SOG / saves props and
+  moneyline (simulator), and the NHL team model's moneyline and total;
+  **unproven** (cap C+, hidden, no stake) for every NBA and NFL game line (both
+  engines), NHL totals (simulator) and NBA blocks. No market is proven yet:
+  that takes 150+ settled picks or recorded lines that beat the closing line.
+- Stale lines are only as fresh as the slowest feed behind them (Odds API
+  every 6 h, SportsGameOdds every 4 h); books correct stale prices quickly, so
+  a listed price may already be gone. Props have no Pinnacle price, so prop
+  stale lines are judged against the consensus.
 - A pick's tier is fixed when it is published. Picks published before an
   engine's evidence existed keep their "unproven" label; the next slate uses the
   new evidence.

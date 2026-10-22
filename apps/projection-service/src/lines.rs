@@ -381,6 +381,9 @@ fn oddsapi_sport(sport: &str) -> Option<&'static str> {
     match sport { "nba" => Some("basketball_nba"), "nhl" => Some("icehockey_nhl"), "nfl" => Some("americanfootball_nfl"), "mlb" => Some("baseball_mlb"), _ => None }
 }
 
+/// The books requested from The Odds API (ten = one region's credits).
+const ODDSAPI_BOOKS: &str = "pinnacle,draftkings,fanduel,betmgm,betrivers,bovada,betonlineag,lowvig,betus,mybookieag";
+
 fn oddsapi_keys() -> Vec<String> {
     std::env::var("ODDS_API_KEYS").or_else(|_| std::env::var("ODDS_API_KEY")).unwrap_or_default()
         .split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect()
@@ -428,8 +431,11 @@ async fn oddsapi(state: &State, sport: &str, games: &[Upcoming], names: &HashMap
     if keys.is_empty() { return Err("ODDS_API_KEYS not set".into()); }
     let base = std::env::var("ODDS_API_BASE_URL").unwrap_or_else(|_| "https://api.the-odds-api.com/v4".into());
     let url = format!("{base}/sports/{key_sport}/odds");
+    // named books instead of a region: up to 10 cost the same as one region, and
+    // Pinnacle (the sharp reference, sharp.rs) is not in the US region
+    let books = std::env::var("ODDS_API_BOOKMAKERS").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| ODDSAPI_BOOKS.to_string());
     for key in &keys {
-        let r = state.http.get(&url).query(&[("apiKey", key.as_str()), ("regions", "us"), ("markets", "h2h,spreads,totals"), ("oddsFormat", "american"), ("includeLinks", "true")])
+        let r = state.http.get(&url).query(&[("apiKey", key.as_str()), ("bookmakers", books.as_str()), ("markets", "h2h,spreads,totals"), ("oddsFormat", "american"), ("includeLinks", "true")])
             .timeout(std::time::Duration::from_secs(25)).send().await.map_err(|e| format!("Odds API: {}", e.without_url()))?;
         let status = r.status();
         let cost = r.headers().get("x-requests-last").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i32>().ok()).unwrap_or(3);
