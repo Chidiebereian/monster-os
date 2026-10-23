@@ -16,7 +16,7 @@ use crate::nhl_sim::{self as sim, GameInput, League, Xg, EV, PP, SH};
 use crate::learning::{freq_over, Forecast, GameEval, Outcomes, Prediction, Scorecard, SlateGame};
 use crate::State;
 
-pub const MODEL_VERSION: &str = "nhl-event-sim-v3";
+pub const MODEL_VERSION: &str = "nhl-event-sim-v4";
 
 fn internal(m: impl std::fmt::Display) -> HttpResponse {
     eprintln!("projection-service(nhl-sim): {m}");
@@ -267,6 +267,9 @@ crate::learning::tuning!(Tuning {
     finish_prior_xg: 12.0, 2.0, 100.0, "expected goals of prior on shooter finishing (goals / xG)";
     goalie_prior_xg: 25.0, 5.0, 200.0, "expected goals of prior on the goalie factor (goals against / xG faced)";
     share_prior: 2.0, 0.5, 20.0, "team-games of prior on a skater's attempt / assist share";
+    accuracy_prior: 40.0, 5.0, 400.0, "attempts of league-average prior on a skater's share of attempts on net";
+    accuracy_weight: 1.0, 0.0, 1.0, "how much of a skater's own on-net share to use (0 = league rate for everyone, as in v3)";
+    goal_odds: 1.0, 0.8, 1.25, "league-wide odds multiplier on a goal from a shot on goal (calibration; empty nets excluded)";
 });
 
 fn norm_name(s: &str) -> String {
@@ -393,6 +396,7 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
         let mut p_att: HashMap<(i64, usize), f64> = HashMap::new();
         let mut p_ast: HashMap<(i64, usize), f64> = HashMap::new();
         let mut p_g: HashMap<i64, (f64, f64)> = HashMap::new(); // goals, xG on goal
+        let mut p_net: HashMap<i64, (f64, f64)> = HashMap::new(); // attempts, attempts on net (goal or save)
         let mut shot_loc: HashMap<i64, Vec<(f32, f32, u8)>> = HashMap::new();
         for s in &shots {
             if &s.team != abbr || s.en || s.ptype == "SO" { continue; }
@@ -400,6 +404,9 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
             *team_att.entry((s.game, k)).or_default() += 1.0;
             if let Some(sh) = s.shooter {
                 *p_att.entry((sh, k)).or_default() += w(gi[&s.game]);
+                let e = p_net.entry(sh).or_default();
+                e.0 += 1.0;
+                if s.kind == "goal" || s.kind == "sog" { e.1 += 1.0; }
                 // location/type pool for on-target outcomes: shots on goal and goals only, the
                 // population the xG model is fitted on (blocked shots are logged at the block with no
                 // type, misses come from farther out; v2 drew misses too and ran ~0.6 goals/game low)
@@ -437,10 +444,15 @@ pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String
             };
             let (gl, xg) = p_g.get(&p.id).copied().unwrap_or((0.0, 0.0));
             let gp = p.played.len() as f64;
+            // share of attempts on net vs the league's at even strength, shrunk
+            let lg_net = 1.0 - league.blocked[EV] - league.missed[EV];
+            let (na, nn) = p_net.get(&p.id).copied().unwrap_or((0.0, 0.0));
+            let acc = ((nn + o.tune.accuracy_prior * lg_net) / (na + o.tune.accuracy_prior)) / lg_net.max(0.05);
+            let accuracy = 1.0 + o.tune.accuracy_weight * (acc - 1.0);
             skaters.push(sim::Skater {
                 id: p.id, name: p.name.clone(), pos: if p.pos == "D" { "D".into() } else { "F".into() }, p_active: pa,
                 att_share: [EV, PP, SH].map(|k| share(&p_att, &team_att, k)), ast_share: [EV, PP, SH].map(|k| share(&p_ast, &team_goal, k)),
-                finish: (gl + o.tune.finish_prior_xg) / (xg + o.tune.finish_prior_xg), block_share: (p.blocks + 1.0) / (gp + 2.0),
+                finish: o.tune.goal_odds * (gl + o.tune.finish_prior_xg) / (xg + o.tune.finish_prior_xg), accuracy, block_share: (p.blocks + 1.0) / (gp + 2.0),
                 shots: shot_loc.remove(&p.id).unwrap_or_default(),
             });
             meta_p.push(json!({ "id": p.id, "name": p.name, "pos": p.pos, "p_active": r3(pa), "status": reason, "games": p.played.len(),
@@ -667,11 +679,16 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
     let mut out = vec![
         Forecast::game("home_win", "league home-win rate 0.535", "home_margin", 0.0, e.home_win as f64 / nn, 0.535),
         Forecast::game("total_over_5_5", "league rate 0.53", "total", 5.5, e.total.line(5.5).0, 0.53),
+        // puck lines: a 2+ goal win (league rates of the 2021-22 to 2025-26 regular seasons)
+        Forecast::game("home_puckline", "league home -1.5 rate 0.33", "home_margin", 1.5, e.home_puckline as f64 / nn, 0.33),
+        Forecast::game("away_puckline", "league away -1.5 rate 0.27", "away_margin", 1.5, e.away_puckline as f64 / nn, 0.27),
     ];
     let pids: Vec<i64> = game.teams.iter().flat_map(|t| t.skaters.iter().map(|p| p.id)).chain(game.teams.iter().map(|t| t.goalie.id)).collect();
-    let hist = db.query("SELECT b.player_id, COALESCE(b.sog,0), COALESCE(b.goals,0)+COALESCE(b.assists,0), COALESCE(b.saves,0) FROM nhl_box_api b JOIN nhl_games_api g USING (game_id) \
+    let hist = db.query("SELECT b.player_id, COALESCE(b.sog,0), COALESCE(b.goals,0)+COALESCE(b.assists,0), COALESCE(b.saves,0), COALESCE(b.goals,0), COALESCE(b.assists,0), COALESCE(b.blocks,0) \
+                         FROM nhl_box_api b JOIN nhl_games_api g USING (game_id) \
                          WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND COALESCE(b.toi_sec,0) > 0", &[&pids, &gref.date]).await.map_err(|e| dberr(&e))?;
-    let mut past: HashMap<i64, [Vec<f64>; 3]> = HashMap::new();
+    // sog, points, saves, goals, assists, blocks
+    let mut past: HashMap<i64, [Vec<f64>; 6]> = HashMap::new();
     for r in &hist {
         let v = past.entry(r.get(0)).or_default();
         for (k, x) in v.iter_mut().enumerate() { x.push(r.get::<_, i32>(k + 1) as f64); }
@@ -684,6 +701,14 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
             let line = (avg.floor() + 0.5).max(0.5);
             out.push(Forecast::player("sog_over_avg", "player's own prior frequency", p.id, &p.name, "sog", line, e.player[t][i][0].line(line).0, freq_over(&ph[0], line)));
             out.push(Forecast::player("points_1plus", "player's own prior frequency", p.id, &p.name, "points", 0.5, e.player[t][i][3].line(0.5).0, freq_over(&ph[1], 0.5)));
+            // sim player props: sog, goals, assists, points, blocks
+            out.push(Forecast::player("goals_1plus", "player's own prior frequency", p.id, &p.name, "goals", 0.5, e.player[t][i][1].line(0.5).0, freq_over(&ph[3], 0.5)));
+            out.push(Forecast::player("assists_1plus", "player's own prior frequency", p.id, &p.name, "assists", 0.5, e.player[t][i][2].line(0.5).0, freq_over(&ph[4], 0.5)));
+            let bavg = ph[5].iter().sum::<f64>() / ph[5].len() as f64;
+            if bavg >= 0.5 {
+                let bl = bavg.floor() + 0.5;
+                out.push(Forecast::player("blocks_over_avg", "player's own prior frequency", p.id, &p.name, "blocks", bl, e.player[t][i][4].line(bl).0, freq_over(&ph[5], bl)));
+            }
         }
         let gk = &game.teams[t].goalie;
         if let Some(ph) = past.get(&gk.id) {
@@ -701,11 +726,13 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
     let gid: i64 = id.parse().map_err(|_| "NHL game id must be numeric")?;
     let Some(g) = db.query_opt("SELECT home_score, away_score FROM nhl_games_api WHERE game_id = $1 AND completed", &[&gid]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
     let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
-    let rows = db.query("SELECT player_id, pos, COALESCE(sog,0), COALESCE(goals,0)+COALESCE(assists,0), COALESCE(saves,0), COALESCE(toi_sec,0) FROM nhl_box_api WHERE game_id = $1", &[&gid])
+    let rows = db.query("SELECT player_id, pos, COALESCE(sog,0), COALESCE(goals,0)+COALESCE(assists,0), COALESCE(saves,0), COALESCE(toi_sec,0), COALESCE(goals,0), COALESCE(assists,0), COALESCE(blocks,0) \
+                         FROM nhl_box_api WHERE game_id = $1", &[&gid])
         .await.map_err(|e| dberr(&e))?;
     if rows.is_empty() { return Ok(None); }
     let mut o = Outcomes::default();
     o.game.insert("home_margin", (hs - as_) as f64);
+    o.game.insert("away_margin", (as_ - hs) as f64);
     o.game.insert("total", (hs + as_) as f64);
     o.game.insert("shots_on_goal", rows.iter().filter(|r| r.get::<_, String>(1) != "G").map(|r| r.get::<_, i32>(2) as f64).sum());
     for r in rows.iter().filter(|r| r.get::<_, i32>(5) > 0) {
@@ -713,6 +740,9 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         m.insert("sog", r.get::<_, i32>(2) as f64);
         m.insert("points", r.get::<_, i32>(3) as f64);
         m.insert("saves", r.get::<_, i32>(4) as f64);
+        m.insert("goals", r.get::<_, i32>(6) as f64);
+        m.insert("assists", r.get::<_, i32>(7) as f64);
+        m.insert("blocks", r.get::<_, i32>(8) as f64);
     }
     Ok(Some(o))
 }

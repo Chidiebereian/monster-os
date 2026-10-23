@@ -89,6 +89,8 @@ pub struct GameRow {
     pub periods: Option<i32>,
     pub boxes: Vec<BoxRow>,
     pub shots: Vec<Shot>,
+    /// referee crew in ESPN's order (crew chief first); empty until ESPN posts it
+    pub officials: Vec<String>,
 }
 
 fn made_att(s: &str) -> (Option<i32>, Option<i32>) {
@@ -117,6 +119,8 @@ pub fn parse_summary(id: &str, sm: &Value) -> Option<GameRow> {
         if comp["homeAway"] == "home" { g.home = abbr; g.home_score = score; } else { g.away = abbr; g.away_score = score; }
     }
     g.completed = c["status"]["type"]["completed"].as_bool().unwrap_or(false);
+    g.officials = sm["gameInfo"]["officials"].as_array().into_iter().flatten()
+        .filter_map(|o| o["displayName"].as_str().map(str::to_string)).collect();
     g.periods = c["status"]["period"].as_i64().map(|x| x as i32);
     if let Some(pc) = sm["pickcenter"].as_array().and_then(|a| a.first()) {
         g.spread = pc["spread"].as_f64();
@@ -179,6 +183,10 @@ async fn store(db: &tokio_postgres::Client, g: &GameRow) -> Result<(), String> {
          periods=EXCLUDED.periods, updated_at=now()",
         &[&g.espn_id, &g.season, &g.season_type, &g.date, &g.start, &g.away, &g.home, &g.away_score, &g.home_score, &g.completed, &g.spread, &g.over_under, &g.periods],
     ).await.map_err(|e| dberr(&e))?;
+    for (i, name) in g.officials.iter().enumerate() {
+        db.execute("INSERT INTO nba_officials_espn (espn_id, ord, name) VALUES ($1,$2,$3) ON CONFLICT (espn_id, ord) DO UPDATE SET name=EXCLUDED.name",
+            &[&g.espn_id, &(i as i32 + 1), name]).await.map_err(|e| dberr(&e))?;
+    }
     if !g.completed { return Ok(()); }
     db.execute("DELETE FROM nba_box_espn WHERE espn_id = $1", &[&g.espn_id]).await.map_err(|e| dberr(&e))?;
     db.execute("DELETE FROM nba_shots_espn WHERE espn_id = $1", &[&g.espn_id]).await.map_err(|e| dberr(&e))?;
@@ -294,6 +302,7 @@ mod tests {
                 "competitors": [ { "homeAway": "home", "team": { "id": "19", "abbreviation": "ORL" }, "score": "118" },
                                  { "homeAway": "away", "team": { "id": "29", "abbreviation": "MEM" }, "score": "111" } ] }] },
             "pickcenter": [{ "spread": -5.5, "overUnder": 227.5 }],
+            "gameInfo": { "officials": [{ "displayName": "Scott Foster", "order": 1 }, { "displayName": "Tony Brothers", "order": 2 }] },
             "boxscore": { "players": [{ "team": { "abbreviation": "MEM" }, "statistics": [{
                 "labels": ["MIN","PTS","FG","3PT","FT","REB","AST","TO","STL","BLK","OREB","DREB","PF","+/-"],
                 "athletes": [
@@ -309,6 +318,7 @@ mod tests {
         let g = parse_summary("401", &sm).unwrap();
         assert_eq!((g.home.as_str(), g.away.as_str(), g.home_score, g.away_score), ("ORL", "MEM", Some(118), Some(111)));
         assert_eq!(g.spread, Some(-5.5));
+        assert_eq!(g.officials, vec!["Scott Foster", "Tony Brothers"]);
         assert_eq!(g.boxes.len(), 2);
         assert_eq!(g.boxes[0].s[1..5], [Some(12), Some(22), Some(3), Some(5)]);
         assert_eq!(g.boxes[0].s[7], Some(0));

@@ -15,8 +15,12 @@
 //! Every box-score number is derived from those simulated possessions.
 //! Shot locations are drawn from the shooter's real ESPN shot chart (display).
 //!
+//! Garbage time (optional, `Blowout`): in the 4th quarter, once the margin
+//! reaches base + per_min x minutes left, both coaches sit their core players
+//! until it closes back under 60% of that threshold.
+//!
 //! Not modelled (documented): fouls / foul trouble / end-game fouling, and-1s,
-//! timeouts, positions in lineups, garbage-time rotations, injuries in-game.
+//! timeouts, positions in lineups, injuries in-game.
 
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +131,29 @@ pub struct GameInput {
     pub teams: [Team; 2], // 0 away, 1 home
     pub league: League,
     pub home_edge: f64,   // odds multiplier on home shooting
+    #[serde(default)]
+    pub blowout: Blowout,
+    /// referee crew: multiplier on every shooting-foul trip (1 = league average)
+    #[serde(default = "one")]
+    pub trip_mult: f64,
+}
+
+/// Garbage time. Real starters (28+ minutes) play 1.2 minutes over their average
+/// when the margin after three quarters is within 5, and 5.5 under it at 30+
+/// (2022-2026 regular seasons). `boost` adds minutes to the core players' draws
+/// so that, over all game scripts, they keep their real average.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Blowout {
+    pub on: bool,
+    /// pull when |margin| >= base + per_min x minutes left in the 4th
+    pub base: f64,
+    pub per_min: f64,
+    /// players (by drawn minutes) who sit in garbage time
+    pub core: usize,
+    pub boost: f64,
+}
+impl Default for Blowout {
+    fn default() -> Self { Blowout { on: false, base: 8.0, per_min: 1.5, core: 6, boost: 1.6 } }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +241,10 @@ pub struct GameResult {
 
 const SEG: f64 = 120.0; // stint length, seconds
 
-/// Minutes for each player in this game, and the stint schedule.
-fn rotation(t: &Team, rng: &mut Rng, segments: usize) -> Vec<[usize; 5]> {
+/// Minutes for each player in this game, the stint schedule, and the garbage-time
+/// five (the active players outside the `core` heaviest by drawn minutes, filled
+/// from the lightest core players).
+fn rotation(t: &Team, rng: &mut Rng, segments: usize, core: usize, boost: f64) -> (Vec<[usize; 5]>, [usize; 5]) {
     let n = t.players.len();
     let active: Vec<bool> = t.players.iter().map(|p| p.p_active > 0.5).collect();
     let mut mins: Vec<f64> = t.players.iter().enumerate().map(|(i, p)| {
@@ -223,6 +252,16 @@ fn rotation(t: &Team, rng: &mut Rng, segments: usize) -> Vec<[usize; 5]> {
         let z = { let u1 = rng.f64().max(1e-12); let u2 = rng.f64(); (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos() };
         (p.min_mean + p.min_sd * z).clamp(0.0, 46.0)
     }).collect();
+    let mut by_mins: Vec<usize> = (0..n).filter(|&i| active[i]).collect();
+    by_mins.sort_by(|a, b| mins[*b].total_cmp(&mins[*a]));
+    if boost > 0.0 { for &i in by_mins.iter().take(core) { mins[i] = (mins[i] + boost).min(46.0); } }
+    let garbage = {
+        let mut g: Vec<usize> = by_mins.iter().skip(core).copied().collect();
+        g.extend(by_mins.iter().take(core).rev().copied());
+        let mut five = [0usize; 5];
+        for k in 0..5 { five[k] = g.get(k).or(g.first()).copied().unwrap_or(0); }
+        five
+    };
     // priority allocation: the rotation gets its usual minutes in order, the
     // deep bench gets what is left of the 240 (scaled up if the pool is short)
     let target = 240.0;
@@ -269,7 +308,7 @@ fn rotation(t: &Team, rng: &mut Rng, segments: usize) -> Vec<[usize; 5]> {
         cur = pick;
         sched.push(five);
     }
-    sched
+    (sched, garbage)
 }
 
 struct G<'a> {
@@ -333,7 +372,7 @@ impl<'a> G<'a> {
                 return;
             }
             // free-throw trip (shooting foul, two shots)
-            if self.rng.f64() < u.trip.mean / (1.0 - u.tov.mean).max(0.05) {
+            if self.rng.f64() < u.trip.mean * self.g.trip_mult / (1.0 - u.tov.mean).max(0.05) {
                 let mut m = 0;
                 for _ in 0..2 { if self.rng.f64() < u.ft.mean { m += 1; } }
                 self.stats[o][ui][FTA] += 2;
@@ -442,7 +481,13 @@ pub fn dur_scale(mean_dur: f64) -> f64 {
 pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) -> GameResult {
     let n = [g.teams[0].players.len(), g.teams[1].players.len()];
     let max_segments = 24 + 3 * 6; // regulation + up to six overtimes (2.5 segments each, rounded up)
-    let scheds = [rotation(&g.teams[0], rng, max_segments), rotation(&g.teams[1], rng, max_segments)];
+    let bo = &g.blowout;
+    let boost = if bo.on { bo.boost } else { 0.0 };
+    let (sched0, garbage0) = rotation(&g.teams[0], rng, max_segments, bo.core, boost);
+    let (sched1, garbage1) = rotation(&g.teams[1], rng, max_segments, bo.core, boost);
+    let scheds = [sched0, sched1];
+    let garbage = [garbage0, garbage1];
+    let mut pulled = false;
     let pace = 0.5 * (g.teams[0].pace + g.teams[1].pace);
     let theta = dur_scale(2880.0 / (2.0 * pace));
     let tip = (rng.f64() < 0.5) as u8;
@@ -457,8 +502,13 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
         let seg_now = ((elapsed_total / SEG) as usize).min(max_segments - 1);
         if seg_now != seg_idx {
             seg_idx = seg_now;
+            if bo.on && s.period == 4 {
+                let threshold = bo.base + bo.per_min * s.clock / 60.0;
+                let margin = (s.score[1] - s.score[0]).abs() as f64;
+                if margin >= threshold { pulled = true; } else if margin < 0.6 * threshold { pulled = false; }
+            } else { pulled = false; }
             for t in 0..2 {
-                let next = scheds[t][seg_idx];
+                let next = if pulled { garbage[t] } else { scheds[t][seg_idx] };
                 let ins: Vec<usize> = next.iter().copied().filter(|i| !s.on[t].contains(i)).collect();
                 let outs: Vec<usize> = s.on[t].iter().copied().filter(|i| !next.contains(i)).collect();
                 s.on[t] = next;
@@ -661,7 +711,31 @@ pub mod tests {
         };
         let team = |abbr: &str| Team { abbr: abbr.into(), players: (0..10).map(|i| player(i, i < 5)).collect(), pace: 99.0,
             def_fg2: 1.0, def_fg3: 1.0, def_tov: 1.0, dreb: 1.0, oreb: 1.0, shoot: 1.0, allow: 1.0 };
-        GameInput { teams: [team("AWY"), team("HOM")], league: lg, home_edge: 1.0 }
+        GameInput { teams: [team("AWY"), team("HOM")], league: lg, home_edge: 1.0, blowout: Blowout::default(), trip_mult: 1.0 }
+    }
+
+    #[test]
+    fn garbage_time_sits_the_core_in_blowouts_only() {
+        // minutes are prop slot 8; player 0 is a starter, player 9 the deepest bench
+        let mins = |g: &GameInput, t: usize, i: usize| simulate(g, 2000, 20, 7).player[t][i][8].mean();
+        let mut lopsided = toy();
+        lopsided.teams[1].shoot = 2.5;
+        lopsided.teams[0].shoot = 0.4;
+        let off = (mins(&lopsided, 1, 0), mins(&lopsided, 1, 9));
+        lopsided.blowout = Blowout { on: true, boost: 0.0, ..Blowout::default() };
+        let on = (mins(&lopsided, 1, 0), mins(&lopsided, 1, 9));
+        assert!(on.0 < off.0 - 3.0, "starter minutes {off:?} -> {on:?}");
+        assert!(on.1 > off.1 + 3.0, "bench minutes {off:?} -> {on:?}");
+        // an even game is rarely a blowout: the starter loses well under a minute
+        let mut even = toy();
+        let base = mins(&even, 1, 0);
+        even.blowout = Blowout { on: true, boost: 0.0, ..Blowout::default() };
+        let cut = mins(&even, 1, 0);
+        even.blowout = Blowout { on: true, ..Blowout::default() };
+        let boosted = mins(&even, 1, 0);
+        eprintln!("lopsided {off:?} -> {on:?}; even starter {base:.2} -> {cut:.2}, with boost {boosted:.2}");
+        assert!(cut < base && base - cut < 3.0, "even game: {base} -> {cut}");
+        assert!((boosted - base).abs() < 0.6, "the boost keeps the average: {base} -> {boosted}");
     }
 
     #[test]

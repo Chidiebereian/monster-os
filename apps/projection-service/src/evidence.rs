@@ -49,6 +49,10 @@ pub(crate) fn pick_market(engine: &str, market: &str) -> Option<(&'static str, &
         ("nba", "reb_over_avg") => ("reb", "baseline"),
         ("nba", "ast_over_avg") => ("ast", "baseline"),
         ("nba", "fg3m_over_avg") => ("fg3m", "baseline"),
+        ("nba", "stl_over_avg") => ("stl", "baseline"),
+        ("nba", "blk_over_avg") => ("blk", "baseline"),
+        ("nba", "tov_over_avg") => ("tov", "baseline"),
+        ("nba", "pra_over_avg") => ("pra", "baseline"),
         ("nfl", "qb_pass_yds_over_avg") => ("pass_yds", "baseline"),
         ("nfl", "rush_yds_over_avg") => ("rush_yds", "baseline"),
         ("nfl", "rec_yds_over_avg") => ("rec_yds", "baseline"),
@@ -58,6 +62,10 @@ pub(crate) fn pick_market(engine: &str, market: &str) -> Option<(&'static str, &
         ("nhl", "points_1plus") => ("points", "baseline"),
         ("nhl", "sog_over_avg") => ("sog", "baseline"),
         ("nhl", "goalie_saves_over_avg") => ("saves", "baseline"),
+        ("nhl", "goals_1plus") => ("goals", "baseline"),
+        ("nhl", "assists_1plus") => ("assists", "baseline"),
+        ("nhl", "blocks_over_avg") => ("blocks", "baseline"),
+        ("nhl", "home_puckline") | ("nhl", "away_puckline") => ("spread", "baseline"),
         _ => return None,
     })
 }
@@ -177,11 +185,23 @@ pub(crate) async fn due(state: &State) -> Option<String> {
 }
 
 #[derive(Deserialize)]
-pub struct RunQ { engine: String }
+pub struct RunQ { engine: String, #[serde(default)] wait: bool }
 
-/// POST /picks/evidence/run?engine= — run now (blocks until done; minutes for a sport).
+/// POST /picks/evidence/run?engine=[&wait=true] — run now. By default the run is
+/// started on the server and the call returns at once (a full sport takes half an
+/// hour, longer than a client should hold a connection; a dropped connection would
+/// cancel it). Results land in pick_evidence and the `evidence:{engine}` job row.
+/// `wait=true` blocks and returns the summary.
 pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Responder {
     if !PICK_ENGINES.contains(&q.engine.as_str()) { return HttpResponse::BadRequest().json(json!({ "error": format!("engine must be one of {PICK_ENGINES:?}") })); }
+    if !q.wait {
+        let (st, engine) = (state.clone(), q.engine.clone());
+        actix_web::rt::spawn(async move {
+            let v = run(&st, &engine).await;
+            crate::autopilot::mark(&st.db, &format!("evidence:{engine}"), v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+        });
+        return HttpResponse::Accepted().json(json!({ "engine": q.engine, "started": true, "note": "running on the server; poll pick_evidence or /learning jobs" }));
+    }
     match run(&state, &q.engine).await {
         Ok(v) => HttpResponse::Ok().json(v),
         Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
@@ -208,5 +228,7 @@ mod tests {
         assert_eq!(pick_market("nba_team", "home_cover"), Some(("spread", "market")));
         assert_eq!(pick_market("nhl", "home_win"), Some(("moneyline", "baseline")));
         assert_eq!(pick_market("nfl", "anytime_td"), None);
+        assert_eq!(pick_market("nhl", "away_puckline"), Some(("spread", "baseline")));
+        assert_eq!(pick_market("nba", "blk_over_avg"), Some(("blk", "baseline")));
     }
 }

@@ -49,7 +49,7 @@ fn dberr(e: &tokio_postgres::Error) -> String {
 fn key(asof: NaiveDate) -> String { format!("nba:impact:{asof}") }
 
 /// Solve A x = b in place for symmetric positive-definite A (n x n, row-major).
-fn cholesky_solve(a: &mut [f64], b: &mut [f64], n: usize) -> Result<(), String> {
+pub(crate) fn cholesky_solve(a: &mut [f64], b: &mut [f64], n: usize) -> Result<(), String> {
     for j in 0..n {
         let mut d = a[j * n + j];
         for k in 0..j { d -= a[j * n + k] * a[j * n + k]; }

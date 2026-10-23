@@ -89,6 +89,16 @@ pub fn spawn(state: web::Data<State>) {
                 if fitted > 0 { println!("autopilot nba impact: {fitted} monthly fits"); }
                 mark(&s2.db, "fit:nba_impact", v.is_ok(), &json!({ "fitted": v.unwrap_or_else(|e| vec![json!({ "error": e })]) })).await;
             }
+            // NBA referee crews: monthly tendency fits, and today's assignments (posted ~9:00 ET)
+            if !paused(&s2.db).await && due(&s2.db, "fit:nba_refs", 360).await {
+                let today = today_et();
+                let v = crate::nba_refs::ensure(&s2.db, today - Duration::days(365 * 6), today).await;
+                mark(&s2.db, "fit:nba_refs", v.is_ok(), &json!({ "fitted": v.map(|x| x.len()).unwrap_or(0) })).await;
+            }
+            if !paused(&s2.db).await && due(&s2.db, "ingest:nba_refs", 60).await {
+                let v = crate::nba_refs::ingest_assignments(&s2).await;
+                mark(&s2.db, "ingest:nba_refs", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             // AI Picks evidence first: an engine whose code changed re-earns its grade caps
             if !paused(&s2.db).await {
                 if let Some(engine) = crate::evidence::due(&s2).await {
@@ -129,7 +139,7 @@ async fn due(db: &tokio_postgres::Client, job: &str, minutes: i64) -> bool {
     last_run(db, job).await.map(|t| Utc::now() - t >= Duration::minutes(minutes)).unwrap_or(true)
 }
 
-async fn mark(db: &tokio_postgres::Client, job: &str, ok: bool, detail: &Value) {
+pub(crate) async fn mark(db: &tokio_postgres::Client, job: &str, ok: bool, detail: &Value) {
     if let Err(e) = db.execute("INSERT INTO learning_jobs (job, last_run, last_ok, detail) VALUES ($1, now(), $2, $3) \
                                 ON CONFLICT (job) DO UPDATE SET last_run=now(), last_ok=EXCLUDED.last_ok, detail=EXCLUDED.detail",
         &[&job, &ok, &Json(detail)]).await { eprintln!("autopilot: mark {job}: {}", dberr(&e)); }

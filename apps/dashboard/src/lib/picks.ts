@@ -17,6 +17,17 @@ export interface Pick {
   profit: number | null; clv: number | null; close: { line: number | null; price: number | null }; settled_at: string | null;
   /** suggested stake, fraction of bankroll (fractional Kelly scaled by track record); null on picks published before stakes */
   stake: number | null;
+  /** break-even price, and the worst price still worth playable_min_ev per unit (null on picks published before them) */
+  fair_price: number | null; playable_price: number | null;
+  /** latest price still at least the playable price at the published line; null = settled, or the line moved (re-check) */
+  playable_now: boolean | null;
+}
+
+/** Split a writeup into the case for the pick and the case against it. */
+export function splitWriteup(w: string): { case_for: string; against: string | null } {
+  const i = w.indexOf("What could make it wrong:");
+  if (i < 0) return { case_for: w, against: null };
+  return { case_for: w.slice(0, i).trim(), against: w.slice(i + "What could make it wrong:".length).trim() };
 }
 
 export interface PickFacts {
@@ -27,6 +38,7 @@ export interface PickFacts {
   p_raw?: number; p_naive?: number | null; w_market?: number; w_naive?: number | null; blend_source?: string; blend_text?: string;
   /** the sharp check: Pinnacle (or the other books' consensus) de-vigged, and this price's EV against it */
   p_sharp?: number; sharp_ev?: number; sharp_source?: string; sharp_text?: string; stake?: number;
+  fair_price?: number | null; playable_price?: number | null; playable_min_ev?: number;
   game_log?: { opp: string; value: number | null }[];
   home_form?: { games: number; w: number; l: number; pf: number; pa: number };
   away_form?: { games: number; w: number; l: number; pf: number; pa: number };

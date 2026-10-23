@@ -83,6 +83,10 @@ pub struct Skater {
     pub ast_share: [f64; 3],
     /// odds multiplier on goal given on goal (finishing)
     pub finish: f64,
+    /// multiplier on P(on goal | unblocked attempt): the shooter's own share of
+    /// attempts that reach the net vs the league's (forwards above 1, defensemen below)
+    #[serde(default = "one")]
+    pub accuracy: f64,
     pub block_share: f64,
     pub shots: Vec<(f32, f32, u8)>,
 }
@@ -294,7 +298,8 @@ impl<'a> G<'a> {
             self.emit("attempt", t, Some(si), None, None, Some(bi), "blocked", Some(xy), 0.0, en, 0);
             return;
         }
-        if r < p_block + lg.missed[s] * (1.0 - p_block) / (1.0 - lg.blocked[s]).max(0.1) {
+        let on_net = ((1.0 - lg.missed[s] / (1.0 - lg.blocked[s]).max(0.1)) * sk.accuracy).clamp(0.05, 0.98);
+        if r < p_block + (1.0 - on_net) * (1.0 - p_block) {
             self.emit("attempt", t, Some(si), None, None, None, "missed", Some(xy), 0.0, en, 0);
             return;
         }
@@ -569,7 +574,7 @@ mod tests {
             pull_rate: 0.8, en_att60: 60.0, en_goal_pct: 0.3, sixv5_att60: 110.0, home_edge: 1.03 };
         let team = |abbr: &str| Team { abbr: abbr.into(),
             skaters: (0..18).map(|i| Skater { id: i, name: format!("S{i}"), pos: if i < 12 { "F".into() } else { "D".into() }, p_active: 1.0,
-                att_share: [1.0 / 18.0; 3], ast_share: [1.0 / 18.0; 3], finish: 1.0, block_share: if i < 12 { 0.03 } else { 0.1 },
+                att_share: [1.0 / 18.0; 3], ast_share: [1.0 / 18.0; 3], finish: 1.0, accuracy: 1.0, block_share: if i < 12 { 0.03 } else { 0.1 },
                 shots: vec![(70.0, 5.0, 0), (55.0, -20.0, 1), (80.0, 2.0, 4)] }).collect(),
             goalie: Goalie { id: 99, name: "G".into(), factor: 1.0 }, off: [1.0; 3], def: [1.0; 3], pen: 1.0, block: 1.0 };
         GameInput { teams: [team("AWY"), team("HOM")], league: lg, playoff }

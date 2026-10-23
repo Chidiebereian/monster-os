@@ -1,4 +1,4 @@
-# NHL event simulator model card — `nhl-event-sim-v3`
+# NHL event simulator model card — `nhl-event-sim-v4`
 
 Status as of 2026-10-20. **Experimental, first version.** Every number was
 produced by the code in this repository against real data.
@@ -56,7 +56,9 @@ the draw.
 **Attempts and goals.**
 
 * Each attempt is blocked, missed or on goal, using league fractions and the
-  team's block factor.
+  team's block factor; an unblocked attempt reaches the net at the league rate
+  times the shooter's own on-net share vs the league's (shrunk with 40 attempts
+  of prior; v4).
 * The shooter is picked by his shrunk share of the team's attempts at that
   strength in the games he played, so power-play units come from the data.
 * The location is drawn from his real attempts.
@@ -149,6 +151,30 @@ home win −0.0033; points 1+ +0.0041*; SOG +0.0041*; saves −0.0116*. The
 remaining ~0.6 goals per game under-scoring is a calibration problem (finishing
 and goalie shrinkage), left to the autopilot's tuner. v3's five-season evidence
 for AI Picks is regenerated automatically (`pick_evidence`, engine `nhl`).
+
+## v4 (2026-10-22): shooter accuracy
+
+v3 shot about the right number of shots on goal, but gave every shooter the
+league's on-net rate. Defensemen take many attempts from the point, which are
+blocked or miss far more often than forwards' attempts, and convert worse. So
+v3 put too many defensemen's shots on net and too few forwards': in 2025-26
+the attempt-share mix converts at 9.33% per shot on goal against 9.65% in
+reality, at even strength.
+
+- **v4**: P(on net | unblocked) = the league rate × the shooter's own on-net
+  share of attempts vs the league's, shrunk (`accuracy_prior` 40 attempts,
+  `accuracy_weight` 1; 0 = v3).
+- New tunable `goal_odds` (default 1, so no change): a league-wide odds
+  multiplier on goals from shots on goal, for the autopilot's tuner to
+  calibrate any remaining bias through the paired evaluation gate.
+
+2025-26, 300 games, projected lineups: goals bias −0.58 (v3, full season) →
+**−0.29**; shots on goal per game 54.5 → 55.7 (actual 55.5); total-goals MAE
+1.787 vs the league average's 1.789 (v3 1.879 vs 1.835).
+
+The backtests now also score goals 1+, assists 1+, blocks over the player's
+average and both puck lines (home −1.5 vs the league rate 0.33, away −1.5 vs
+0.27), so AI Picks can grade those markets.
 
 ## Limitations
 

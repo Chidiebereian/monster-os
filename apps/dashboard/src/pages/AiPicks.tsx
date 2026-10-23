@@ -5,7 +5,7 @@ import clsx from "clsx";
 import { ExternalLink, X } from "lucide-react";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import {
-  BANKROLL_KEY, GRADES, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, startLabel, teamLogo,
+  BANKROLL_KEY, GRADES, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
   type Edge, type Pick, type PickDetail, type PickFilters, type Tier,
 } from "../lib/picks";
 
@@ -256,11 +256,20 @@ function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: 
         <Chip>Prob {pct(p.p_model)}</Chip>
         <Chip tone="pos">Edge {signedPct(p.edge)}</Chip>
         <StakeChip stake={p.stake} bankroll={bankroll} />
+        <PlayableChip p={p} />
       </div>
-      <p className="text-xs text-gray-400 line-clamp-2 flex-1">{p.writeup}</p>
+      <p className="text-xs text-gray-400 line-clamp-2 flex-1">{splitWriteup(p.writeup).case_for}</p>
       <BetButton p={p} />
     </div>
   );
+}
+
+/** Price sensitivity: how far the price can drift before the pick is no longer worth it. */
+function PlayableChip({ p }: { p: Pick }) {
+  if (p.playable_price == null) return null;
+  if (p.playable_now === false) return <Chip tone="plain"><span className="text-amber" title={`The best price now is worse than ${odds(p.playable_price)}`}>Price gone · was playable to {odds(p.playable_price)}</span></Chip>;
+  if (p.playable_now == null && p.status === "open") return <Chip tone="plain"><span className="text-amber" title="The line has moved since publishing; the price floor was for the old line">Line moved · re-check</span></Chip>;
+  return <Chip tone="plain"><span title="The worst odds at which this pick still has the minimum expected value">Playable to {odds(p.playable_price)}</span></Chip>;
 }
 
 function BetButton({ p }: { p: Pick }) {
@@ -299,6 +308,7 @@ function PickModal({ id, bankroll, onClose }: { id: number; bankroll: number; on
 function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
   const f = p.facts;
   const moved = p.latest && p.latest.line != null && p.line != null && p.latest.line !== p.line;
+  const w = splitWriteup(p.writeup);
   return (
     <>
       <div className="flex items-center gap-4">
@@ -328,8 +338,15 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
 
       <section className="space-y-2">
         <h3 className="text-xs uppercase tracking-wide text-gray-400">MonsterGPT analysis <span className="normal-case text-gray-600">· {p.writeup_source === "template" ? "written from the facts below" : `${p.writeup_source.replace("llm:", "")}, every number checked against the facts`}</span></h3>
-        <div className="rounded-lg border border-glass bg-surface/60 p-4 text-sm leading-relaxed text-gray-200">{p.writeup}</div>
+        <div className="rounded-lg border border-glass bg-surface/60 p-4 text-sm leading-relaxed text-gray-200">{w.case_for}</div>
       </section>
+
+      {w.against && (
+        <section className="space-y-2">
+          <h3 className="text-xs uppercase tracking-wide text-gray-400">What could make it wrong</h3>
+          <div className="rounded-lg border border-amber/30 bg-amber/5 p-4 text-sm leading-relaxed text-gray-200">{w.against}</div>
+        </section>
+      )}
 
       {p.risk_flags.length > 0 && (
         <section className="space-y-2">
@@ -358,6 +375,8 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
           <div className="text-xs uppercase tracking-wide text-gray-400">Market</div>
           <Row k="Published" v={`${num(p.line)} at ${odds(p.price)} (${p.book_title}) · ${new Date(p.published_at).toLocaleString()}`} />
           {p.latest && <Row k="Now" v={<span className={moved ? "text-amber" : ""}>{num(p.latest.line)} at {odds(p.latest.price)} · edge {signedPct(p.latest.edge)}</span>} />}
+          {p.fair_price != null && <Row k="Fair price (break-even)" v={odds(p.fair_price)} />}
+          {p.playable_price != null && <Row k="Playable to" v={<span className={p.playable_now === false ? "text-amber" : ""}>{odds(p.playable_price)}{f.playable_min_ev != null ? ` (+${pct(f.playable_min_ev, 0)} EV or better)` : ""}{p.playable_now === false ? " · price now worse" : p.playable_now == null && p.status === "open" ? " · line moved, re-check" : ""}</span>} />}
           {f.open_line != null && <Row k="Opened at" v={num(f.open_line)} />}
           <Row k="Books quoting" v={f.books_quoting ?? 1} />
           {f.p_sharp != null && <Row k="Sharp check" v={<span className={(f.sharp_ev ?? 0) < 0 ? "text-amber" : "text-emerald-light"}>{f.sharp_text}: {pct(f.p_sharp, 1)} · {signedPct(f.sharp_ev)} per unit at this price</span>} />}

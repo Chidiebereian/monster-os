@@ -130,6 +130,23 @@ stakes and stale lines `0021_market_edges.sql`.
    minutes, push chance > 5%, line moved against the side since open, fewer than
    8 recent games.
 
+   **Case against.** Every writeup ends with "What could make it wrong:",
+   built from the facts only: how often the simulations land on the other
+   side, the market's probability, a cold recent record against the line,
+   simulated minutes far from recent minutes, uncertain availability,
+   projected lineups, the sharp price, a line move against the side, an engine
+   trimmed hard by the blend, push chance and the playable price. A MonsterGPT
+   rewrite is rejected unless it keeps that part. The dashboard shows it as its
+   own panel.
+
+   **Price sensitivity.** `fair_price` is the break-even American price at the
+   blended probability (pushes counted). `playable_price` is the worst price
+   still worth `playable_min_ev` (setting, default 2%) per unit, never better
+   than the published price. `playable_now` compares the latest tracked price
+   with it at the published line. It is null after a line move (the floor no
+   longer applies: re-check) and for picks no longer open. Cards show "Playable
+   to −131", "Price gone" or "Line moved · re-check".
+
 5. **Record lines.** Each build records every selection a champion engine can
    price, at the line most books quote. The record holds the raw engine
    probability, the naive baseline and the consensus, and is updated until the
@@ -201,9 +218,14 @@ The dashboard page accepts `?sport=nhl&hidden=1&pick=<id>` deep links.
 - Tiers on 2026-10-22 (blend-v1 evidence): **baseline** (cap B+) for NBA
   points / rebounds / assists / threes props, NFL passing / rushing /
   receiving yards and receptions props, NHL points / SOG / saves props and
-  moneyline (simulator), and the NHL team model's moneyline and total;
-  **unproven** (cap C+, hidden, no stake) for every NBA and NFL game line (both
-  engines), NHL totals (simulator) and NBA blocks. No market is proven yet:
+  moneyline (simulator), and the NHL team model's moneyline and total. With
+  `nhl-event-sim-v4` (shooter accuracy) NHL goals, assists and blocked-shot
+  props and the puck line are backtested too (better than the naive baseline
+  in 4/4, 4/4, 4/4 and 3/3 seasons: baseline). **Unproven** (cap C+, hidden,
+  no stake): every NBA and NFL game line (both engines) and NHL totals
+  (simulator, 1 season better, 0 worse). NBA steals, blocks, turnovers and
+  PRA props are baseline too (4 of 4 seasons better than the naive baseline,
+  none worse; PRA Brier −0.0144 ± 0.0004, the largest gain of any NBA prop). No market is proven yet:
   that takes 150+ settled picks or recorded lines that beat the closing line.
 - Stale lines are only as fresh as the slowest feed behind them (Odds API
   every 6 h, SportsGameOdds every 4 h); books correct stale prices quickly, so

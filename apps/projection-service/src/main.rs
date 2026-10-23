@@ -45,6 +45,7 @@ mod nba;
 mod nba_espn;
 mod nba_game;
 mod nba_impact;
+mod nba_refs;
 mod nba_sim;
 mod nba_teams;
 mod mlb;
@@ -719,6 +720,8 @@ async fn main() -> std::io::Result<()> {
             .route("/fit/nba/sim", web::post().to(nba_game::fit))
             .route("/fit/nba/impact", web::post().to(nba_impact::fit_http))
             .route("/nba/impact", web::get().to(nba_impact::show))
+            .route("/fit/nba/refs", web::post().to(nba_refs::fit_http))
+            .route("/ingest/nba/refs", web::post().to(nba_refs::assignments_http))
             .route("/nba/sim/games", web::get().to(nba_game::games))
             .route("/nba/simulate/{game_id}", web::get().to(nba_game::simulate))
             .route("/backtest/nba/sim", web::get().to(nba_game::backtest))

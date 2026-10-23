@@ -193,6 +193,12 @@ crate::learning::tuning!(Tuning {
     rest_total_pts: 0.9, -2.0, 3.0, "points added to the game total per team with three or more days off";
     schedule_scale: 0.0, 0.0, 1.0, "1 = apply the schedule effects above; 0 = ignore the schedule";
     impact_weight: 0.0, 0.0, 1.5, "share of the lineup gap (player impact ratings, tonight vs the team's last ten games) added to the margin; 0 = off";
+    blowout: 0.0, 0.0, 1.0, "1 = garbage time: core players sit in the 4th once the margin reaches blowout_base + blowout_per_min x minutes left; 0 = off";
+    blowout_base: 8.0, 0.0, 30.0, "garbage-time margin threshold with no time left";
+    blowout_per_min: 1.5, 0.0, 4.0, "points added to the garbage-time threshold per minute left in the 4th";
+    blowout_core: 6.0, 5.0, 9.0, "players (by drawn minutes) who sit in garbage time";
+    ref_weight: 0.0, 0.0, 1.5, "share of the referee crew's free-throw tendency applied to shooting-foul trips (nba_refs.rs; crews posted ~9:00 ET); 0 = off";
+    blowout_boost: 1.6, 0.0, 4.0, "minutes added to the core players' draws so their average over all game scripts stays their real average";
 });
 
 /// ESPN injury designations -> probability of playing. Not fitted (no stored
@@ -298,6 +304,20 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
     // player impact ratings in force before this game (nba_impact.rs)
     // only when availability is known (confirmed: the injury report; actual: hindsight). A
     // projected lineup is "whoever played lately", so its gap would be noise.
+    // referee crew (nba_refs.rs): official.nba.com posts it ~9:00 ET on game day; ESPN keeps it
+    let mut trip_mult = 1.0;
+    let mut officials = Value::Null;
+    if opts.tune.ref_weight > 0.0 {
+        let crew = crate::nba_refs::crew(db, &g.id).await?;
+        if crew.len() == 3 {
+            let r = crate::nba_refs::load(db, g.date).await?;
+            let effect = crate::nba_refs::crew_effect(&r, &crew);
+            trip_mult = (1.0 + opts.tune.ref_weight * effect / r.league_fta.max(20.0)).clamp(0.8, 1.25);
+            officials = json!({ "crew": crew, "fta_effect": (effect * 100.0).round() / 100.0, "trip_mult": (trip_mult * 1000.0).round() / 1000.0, "fit_asof": r.asof });
+        } else {
+            flags.push("referee crew not posted yet: league-average whistle".into());
+        }
+    }
     let (impact, impact_asof) = if opts.tune.impact_weight > 0.0 && opts.mode != LineupMode::Projected { crate::nba_impact::load(db, g.date).await? } else { (HashMap::new(), None) };
     for (ti, abbr) in teams.iter().enumerate() {
         // team's recent completed games
@@ -544,7 +564,7 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
     let [a, h]: [sim::Team; 2] = team_inputs.try_into().map_err(|_| "teams")?;
     let meta = json!({
         "model_version": MODEL_VERSION, "params": params_key, "data_cutoff": g.date, "lineup_mode": opts.mode.as_str(),
-        "actual_available": !actual.is_empty(), "teams": team_meta, "flags": flags,
+        "actual_available": !actual.is_empty(), "teams": team_meta, "flags": flags, "officials": officials,
         "assumptions": [
             "possession model: usage x outcome (turnover / two-shot trip / 2 or 3 FGA) with player x defence odds ratios; no fouls, and-1s or timeouts",
             "rotation: minutes from each player's recent games, greedy 2-minute stints, starters open the 1st and 3rd quarters",
@@ -553,7 +573,9 @@ pub async fn build(state: &State, g: &GameRef, opts: &Opts) -> Result<Built, Str
             "shot locations on the court are drawn from the shooter's real ESPN shot chart (display only)",
         ],
     });
-    Ok(Built { game: GameInput { teams: [a, h], league, home_edge }, meta })
+    let t = &opts.tune;
+    let blowout = sim::Blowout { on: t.blowout > 0.5, base: t.blowout_base, per_min: t.blowout_per_min, core: t.blowout_core.round() as usize, boost: t.blowout_boost };
+    Ok(Built { game: GameInput { teams: [a, h], league, home_edge, blowout, trip_mult }, meta })
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +808,10 @@ pub async fn slate(db: &tokio_postgres::Client, date: NaiveDate) -> Result<Vec<S
             label: format!("{} @ {}", r.get::<_, String>(3), r.get::<_, String>(4)) }).collect())
 }
 
-const PROP_MARKETS: [(&str, &str); 4] = [("pts_over_avg", "pts"), ("reb_over_avg", "reb"), ("ast_over_avg", "ast"), ("fg3m_over_avg", "fg3m")];
+/// Prop forecasts at the player's own average, in the simulator's prop order
+/// (nba_sim::prop_values: pts, reb, ast, fg3m, stl, blk, tov, pra).
+const PROP_MARKETS: [(&str, &str); 8] = [("pts_over_avg", "pts"), ("reb_over_avg", "reb"), ("ast_over_avg", "ast"), ("fg3m_over_avg", "fg3m"),
+    ("stl_over_avg", "stl"), ("blk_over_avg", "blk"), ("tov_over_avg", "tov"), ("pra_over_avg", "pra")];
 
 /// Scoreable forecasts. Market baselines use the line stored for the game; player baselines use only games before it.
 async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput, e: &sim::Ensemble) -> Result<Vec<Forecast>, String> {
@@ -802,14 +827,15 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
         out.push(Forecast::game("total_over", "0.5 at the line", "total", l, o / (o + u).max(1e-9), 0.5).pushes());
     }
     let pids: Vec<String> = game.teams.iter().flat_map(|t| t.players.iter().map(|p| p.id.clone())).collect();
-    let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
+    let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m, b.stl, b.blk, b.tov FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
                          WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND NOT b.dnp AND COALESCE(b.min,0) > 0",
                         &[&pids, &gref.date]).await.map_err(|e| dberr(&e))?;
-    let mut past: HashMap<String, [Vec<f64>; 4]> = HashMap::new();
+    let mut past: HashMap<String, [Vec<f64>; 8]> = HashMap::new();
     for r in &hist {
         let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
         let v = past.entry(r.get(0)).or_default();
-        for (k, x) in [g(1), g(2) + g(3), g(4), g(5)].into_iter().enumerate() { v[k].push(x); }
+        let reb = g(2) + g(3);
+        for (k, x) in [g(1), reb, g(4), g(5), g(6), g(7), g(8), g(1) + reb + g(4)].into_iter().enumerate() { v[k].push(x); }
     }
     for t in 0..2 {
         for (i, p) in game.teams[t].players.iter().enumerate() {
@@ -817,7 +843,8 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
             if ph[0].len() < 5 || e.active_n[t][i] == 0 { continue; }
             for (k, (market, stat)) in PROP_MARKETS.iter().enumerate() {
                 let avg = ph[k].iter().sum::<f64>() / ph[k].len() as f64;
-                if k == 3 && avg < 0.8 { continue; }
+                // markets books rarely post for this player
+                if (k == 3 && avg < 0.8) || ((4..=6).contains(&k) && avg < 0.3) { continue; }
                 let line = avg.floor() + 0.5;
                 out.push(Forecast::player(market, "player's own prior frequency", &p.id, &p.name, stat, line, e.player[t][i][k].line(line).0, freq_over(&ph[k], line)));
             }
@@ -830,7 +857,7 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
 pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Outcomes>, String> {
     let Some(g) = db.query_opt("SELECT home_score, away_score FROM nba_games_espn WHERE espn_id = $1 AND completed", &[&id]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
     let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
-    let act = db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[&id]).await.map_err(|e| dberr(&e))?;
+    let act = db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min, stl, blk FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[&id]).await.map_err(|e| dberr(&e))?;
     if act.is_empty() { return Ok(None); }
     let mut o = Outcomes::default();
     o.game.insert("home_margin", (hs - as_) as f64);
@@ -842,6 +869,7 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         if r.get::<_, Option<f64>>(10).unwrap_or(0.0) <= 0.0 { continue; }
         let m = o.players.entry(r.get(1)).or_default();
         m.insert("pts", g(2)); m.insert("reb", g(3) + g(4)); m.insert("ast", g(5)); m.insert("fg3m", g(6));
+        m.insert("stl", g(11)); m.insert("blk", g(12)); m.insert("tov", g(9)); m.insert("pra", g(2) + g(3) + g(4) + g(5));
         m.insert("min", r.get::<_, Option<f64>>(10).unwrap_or(0.0));
     }
     o.game.insert("possessions", pa);

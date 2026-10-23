@@ -173,6 +173,26 @@ pub(crate) fn implied(american: i32) -> f64 { 1.0 / decimal(american) }
 /// De-vigged probability of side a from a two-way pair.
 pub(crate) fn novig(a: i32, b: i32) -> f64 { let (x, y) = (implied(a), implied(b)); x / (x + y) }
 
+/// The worst American price at which a bet with these win / loss chances (pushes
+/// are the rest) still earns `min_ev` per unit; 0 gives the break-even (fair)
+/// price. Rounded toward the safe side.
+pub(crate) fn price_for_ev(win: f64, loss: f64, min_ev: f64) -> Option<i32> {
+    if win <= 0.0 { return None; }
+    let d = 1.0 + (min_ev + loss) / win;
+    if !d.is_finite() || d > 101.0 { return None; }
+    Some(if d >= 2.0 { ((d - 1.0) * 100.0 - 1e-9).ceil() as i32 } else { -((100.0 / (d - 1.0)) + 1e-9).floor() as i32 })
+}
+
+/// "Playable to": the worst price still worth `min_ev`, never better than the
+/// published price (a pick that cleared the edge rule but not `min_ev` is
+/// playable only at its own price).
+pub(crate) fn playable_floor(win: f64, loss: f64, min_ev: f64, published: i32) -> Option<i32> {
+    price_for_ev(win, loss, min_ev).map(|p| if at_least(published, p) { p } else { published })
+}
+
+/// Is `now` at least as good a price as `floor`?
+pub(crate) fn at_least(now: i32, floor: i32) -> bool { decimal(now) >= decimal(floor) - 1e-9 }
+
 /// Grade from the edge alone (before the track-record cap).
 pub(crate) fn edge_grade(edge: f64) -> Option<&'static str> {
     const T: [(f64, &str); 8] = [(0.10, "A+"), (0.075, "A"), (0.06, "A-"), (0.05, "B+"), (0.04, "B"), (0.03, "B-"), (0.025, "C+"), (0.015, "C")];
@@ -464,7 +484,52 @@ pub(crate) fn template(f: &Value) -> String {
         if (ol - l).abs() > 1e-9 { out.push(format!("The line has moved from {} at open to {}.", fmt_num(ol), fmt_num(l))); }
     }
     out.push(s("evidence_text"));
+    let against = against_case(f);
+    if !against.is_empty() { out.push(format!("What could make it wrong: {against}")); }
     out.join(" ")
+}
+
+/// The case against the pick, from the facts only: what the bettor is relying on
+/// and what would break it.
+pub(crate) fn against_case(f: &Value) -> String {
+    let s = |k: &str| f[k].as_str().unwrap_or("").to_string();
+    let n = |k: &str| f[k].as_f64();
+    let side = s("side");
+    let mut out: Vec<String> = Vec::new();
+    if let (Some(pm), Some(pk)) = (n("p_model"), n("p_market")) {
+        out.push(format!("the simulations still land on the other side {}% of the time, and the de-vigged market says {}%, so the edge rests on the model seeing something the books have not.",
+            pct(1.0 - pm), pct(pk)));
+    }
+    if s("kind") == "prop" {
+        let who = s("subject_name");
+        let last = who.split_whitespace().last().unwrap_or(&who).to_string();
+        if let (Some(h), Some(g), Some(l)) = (n("l10_hits"), n("l10_games"), n("line")) {
+            if g >= 5.0 && h * 2.0 < g { out.push(format!("{last} has finished {side} {} in only {} of the last {} games.", fmt_num(l), fmt_num(h), fmt_num(g))); }
+        }
+        if let (Some(pmin), Some(l5)) = (n("proj_minutes"), n("l5_minutes")) {
+            if side == "over" && pmin - l5 >= 3.0 { out.push(format!("The projection plays {last} {} minutes, more than the recent {}; a normal workload shrinks the over.", fmt_num(pmin), fmt_num(l5))); }
+            if side == "under" && l5 - pmin >= 3.0 { out.push(format!("The projection plays {last} {} minutes, fewer than the recent {}; a full workload breaks the under.", fmt_num(pmin), fmt_num(l5))); }
+        }
+        if let Some(a) = n("p_active") { if a < 0.97 { out.push(format!("{last} is not certain to play ({}% of simulations).", pct(a))); } }
+    }
+    if s("lineup_mode") == "projected" { out.push("Lineups are projected, so a late absence changes the numbers.".into()); }
+    if let (Some(ps), Some(sev)) = (n("p_sharp"), n("sharp_ev")) {
+        if sev < 0.0 { out.push(format!("{} has this side at {}%, which makes the price a losing bet without the model.", s("sharp_text"), pct(ps))); }
+    }
+    if let (Some(o), Some(l)) = (n("open_line"), n("line")) {
+        let against = match side.as_str() { "over" => l > o, "under" => l < o, _ => l < o };
+        if (l - o).abs() > 1e-9 && against { out.push(format!("The line has already moved against this side ({} to {}).", fmt_num(o), fmt_num(l))); }
+    }
+    if let (Some(raw), Some(pm)) = (n("p_raw"), n("p_model")) {
+        if raw - pm >= 0.05 { out.push(format!("On its own the engine is more confident ({}%), but its record only justifies {}%.", pct(raw), pct(pm))); }
+    }
+    if let Some(p) = n("p_push") { if p > 0.05 { out.push(format!("{}% of simulations push.", pct(p))); } }
+    if let (Some(pp), Some(m)) = (f["playable_price"].as_i64(), n("playable_min_ev")) {
+        out.push(format!("At worse odds than {} the bet is worth less than {}% per unit.", odds_str(pp as i32), pct(m)));
+    }
+    let mut t = out.join(" ");
+    if let Some(c) = t.get(0..1) { t = c.to_uppercase() + &t[1..]; }
+    t
 }
 
 /// Numbers in a text (for checking an LLM rewrite against the facts).
@@ -506,6 +571,7 @@ async fn llm_writeup(state: &State, facts: &Value, template: &str) -> Option<(St
     let _ = env;
     let system = "You are MonsterGPT, a sports betting analyst. Rewrite the draft into one tight paragraph of 3 to 5 sentences explaining why the pick surfaced. \
         Use ONLY the numbers in the facts and draft; do not invent statistics, injuries, trends or news. Keep the risk or track-record caution if the draft has one. \
+        Then end with a second part that starts exactly \"What could make it wrong:\" and keeps the draft's case against the pick. \
         No hype, no guarantees, no emojis. Plain text only.";
     let user = format!("FACTS (JSON):\n{}\n\nDRAFT:\n{template}", serde_json::to_string(facts).ok()?);
     let body = json!({ "model": model, "temperature": 0.3, "max_tokens": 320, "messages": [{ "role": "system", "content": system }, { "role": "user", "content": user }] });
@@ -513,7 +579,7 @@ async fn llm_writeup(state: &State, facts: &Value, template: &str) -> Option<(St
     if let Some(k) = key { req = req.bearer_auth(k); }
     let v: Value = req.send().await.ok()?.json().await.ok()?;
     let text = v["choices"][0]["message"]["content"].as_str()?.trim().to_string();
-    if text.len() < 120 || text.len() > 1400 { return None; }
+    if text.len() < 120 || text.len() > 2000 || !text.contains("What could make it wrong:") { return None; }
     let low = text.to_lowercase();
     if ["guarantee", "lock of", "can't lose", "cannot lose", "sure thing"].iter().any(|w| low.contains(w)) { return None; }
     let mut allowed = numbers(template);
@@ -550,6 +616,9 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let min_edge = lines::setting(db, "min_edge", 0.015).await;
     // edges this large against real markets are almost always a data or model error
     let max_edge = lines::setting(db, "max_edge", 0.25).await;
+    // "playable to": the worst price still worth this much per unit
+    let playable_ev = lines::setting(db, "playable_min_ev", 0.02).await;
+    backfill_playable(db, sport, playable_ev).await?;
     // market weight used until one is fitted (blend.rs)
     let default_w = lines::setting(db, "blend_default_w", 0.2).await;
     let (kelly_f, kelly_cap) = crate::sharp::stake_settings(db).await;
@@ -749,6 +818,12 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             }
         }
         f.insert("stake".into(), json!((stake * 10000.0).round() / 10000.0));
+        // price sensitivity: break-even, and the worst price still worth playable_min_ev
+        let fair_price = price_for_ev(c.priced.win, c.priced.loss, 0.0);
+        let playable_price = playable_floor(c.priced.win, c.priced.loss, playable_ev, c.q.a_price);
+        f.insert("fair_price".into(), json!(fair_price));
+        f.insert("playable_price".into(), json!(playable_price));
+        f.insert("playable_min_ev".into(), json!(playable_ev));
         if kind == "prop" {
             if let (Some(h), Some(line)) = (hist.get(&c.key.2), c.q.a_line) {
                 let stat: &str = &c.key.1;
@@ -812,12 +887,12 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         let head = c.q.provider_subject.as_ref().and_then(|p| heads.get(p).cloned());
         let n = db.execute("INSERT INTO ai_picks (sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
               line, book, price, link, p_model, p_market, edge, ev, projection, grade, tier, facts, risk_flags, writeup, writeup_source, \
-              latest_line, latest_price, latest_book, latest_p_market, latest_edge, stake) \
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$17,$19,$18,$22,$23,$32) \
+              latest_line, latest_price, latest_book, latest_p_market, latest_edge, stake, fair_price, playable_price) \
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$17,$19,$18,$22,$23,$32,$33,$34) \
             ON CONFLICT (sport, game_id, market, subject, side, engine) DO NOTHING",
             &[&sport, &c.engine, &c.version, &c.ledger_id, &c.key.0, &format!("{away} @ {home}"), &home, &away, &start, &kind, &c.key.1, &c.key.2,
               &subject_name, &subject_team, &head, &c.side, &c.q.a_line, &c.q.book, &c.q.a_price, &c.q.a_link, &pm, &c.p_market, &c.edge, &c.ev,
-              &c.priced.projection, &grade, &c.tier, &facts, &Value::Array(flags), &writeup, &wsrc, &stake]).await.map_err(|e| dberr(&e))?;
+              &c.priced.projection, &grade, &c.tier, &facts, &Value::Array(flags), &writeup, &wsrc, &stake, &fair_price, &playable_price]).await.map_err(|e| dberr(&e))?;
         published += n;
         let _ = &label;
     }
@@ -832,6 +907,28 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "lines_recorded": recorded, "qualifying": keep.len(), "published": published, "updated": updated,
         "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch }, "llm_rewritten": rewritten,
         "orientation_check": { "checked": checked, "agree": agree, "ok": orientation_ok } }))
+}
+
+/// Open picks published before price sensitivity existed: add the fair and
+/// playable prices, and re-draft template writeups so they carry the case against.
+async fn backfill_playable(db: &tokio_postgres::Client, sport: &str, min_ev: f64) -> Result<(), String> {
+    let rows = db.query("SELECT id, p_model, price, facts, writeup_source FROM ai_picks WHERE sport=$1 AND status='open' AND playable_price IS NULL", &[&sport])
+        .await.map_err(|e| dberr(&e))?;
+    for r in &rows {
+        let (id, pm, price0, facts, wsrc): (i64, f64, i32, Json<Value>, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let decided = 1.0 - facts.0["p_push"].as_f64().unwrap_or(0.0);
+        let (win, loss) = (pm * decided, (1.0 - pm) * decided);
+        let fair = price_for_ev(win, loss, 0.0);
+        let playable = playable_floor(win, loss, min_ev, price0);
+        let mut f = facts.0.clone();
+        f["fair_price"] = json!(fair);
+        f["playable_price"] = json!(playable);
+        f["playable_min_ev"] = json!(min_ev);
+        let writeup = if wsrc == "template" { Some(template(&f)) } else { None };
+        db.execute("UPDATE ai_picks SET fair_price=$2, playable_price=$3, facts=$4, writeup=COALESCE($5, writeup) WHERE id=$1",
+            &[&id, &fair, &playable, &f, &writeup]).await.map_err(|e| dberr(&e))?;
+    }
+    Ok(())
 }
 
 /// Record every selection both champion engines can price at its main line (the
@@ -1046,7 +1143,20 @@ pub struct ListQ {
 
 const PICK_COLS: &str = "id, sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
     line, book, price, link, p_model, p_market, edge, ev, projection, grade, tier, risk_flags, writeup, writeup_source, published_at, latest_line, latest_price, latest_book, \
-    latest_p_market, latest_edge, updated_at, status, close_line, close_price, clv, actual, result, profit, settled_at, stake";
+    latest_p_market, latest_edge, updated_at, status, close_line, close_price, clv, actual, result, profit, settled_at, stake, fair_price, playable_price";
+
+/// Can the pick still be played? At the published line: is the latest price at
+/// least the playable price. After a line move the old price floor says nothing,
+/// so null (re-check).
+fn playable_now(status: &str, line: Option<f64>, price: i32, playable: Option<i32>, latest_line: Option<f64>, latest_price: Option<i32>) -> Option<bool> {
+    if status != "open" { return None; }
+    let floor = playable?;
+    match latest_price {
+        None => Some(at_least(price, floor)),
+        Some(_) if latest_line != line => None,
+        Some(p) => Some(at_least(p, floor)),
+    }
+}
 
 fn pick_json(r: &tokio_postgres::Row, full: bool) -> Value {
     let (market, side, line, home, away): (String, String, Option<f64>, Option<String>, Option<String>) = (r.get("market"), r.get("side"), r.get("line"), r.get("home"), r.get("away"));
@@ -1070,8 +1180,11 @@ fn pick_json(r: &tokio_postgres::Row, full: bool) -> Value {
         "profit": r.get::<_, Option<f64>>("profit").map(r3), "clv": r.get::<_, Option<f64>>("clv").map(r3), "stake": r.get::<_, Option<f64>>("stake"),
         "close": { "line": r.get::<_, Option<f64>>("close_line"), "price": r.get::<_, Option<i32>>("close_price") }, "settled_at": r.get::<_, Option<DateTime<Utc>>>("settled_at"),
     });
+    let (fair, playable): (Option<i32>, Option<i32>) = (r.get("fair_price"), r.get("playable_price"));
+    v["fair_price"] = json!(fair);
+    v["playable_price"] = json!(playable);
+    v["playable_now"] = json!(playable_now(&r.get::<_, String>("status"), line, r.get("price"), playable, r.get("latest_line"), r.get("latest_price")));
     let _ = full;
-    let _ = odds_str;
     if v["latest"]["line"].is_null() { v["latest"] = Value::Null; }
     v
 }
@@ -1346,5 +1459,39 @@ mod tests {
         assert!(t.contains("Green has averaged 17.7 and gone under 24.5 in 8 of them (last 20: 19.1 per game)"), "{t}");
         assert!(t.contains("moved from 25.5 at open to 24.5"), "{t}");
         assert_eq!(numbers("a 64.4% edge, 2 of 10, -3.5"), vec![64.4, 2.0, 10.0, 3.5]);
+    }
+
+    #[test]
+    fn price_sensitivity() {
+        // 55% to win, no pushes: break-even at -122; +2% per unit needs -117 or better
+        assert_eq!(price_for_ev(0.55, 0.45, 0.0), Some(-122));
+        assert_eq!(price_for_ev(0.55, 0.45, 0.02), Some(-117));
+        assert_eq!(price_for_ev(0.5, 0.5, 0.0), Some(100));
+        assert_eq!(price_for_ev(0.4, 0.6, 0.0), Some(150));
+        assert!(at_least(-110, -118) && !at_least(-125, -118) && at_least(105, -118));
+        // published at +104 with a -138 break-even (58%): playable well below the published price
+        assert_eq!(playable_floor(0.58, 0.42, 0.02, 104), Some(-131));
+        // a thin pick (EV under 2% at its own price) is playable only at that price
+        assert_eq!(playable_floor(0.55, 0.45, 0.02, -120), Some(-120));
+        // the latest price decides at the published line; a line move means re-check
+        assert_eq!(playable_now("open", Some(24.5), -110, Some(-118), Some(24.5), Some(-120)), Some(false));
+        assert_eq!(playable_now("open", Some(24.5), -110, Some(-118), Some(24.5), Some(-115)), Some(true));
+        assert_eq!(playable_now("open", Some(24.5), -110, Some(-118), Some(23.5), Some(-110)), None);
+        assert_eq!(playable_now("settled", Some(24.5), -110, Some(-118), None, None), None);
+    }
+
+    #[test]
+    fn writeup_carries_the_case_against() {
+        let f = json!({ "kind": "prop", "market": "pts", "side": "over", "line": 24.5, "subject_name": "Jalen Green", "team": "PHX", "opponent": "SAC", "home": false,
+            "engine_label": "possession simulator", "projection": 26.1, "p_model": 0.58, "p_market": 0.52, "p_raw": 0.66, "edge": 0.06, "book_title": "DraftKings",
+            "l10_hits": 3, "l10_games": 10, "proj_minutes": 36.0, "l5_minutes": 31.5, "lineup_mode": "projected", "open_line": 23.5,
+            "playable_price": -118, "playable_min_ev": 0.02, "evidence_text": "" });
+        let t = template(&f);
+        assert!(t.contains("What could make it wrong: The simulations still land on the other side 42% of the time, and the de-vigged market says 52%"), "{t}");
+        assert!(t.contains("Green has finished over 24.5 in only 3 of the last 10 games."), "{t}");
+        assert!(t.contains("plays Green 36 minutes, more than the recent 31.5"), "{t}");
+        assert!(t.contains("moved against this side (23.5 to 24.5)"), "{t}");
+        assert!(t.contains("engine is more confident (66%), but its record only justifies 58%"), "{t}");
+        assert!(t.contains("At worse odds than -118 the bet is worth less than 2% per unit."), "{t}");
     }
 }

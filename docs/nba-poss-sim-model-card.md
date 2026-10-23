@@ -194,10 +194,63 @@ Redistributing the available players' own rates already captures it. So
 (`GET /nba/impact?date=&team=`), and it only ever applies to confirmed or
 actual lineups (a projected lineup knows nothing about absences).
 
+## Garbage time (2026-10-22)
+
+Measured on 117k player-games: when the fourth quarter starts with a close
+game, starters play about 1.2 minutes more than usual; with a 30+ point lead
+they play about 5.5 fewer. The simulator now pulls the core rotation in the
+fourth quarter once the margin reaches `blowout_base + blowout_per_min ×
+minutes left` (8 points plus 1.5 per minute). It sends them back if the lead
+falls under 60% of that threshold. The core is the top `blowout_core` (6)
+players by drawn minutes. In close games they get `blowout_boost` (1.6) extra
+minutes, so the season-average minutes budget still holds.
+In a toy lopsided game the starters drop from 32.6 to 26.7 minutes and the
+bench rises from 15.1 to 21.4. In an even game they stay at 32.2.
+
+Paired walk-forward, `{"blowout": 1}` (`nba-poss-sim-v4+cfg.f7764723`) vs the
+champion, projected lineups, Brier diff z-scores (negative = better):
+
+| Season | Games | PRA | Rebounds | Points | Threes | Blocks | Game lines |
+|---|---|---|---|---|---|---|---|
+| 2025-26 | 1,027 | −13.7 | −8.3 | −6.9 | −4.7 | −2.2 | all within 2 SE |
+| 2024-25 | 1,028 | −13.5 | −10.4 | −6.6 | −5.4 | −1.4 | all within 2 SE |
+| 2023-24 | 1,030 | −13.4 | −13.5 | −7.8 | −4.6 | −3.3 | all within 2 SE |
+
+It passes the gate in all three seasons, and no market is worse by 2 SE.
+`blowout` is a tunable (0 = off), so it reaches production only as a promoted
+config.
+
+## Referee crews (2026-10-22)
+
+`nba_refs.rs` fits each referee's free-throw tendency. Crews come from ESPN
+game summaries, `nba_officials_espn`, backfilled from 2020. The fit is a
+ridge regression of a game's free-throw attempts above the season mean on its
+three referees: shrunk to 0 with 100 games of prior, recency-weighted with a
+540-day half-life, and refitted as of the first of every month. Today's crews come from
+official.nba.com (posted about 9:00 ET, ingested hourly). Walk-forward on 7,781
+regulation games:
+
+| Out of sample, per unit of crew FTA effect | Slope |
+|---|---|
+| Actual free-throw attempts | 0.95 ± 0.13 |
+| Personal fouls | 1.14 ± 0.12 |
+| Possessions | no effect |
+| Actual total − closing total | +0.69 ± 0.28 |
+
+Crews are real (sd about 1.1 free throws, so about ±0.8 total points), and
+the closing line only partly prices them. In the simulator `ref_weight`
+scales every shooting-foul trip by `1 + weight × effect / league FTA`
+(clamped 0.8–1.25), and the crew is shown in the game's `officials` meta.
+Paired evaluation of `{"ref_weight": 1}` (`nba-poss-sim-v4+cfg.eb996979`) on
+about 300 games per season (2024–2026) is neutral: no market moves by 2 SE,
+pooled total −0.0007 ± 0.0012. So `ref_weight` stays 0 until a full-season
+evaluation or live shadow shows a gain.
+
 ## Limitations
 
-* No fouls, foul trouble, end-game fouling, and-1s or timeouts.
-* No lineup positions, and no in-game injuries or blowout rotations.
+* No foul trouble, end-game fouling, and-1s or timeouts.
+* No lineup positions and no in-game injuries; garbage time is a margin rule,
+  not coach-specific.
 * Neutral-site games (international, the NBA Cup final) use the home team's
   arena for time zones.
 * Shot locations are display only: drawn from the shooter's real chart, but
