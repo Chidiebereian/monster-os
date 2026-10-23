@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
-import { americanToDecimal, americanToImpliedProb, formatAmerican, formatPct, impliedOrNull, noVig } from "../lib/odds";
+import { americanToDecimal, americanToImpliedProb, decimalOf, formatAmerican, formatPct, fractionalOf, impliedOrNull, impliedPctText, noVig, parseOdds, stepAmerican } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
 // AI Picks & Projections. Filter sport -> stat -> player, then see that player's
@@ -642,19 +642,42 @@ function Implied({ odds }: { odds: number | string | null | undefined }) {
   return p == null ? null : <span className="text-gray-400 font-mono">({formatPct(p)})</span>;
 }
 
-/** American-odds input with its implied probability alongside (-113 -> 53.1%), updated as you type. */
+/** Odds input: type American (-162.5, +150), decimal (1.62) or fractional (8/13, evens);
+ *  arrows / arrow keys step through real American prices (-101 -> +100, never -99).
+ *  Shows the implied probability, decimal and fractional odds as you type. The
+ *  value handed back is always American. */
 function OddsInput({ label, value, onChange, inline = false }: { label: string; value: string; onChange: (v: string) => void; inline?: boolean }) {
-  const p = impliedOrNull(value);
-  const hint = <span className="font-mono text-xs text-gray-300 whitespace-nowrap" title="Implied probability: the break-even win rate at this price (vig included)">{p == null ? "—" : `${formatPct(p)} implied`}</span>;
-  if (inline) {
-    return (
-      <label className="text-xs text-gray-500 flex items-center gap-1">{label}<Input type="number" value={value} onChange={onChange} className="w-20 ml-1" />{hint}</label>
-    );
-  }
+  const [text, setText] = useState(value);
+  // follow outside changes (market price filled in), not our own normalisation
+  useEffect(() => { if (parseOdds(text) !== parseOdds(value)) setText(value); }, [value]); // eslint-disable-line react-hooks/exhaustive-deps
+  const a = parseOdds(text);
+  const fmt = (x: number) => (x > 0 ? `+${+x.toFixed(1)}` : `${+x.toFixed(1)}`);
+  const set = (t: string) => { setText(t); const x = parseOdds(t); if (x != null) onChange(String(+x.toFixed(1))); };
+  const step = (dir: 1 | -1) => set(fmt(stepAmerican(a ?? -110, dir)));
+  const frac = a == null ? null : fractionalOf(a);
+  const hint = (
+    <span className="font-mono text-[11px] text-gray-300 whitespace-nowrap" title="Implied probability (the break-even win rate at this price, vig included) · decimal · fractional">
+      {a == null ? "—" : <>{impliedPctText(a)} implied<span className="text-gray-500"> · {decimalOf(a)}{frac ? ` · ${frac}` : ""}</span></>}
+    </span>
+  );
+  const box = (
+    <span className={clsx("relative inline-flex", inline ? "w-24 ml-1" : "w-full mt-1")}>
+      <input value={text} inputMode="decimal" spellCheck={false}
+        onChange={(e) => set(e.target.value)}
+        onBlur={() => { if (a != null) setText(fmt(a)); }}
+        onKeyDown={(e) => { if (e.key === "ArrowUp" || e.key === "ArrowDown") { e.preventDefault(); step(e.key === "ArrowUp" ? 1 : -1); } }}
+        className={clsx("w-full rounded-md border bg-surface/60 px-3 py-2 pr-6 text-sm font-mono outline-none focus:border-violet/60", a == null && text.trim() !== "" ? "border-amber/60" : "border-glass")} />
+      <span className="absolute right-1 inset-y-0 flex flex-col justify-center text-[9px] leading-none text-gray-500">
+        <button type="button" tabIndex={-1} onClick={() => step(1)} className="hover:text-gray-200 px-0.5" aria-label="Odds up">▲</button>
+        <button type="button" tabIndex={-1} onClick={() => step(-1)} className="hover:text-gray-200 px-0.5" aria-label="Odds down">▼</button>
+      </span>
+    </span>
+  );
+  if (inline) return <label className="text-xs text-gray-500 flex items-center gap-1">{label}{box}{hint}</label>;
   return (
     <label className="text-xs text-gray-500">
       <span className="flex justify-between gap-2"><span>{label}</span>{hint}</span>
-      <Input type="number" value={value} onChange={onChange} className="w-full mt-1" />
+      {box}
     </label>
   );
 }
