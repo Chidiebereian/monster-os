@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
-import { americanToDecimal, americanToImpliedProb, formatAmerican, formatPct } from "../lib/odds";
+import { americanToDecimal, americanToImpliedProb, formatAmerican, formatPct, impliedOrNull, noVig } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
 // AI Picks & Projections. Filter sport -> stat -> player, then see that player's
@@ -263,7 +263,7 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
     queryKey: ["proj-detail", sport, stat.key, player.player_id],
     queryFn: () => api.playerProjection(sport, stat.key, player.player_id),
   });
-  // live market line for this player+stat (SportsGameOdds), if available
+  // market line for this player+stat (recorded every 20 min from ESPN/DraftKings, The Odds API, SportsGameOdds), if available
   const marketQ = useQuery({
     queryKey: ["mkt-prop", sport, stat.key],
     queryFn: () => api.marketProps(sport, stat.key),
@@ -275,6 +275,10 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
   useEffect(() => {
     if (prop?.line != null) setLine(prop.line);
   }, [prop?.line]);
+  // ...and the odds box to the market's Over price (back to -110 when there is none)
+  useEffect(() => {
+    setMarketOdds(prop?.over_odds != null ? String(prop.over_odds) : "-110");
+  }, [player.player_id, prop?.over_odds]);
 
   const pOver = prob.data?.p_over ?? 0;
   const pUnder = prob.data?.p_under ?? 0;
@@ -307,7 +311,7 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
         <div className="grid md:grid-cols-4 gap-4 items-end">
           <Stat label="Projection (mean)" value={`${mean.toFixed(2)} ${stat.unit}`} />
           <label className="text-xs text-gray-500">Line ({stat.unit})<Input type="number" value={line} onChange={(v) => setLine(Number(v) || 0)} className="w-full mt-1" /></label>
-          <label className="text-xs text-gray-500">Market odds (Over)<Input type="number" value={marketOdds} onChange={setMarketOdds} className="w-full mt-1" /></label>
+          <OddsInput label={`Market odds (Over)${prop?.over_odds != null && String(prop.over_odds) === marketOdds ? ` · ${prop.book ?? "market"}` : ""}`} value={marketOdds} onChange={setMarketOdds} />
           <Stat label="Edge (Over)" value={`${edge >= 0 ? "+" : ""}${formatPct(edge)}`} tone={edge >= 0 ? "pos" : "neg"} />
         </div>
 
@@ -341,7 +345,8 @@ function Distribution({ sport, stat, player }: { sport: string; stat: StatDef; p
             <div className="flex items-center gap-2 mb-2 flex-wrap">
               <span className="font-medium text-sm text-emerald-light">Market EV · live</span>
               <span className="text-xs text-gray-500">
-                {stat.label} {prop.line} · Over {formatAmerican(prop.over_odds)} / Under {formatAmerican(prop.under_odds)} (SportsGameOdds)
+                {stat.label} {prop.line} · Over {formatAmerican(prop.over_odds)} <Implied odds={prop.over_odds} /> / Under {formatAmerican(prop.under_odds)} <Implied odds={prop.under_odds} />
+                {noVig(prop.over_odds, prop.under_odds) != null && <> · no-vig Over {formatPct(noVig(prop.over_odds, prop.under_odds))}</>} ({prop.book ?? "SportsGameOdds"}{prop.books && prop.books > 1 ? `, ${prop.books} books` : ""})
               </span>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -546,8 +551,9 @@ function GameProjections({ sport }: { sport: string }) {
           <div className="flex items-center gap-3 flex-wrap">
             <h3 className="font-medium text-sm">Edge &amp; EV vs market</h3>
             <span className="text-xs text-gray-500">model probability vs the price you pay</span>
-            <label className="text-xs text-gray-500 ml-auto">Spread odds<Input type="number" value={spreadOdds} onChange={setSpreadOdds} className="w-20 ml-1" /></label>
-            <label className="text-xs text-gray-500">Total odds<Input type="number" value={totalOdds} onChange={setTotalOdds} className="w-20 ml-1" /></label>
+            <span className="ml-auto" />
+            <OddsInput inline label="Spread odds" value={spreadOdds} onChange={setSpreadOdds} />
+            <OddsInput inline label="Total odds" value={totalOdds} onChange={setTotalOdds} />
           </div>
           <Table head={<tr><Th>Bet</Th><Th className="text-right">Model</Th><Th className="text-right">Implied</Th><Th className="text-right">Edge</Th><Th className="text-right">EV / $1</Th></tr>}>
             {[
@@ -627,5 +633,28 @@ function HistCurve({ hist, line, loading }: { hist?: SimHistogram; line: number;
       <line x1={lineX} y1={2} x2={lineX} y2={H} stroke="#F59E0B" strokeWidth={1.5} strokeDasharray="4 3" />
       <text x={Math.min(lineX, W - 14)} y={10} fill="#F59E0B" fontSize="9" textAnchor="middle">line</text>
     </svg>
+  );
+}
+
+/** "(53.1%)": the implied probability of an American price, or nothing when it is not one. */
+function Implied({ odds }: { odds: number | string | null | undefined }) {
+  const p = impliedOrNull(odds);
+  return p == null ? null : <span className="text-gray-400 font-mono">({formatPct(p)})</span>;
+}
+
+/** American-odds input with its implied probability alongside (-113 -> 53.1%), updated as you type. */
+function OddsInput({ label, value, onChange, inline = false }: { label: string; value: string; onChange: (v: string) => void; inline?: boolean }) {
+  const p = impliedOrNull(value);
+  const hint = <span className="font-mono text-xs text-gray-300 whitespace-nowrap" title="Implied probability: the break-even win rate at this price (vig included)">{p == null ? "—" : `${formatPct(p)} implied`}</span>;
+  if (inline) {
+    return (
+      <label className="text-xs text-gray-500 flex items-center gap-1">{label}<Input type="number" value={value} onChange={onChange} className="w-20 ml-1" />{hint}</label>
+    );
+  }
+  return (
+    <label className="text-xs text-gray-500">
+      <span className="flex justify-between gap-2"><span>{label}</span>{hint}</span>
+      <Input type="number" value={value} onChange={onChange} className="w-full mt-1" />
+    </label>
   );
 }

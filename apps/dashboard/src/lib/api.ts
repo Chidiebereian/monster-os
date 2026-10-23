@@ -209,6 +209,8 @@ export interface MarketGame {
 export interface MarketProp {
   player: string; player_id: string | null; team: string | null;
   line: number | null; over_odds: number | null; under_odds: number | null;
+  /** recorded lines: the book priced and how many books quote the main line */
+  book?: string; books?: number;
 }
 export interface PlayerBacktest {
   sport: string; stat: string; label: string; unit: string; family: string;

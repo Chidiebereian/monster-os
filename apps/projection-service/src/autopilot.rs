@@ -99,6 +99,15 @@ pub fn spawn(state: web::Data<State>) {
                 let v = crate::nba_refs::ingest_assignments(&s2).await;
                 mark(&s2.db, "ingest:nba_refs", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
             }
+            // Projections page: rebuild players, teams (live rosters), logs, games and
+            // projections from the simulator warehouses (proj_sync.rs); in-season sports every 6 h
+            for sport in crate::proj_sync::SPORTS {
+                let job = format!("sync:{sport}");
+                if paused(&s2.db).await || !due(&s2.db, &job, if *sport == "mlb" { 1440 } else { 360 }).await { continue; }
+                let v = crate::proj_sync::run(&s2, sport).await;
+                if let Err(e) = &v { println!("autopilot projections sync {sport}: {e}"); }
+                mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             // AI Picks evidence first: an engine whose code changed re-earns its grade caps
             if !paused(&s2.db).await {
                 if let Some(engine) = crate::evidence::due(&s2).await {

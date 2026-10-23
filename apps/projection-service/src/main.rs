@@ -58,6 +58,7 @@ mod nhl_api;
 mod nhl_game;
 mod nhl_sim;
 mod nhl_teams;
+mod proj_sync;
 mod teams;
 
 const NFLVERSE_PLAYER_STATS: &str =
@@ -251,7 +252,13 @@ struct IngestQuery {
     halflife: f64,
     /// comma-separated stat keys; empty = all NFL stats
     stats: Option<String>,
+    /// "current": only the current-season weekly files (skip the 1999- cumulative file)
+    sources: Option<String>,
+    /// false: store players and logs only (proj_sync.rs fits from every stored season)
+    #[serde(default = "yes")]
+    fit: bool,
 }
+fn yes() -> bool { true }
 fn d_min_games() -> usize { 8 }
 fn d_prior_k() -> f64 { 6.0 }
 fn d_halflife() -> f64 { 34.0 }
@@ -298,7 +305,8 @@ async fn ingest_nfl(state: web::Data<State>, q: web::Query<IngestQuery>) -> impl
 
     // 1. sources: cumulative 1999-2024 file (old schema) + current-season files
     //    (newer schema). Parse each with alias-aware column lookup and merge.
-    let mut sources: Vec<String> = vec![state.nflverse_url.clone()];
+    let current_only = q.sources.as_deref() == Some("current");
+    let mut sources: Vec<String> = if current_only { Vec::new() } else { vec![state.nflverse_url.clone()] };
     match std::env::var("NFLVERSE_CURRENT_URLS") {
         Ok(v) if !v.trim().is_empty() => sources.extend(v.split(',').map(|s| s.trim().to_string())),
         _ => sources.extend(NFL_CURRENT_SEASON_URLS.iter().map(|s| s.to_string())),
@@ -426,7 +434,7 @@ async fn ingest_nfl(state: web::Data<State>, q: web::Query<IngestQuery>) -> impl
         if let Err(e) = persist_game_logs(&state.db, pid, p).await {
             return internal(e);
         }
-        for s in &selected {
+        for s in selected.iter().filter(|_| q.fit) {
             let vals: Vec<f64> = p.games.iter()
                 .filter(|g| *g.vals.get(s.opportunity).unwrap_or(&0.0) >= 1.0)
                 .map(|g| *g.vals.get(s.column).unwrap_or(&0.0))
@@ -731,6 +739,7 @@ async fn main() -> std::io::Result<()> {
             .route("/projections/nba/{stat}", web::get().to(nba::list_stat))
             .route("/projections/nba/{stat}/{player_id}", web::get().to(nba::get_player_stat))
             .route("/fit/nba/teams", web::post().to(nba_teams::fit_teams))
+            .route("/sync/projections", web::post().to(proj_sync::sync_http))
             .route("/teams/nba", web::get().to(nba_teams::list_ratings))
             .route("/games/nba", web::get().to(nba_teams::list_games))
             .route("/matchup/nba", web::get().to(nba_teams::matchup))

@@ -9,6 +9,20 @@ export function americanToImpliedProb(american: number): number {
   return american > 0 ? 100 / (american + 100) : Math.abs(american) / (Math.abs(american) + 100);
 }
 
+/** Implied probability of an American price, or null when it is not a valid
+ *  price (|odds| < 100, empty, mid-typing). -113 -> 0.531. */
+export function impliedOrNull(american: number | string | null | undefined): number | null {
+  const a = typeof american === "string" ? Number(american.trim()) : american;
+  if (a == null || !Number.isFinite(a) || Math.abs(a) < 100) return null;
+  return americanToImpliedProb(a);
+}
+
+/** Two-way no-vig probability of the first side (the bookmaker's margin removed). */
+export function noVig(a: number | null | undefined, b: number | null | undefined): number | null {
+  const x = impliedOrNull(a), y = impliedOrNull(b);
+  return x == null || y == null ? null : x / (x + y);
+}
+
 /** Format American odds with an explicit sign, e.g. +145 / -160. */
 export function formatAmerican(american: number | null | undefined): string {
   if (american == null) return "—";

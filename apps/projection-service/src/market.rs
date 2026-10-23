@@ -237,9 +237,55 @@ pub(crate) async fn fetch_props(state: &State, sport: &str, stats: &[&'static st
 // --------------------------------------------------------------------------
 // GET /market/{sport}/games  -> current game lines (ml / spread / total)
 // --------------------------------------------------------------------------
-pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Responder {
+/// Game lines from market_lines (see `recorded_props`): per game and market the
+/// main line, priced at DraftKings when it quotes it, else the first book that does.
+async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<Value>, String> {
+    let rows = db.query("SELECT DISTINCT ON (m.book, m.game_id, m.market, m.side) m.book, m.game_id, m.market, m.side, m.line, m.price, g.home_team, g.away_team, m.starts_at         FROM market_lines m JOIN sports_games g ON g.sport = m.sport AND g.game_id = m.game_id         WHERE m.sport=$1 AND m.kind='game' AND m.starts_at > now() AND m.observed_at > now() - interval '6 hours'         ORDER BY m.book, m.game_id, m.market, m.side, m.observed_at DESC", &[&sport]).await.map_err(|e| e.to_string())?;
+    // game -> (home, away, start, market -> book -> line key -> (a side, b side))
+    type Book = HashMap<String, HashMap<String, (Option<(Option<f64>, i32)>, Option<(Option<f64>, i32)>)>>;
+    let mut by: HashMap<String, (String, String, Option<chrono::DateTime<chrono::Utc>>, HashMap<String, Book>)> = HashMap::new();
+    for r in &rows {
+        let (book, gid, market, side, line, price): (String, String, String, String, Option<f64>, i32) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
+        let g = by.entry(gid).or_insert_with(|| (r.get(6), r.get(7), r.get(8), HashMap::new()));
+        // pair sides at the same number (a spread's away side is the negated home line)
+        let k = match market.as_str() { "spread" => format!("{}", if side == "away" { -line.unwrap_or(0.0) } else { line.unwrap_or(0.0) }), "moneyline" => "ml".into(), _ => format!("{}", line.unwrap_or(0.0)) };
+        let q = g.3.entry(market).or_default().entry(book).or_default().entry(k).or_default();
+        if side == "home" || side == "over" { q.0 = Some((line, price)) } else { q.1 = Some((line, price)) }
+    }
+    let pick = |m: Option<&Book>| -> Option<((Option<f64>, i32), (Option<f64>, i32))> {
+        let m = m?;
+        let mut count: HashMap<&String, usize> = HashMap::new();
+        for lines in m.values() { for (k, (a, b)) in lines { if a.is_some() && b.is_some() { *count.entry(k).or_default() += 1; } } }
+        let (main, _) = count.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))?;
+        let mut books: Vec<&String> = m.keys().filter(|b| m[*b].get(main).map(|(a, c)| a.is_some() && c.is_some()).unwrap_or(false)).collect();
+        books.sort_by_key(|b| (b.as_str() != "draftkings", b.to_string()));
+        let (a, b) = m[*books.first()?][main];
+        Some((a?, b?))
+    };
+    let mut out = Vec::new();
+    for (_, (home, away, start, mk)) in by {
+        let ml = pick(mk.get("moneyline"));
+        let sp = pick(mk.get("spread"));
+        let tot = pick(mk.get("total"));
+        let novig = ml.map(|((_, h), (_, a))| { let (ih, ia) = (implied(h as f64), implied(a as f64)); (ih / (ih + ia) * 1000.0).round() / 1000.0 });
+        out.push(json!({ "home": home, "away": away, "starts_at": start,
+            "ml_home_odds": ml.map(|x| x.0 .1), "ml_away_odds": ml.map(|x| x.1 .1), "novig_home_win": novig,
+            "spread": sp.and_then(|x| x.0 .0), "spread_home_odds": sp.map(|x| x.0 .1), "spread_away_odds": sp.map(|x| x.1 .1),
+            "total": tot.and_then(|x| x.0 .0), "over_odds": tot.map(|x| x.0 .1), "under_odds": tot.map(|x| x.1 .1) }));
+    }
+    out.sort_by(|a, b| a["starts_at"].as_str().cmp(&b["starts_at"].as_str()));
+    Ok(out)
+}
+
+pub async fn games(state: web::Data<State>, path: web::Path<String>, q: web::Query<PropsQ>) -> impl Responder {
     let sport = path.into_inner();
     if league(&sport).is_none() { return bad_request("unknown sport"); }
+    if !q.live {
+        return match recorded_games(&state.db, &sport).await {
+            Ok(out) => HttpResponse::Ok().json(json!({ "sport": sport, "source": "recorded", "count": out.len(), "games": out })),
+            Err(e) => internal(e),
+        };
+    }
     match fetch_games(&state, &sport).await {
         Ok(out) => HttpResponse::Ok().json(json!({ "sport": sport, "count": out.len(), "games": out })),
         Err(e) => internal(e),
@@ -249,9 +295,61 @@ pub async fn games(state: web::Data<State>, path: web::Path<String>) -> impl Res
 // --------------------------------------------------------------------------
 // GET /market/{sport}/props/{stat}  -> player prop lines matched to our players
 // --------------------------------------------------------------------------
-pub async fn props(state: web::Data<State>, path: web::Path<(String, String)>) -> impl Responder {
+#[derive(serde::Deserialize)]
+pub struct PropsQ { #[serde(default)] live: bool }
+
+/// The recorded-lines market for a Projections-page stat key.
+pub(crate) fn recorded_market(sport: &str, key: &str) -> Option<&'static str> {
+    Some(match (sport, key) {
+        ("nba", "points") => "pts", ("nba", "rebounds") => "reb", ("nba", "assists") => "ast", ("nba", "threes") => "fg3m",
+        ("nba", "steals") => "stl", ("nba", "blocks") => "blk", ("nba", "turnovers") => "tov", ("nba", "pra") => "pra",
+        ("nhl", "shots") => "sog", ("nhl", "goals") => "goals", ("nhl", "assists") => "assists", ("nhl", "points") => "points", ("nhl", "saves") => "saves",
+        ("nfl", "pass_yds") => "pass_yds", ("nfl", "rush_yds") => "rush_yds", ("nfl", "rec_yds") => "rec_yds", ("nfl", "receptions") => "receptions",
+        _ => return None,
+    })
+}
+
+/// Prop lines from market_lines (lines.rs records ESPN/DraftKings, The Odds API and
+/// SportsGameOdds every 20 minutes for AI Picks), so the page spends no provider
+/// budget. Per player: the main line (the one most books quote), priced at
+/// DraftKings when it quotes it, else the first book that does.
+async fn recorded_props(db: &tokio_postgres::Client, sport: &str, market: &str) -> Result<Vec<Value>, String> {
+    let rows = db.query("SELECT DISTINCT ON (book, game_id, subject, side) book, game_id, subject, subject_name, side, line, price, observed_at         FROM market_lines WHERE sport=$1 AND kind='prop' AND market=$2 AND starts_at > now() AND observed_at > now() - interval '6 hours'         ORDER BY book, game_id, subject, side, observed_at DESC", &[&sport, &market]).await.map_err(|e| e.to_string())?;
+    // subject -> (name, book -> line -> (over, under))
+    let mut by: HashMap<String, (String, HashMap<String, HashMap<String, (Option<i32>, Option<i32>)>>)> = HashMap::new();
+    for r in &rows {
+        let (book, subj, name, side, line, price): (String, String, Option<String>, String, Option<f64>, i32) = (r.get(0), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6));
+        let Some(line) = line else { continue };
+        let e = by.entry(subj).or_insert_with(|| (name.clone().unwrap_or_default(), HashMap::new()));
+        let q = e.1.entry(book).or_default().entry(format!("{line}")).or_default();
+        if side == "over" { q.0 = Some(price) } else { q.1 = Some(price) }
+    }
+    let mut out = Vec::new();
+    for (subj, (name, books)) in by {
+        let mut count: HashMap<String, usize> = HashMap::new();
+        for lines in books.values() { for (l, (o, u)) in lines { if o.is_some() && u.is_some() { *count.entry(l.clone()).or_default() += 1; } } }
+        let Some((main, n)) = count.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))) else { continue };
+        let mut names: Vec<&String> = books.keys().filter(|b| books[*b].get(&main).map(|(o, u)| o.is_some() && u.is_some()).unwrap_or(false)).collect();
+        names.sort_by_key(|b| (b.as_str() != "draftkings", b.to_string()));
+        let Some(book) = names.first() else { continue };
+        let (o, u) = books[*book][&main];
+        out.push(json!({ "player": name, "player_id": subj, "team": Value::Null, "line": main.parse::<f64>().ok(),
+            "over_odds": o, "under_odds": u, "book": crate::picks::book_title(book), "books": n }));
+    }
+    Ok(out)
+}
+
+pub async fn props(state: web::Data<State>, path: web::Path<(String, String)>, q: web::Query<PropsQ>) -> impl Responder {
     let (sport, stat) = path.into_inner();
     if league(&sport).is_none() { return bad_request("unknown sport"); }
+    if !q.live {
+        if let Some(m) = recorded_market(&sport, &stat) {
+            return match recorded_props(&state.db, &sport, m).await {
+                Ok(out) => HttpResponse::Ok().json(json!({ "sport": sport, "stat": stat, "source": "recorded", "count": out.len(), "props": out })),
+                Err(e) => internal(e),
+            };
+        }
+    }
     let Some(sgo) = sgo_stat(&sport, &stat) else { return bad_request("stat has no mapped market"); };
     let Some(def) = crate::player_backtest::stat_def(&sport, &stat) else { return bad_request("unknown stat"); };
     match fetch_props(&state, &sport, &[def.key]).await {
