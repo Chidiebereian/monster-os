@@ -68,14 +68,14 @@ pub fn is_address(s: &str) -> bool {
 }
 
 /// A number that may arrive as a JSON number or a numeric string.
-fn num(v: &Value, k: &str) -> Option<f64> {
+pub(crate) fn num(v: &Value, k: &str) -> Option<f64> {
     match v.get(k)? {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.parse().ok(),
         _ => None,
     }
 }
-fn text(v: &Value, k: &str) -> Option<String> {
+pub(crate) fn text(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
@@ -126,14 +126,27 @@ pub fn slice_range(points: &[(i64, f64)], range: &str) -> Vec<(i64, f64)> {
 
 // ---------- HTTP plumbing ----------
 
-async fn get_json(state: &State, url: &str) -> Result<Value, String> {
-    let resp = state.http.get(url).send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body: Value = resp.json().await.map_err(|e| format!("{url}: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("{url}: HTTP {status}: {body}"));
+/// GET a JSON body. Polymarket's Cloudflare throttle answers 429 (or a 5xx)
+/// with a non-JSON page, so check the status first and back off and retry
+/// those up to 3 times (1 s, 2 s, 4 s, or the Retry-After it sends).
+pub(crate) async fn get_json(state: &State, url: &str) -> Result<Value, String> {
+    let mut wait = 1u64;
+    for attempt in 0..4 {
+        let resp = state.http.get(url).send().await.map_err(|e| format!("{url}: {e}"))?;
+        let status = resp.status();
+        if (status.as_u16() == 429 || status.is_server_error()) && attempt < 3 {
+            let after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+            actix_web::rt::time::sleep(std::time::Duration::from_secs(after.unwrap_or(wait).min(30))).await;
+            wait *= 2;
+            continue;
+        }
+        let text = resp.text().await.map_err(|e| format!("{url}: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("{url}: HTTP {status}: {}", text.chars().take(200).collect::<String>()));
+        }
+        return serde_json::from_str(&text).map_err(|e| format!("{url}: {e}: {}", text.chars().take(120).collect::<String>()));
     }
-    Ok(body)
+    Err(format!("{url}: still throttled after retries"))
 }
 
 fn lb_url(state: &State, category: &str, window: &str, order: &str, limit: usize, offset: usize) -> String {
@@ -144,7 +157,7 @@ fn lb_url(state: &State, category: &str, window: &str, order: &str, limit: usize
 }
 
 /// One wallet's standing on one leaderboard (rank, pnl, vol), if it has one.
-async fn standing(state: &State, wallet: &str, category: &str, window: &str) -> Option<(i32, f64, f64)> {
+pub(crate) async fn standing(state: &State, wallet: &str, category: &str, window: &str) -> Option<(i32, f64, f64)> {
     let url = format!(
         "{}/v1/leaderboard?category={category}&timePeriod={window}&orderBy=PNL&user={wallet}",
         state.pm_url
@@ -428,7 +441,7 @@ async fn fetch_board(
     Ok(out)
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),

@@ -152,3 +152,38 @@ export function timeAgo(ts: number): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
+
+// ---------- Smart Signals ----------
+
+export interface PmSignal {
+  id: number; wallet: string; asset: string; category: string | null; title: string | null; slug: string | null;
+  event_slug: string | null; icon: string | null; outcome: string | null;
+  entry_price: number | null; entry_usdc: number | null; entry_shares: number | null;
+  first_trade_at: string | null; last_trade_at: string | null; current_price: number | null; price_at_signal: number | null;
+  slippage: number | null; depth_2c: number | null; rel_size: number | null; wallet_score: number | null;
+  score: number | null; best_score: number | null; precision: boolean | null; flow: boolean | null;
+  parts: Record<string, number> | null; flags: string[] | null; status: string; close_reason: string | null;
+  first_seen: string; last_seen: string; closed_at: string | null; result: string | null; final_price: number | null;
+  name: string | null; profile_image: string | null; normal_bet: number | null;
+  cat_rank: number | null; cat_pnl: number | null; cat_vol: number | null; cat_roi: number | null;
+  overall_rank: number | null; overall_pnl: number | null;
+}
+export interface SignalStatus { state: string; since?: string; last?: { started: string; seconds: number; wallets: number; candidates: number; active: number; retired: number; resolved: number; new_trades: number }; error?: string }
+export interface Consensus {
+  asset: string; title: string | null; slug: string | null; event_slug: string | null; icon: string | null; outcome: string | null;
+  category: string | null; wallets: number; usdc: number | null; avg_entry: number | null; current_price: number | null;
+  avg_wallet_score: number; top_signal_score: number | null; depth_2c: number | null; score: number;
+  members: { wallet: string; name: string | null; entry: number; usdc: number; wallet_score: number }[] | null;
+  opposed: number;
+}
+export interface SignalRecord { modes: { mode: string; resolved: number; won: number; hit_rate: number | null; roi: number | null }[]; unresolved: number }
+
+export const pmSignals = {
+  list: (o: { mode: string; category?: string; min_score?: number; limit?: number }) =>
+    getJson<{ rows: PmSignal[]; status: SignalStatus }>(`/pm/signals?${qs(o)}`),
+  consensus: (o: { category?: string; min_wallets?: number } = {}) => getJson<{ rows: Consensus[] }>(`/pm/signals/consensus?${qs(o)}`),
+  history: (o: { category?: string; limit?: number } = {}) => getJson<{ rows: PmSignal[] }>(`/pm/signals/history?${qs(o)}`),
+  record: () => getJson<SignalRecord>(`/pm/signals/record`),
+  chart: (asset: string, range = "1w") => getJson<{ points: { t: number; p: number }[] }>(`/pm/signals/chart?${qs({ asset, range })}`),
+  run: () => fetch(`/api/whale-tracker/pm/signals/run`, { method: "POST" }).then((r) => r.json()),
+};

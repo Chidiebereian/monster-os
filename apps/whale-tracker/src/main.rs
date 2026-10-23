@@ -13,7 +13,10 @@
 //! (default https://data-api.polymarket.com). Kalshi is not covered: it does
 //! not expose per-wallet trades publicly.
 
+#![recursion_limit = "256"]
+
 mod pm;
+mod signals;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -864,6 +867,7 @@ async fn main() -> std::io::Result<()> {
     });
 
     println!("whale-tracker listening on 0.0.0.0:{port} (polymarket {}, clickhouse {})", state.pm_url, state.ch_url);
+    signals::spawn_loop(state.clone());
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
@@ -882,6 +886,13 @@ async fn main() -> std::io::Result<()> {
             .route("/pm/discover/whales", web::get().to(pm::whales))
             .route("/pm/discover/insiders", web::get().to(pm::insiders))
             .route("/pm/discover/movers", web::get().to(pm::movers))
+            .route("/pm/signals", web::get().to(signals::list))
+            .route("/pm/signals/consensus", web::get().to(signals::consensus))
+            .route("/pm/signals/history", web::get().to(signals::history))
+            .route("/pm/signals/record", web::get().to(signals::record))
+            .route("/pm/signals/chart", web::get().to(signals::chart))
+            .route("/pm/signals/status", web::get().to(signals::status))
+            .route("/pm/signals/run", web::post().to(signals::run_http))
     })
     .bind(("0.0.0.0", port))?
     .run()
