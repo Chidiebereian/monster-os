@@ -2486,6 +2486,7 @@ dependencies = [
  "actix-web",
  "chrono",
  "common",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

@@ -13,6 +13,8 @@
 //! (default https://data-api.polymarket.com). Kalshi is not covered: it does
 //! not expose per-wallet trades publicly.
 
+mod pm;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -872,6 +874,14 @@ async fn main() -> std::io::Result<()> {
             .route("/exposure", web::get().to(exposure))
             .route("/trades", web::get().to(trades))
             .route("/candles", web::get().to(candles))
+            .route("/pm/leaderboard", web::get().to(pm::leaderboard))
+            .route("/pm/wallet/{addr}", web::get().to(pm::wallet))
+            .route("/pm/wallet/{addr}/positions", web::get().to(pm::positions))
+            .route("/pm/wallet/{addr}/activity", web::get().to(pm::activity))
+            .route("/pm/wallet/{addr}/pnl", web::get().to(pm::pnl))
+            .route("/pm/discover/whales", web::get().to(pm::whales))
+            .route("/pm/discover/insiders", web::get().to(pm::insiders))
+            .route("/pm/discover/movers", web::get().to(pm::movers))
     })
     .bind(("0.0.0.0", port))?
     .run()

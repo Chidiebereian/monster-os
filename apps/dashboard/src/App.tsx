@@ -8,6 +8,7 @@ import { Arbitrage } from "./pages/Arbitrage";
 import { WhaleWatch } from "./pages/WhaleWatch";
 import { SmartSignals } from "./pages/SmartSignals";
 import { TopTraders } from "./pages/TopTraders";
+import { WalletProfile } from "./pages/WalletProfile";
 import { Backtest } from "./pages/Backtest";
 import { Cheatsheets } from "./pages/Cheatsheets";
 import { HitRates } from "./pages/HitRates";
@@ -39,6 +40,7 @@ export default function App() {
             <Route path="/whale-watch" element={<WhaleWatch />} />
             <Route path="/signals" element={<SmartSignals />} />
             <Route path="/copy" element={<TopTraders />} />
+            <Route path="/wallets/:addr" element={<WalletProfile />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/picks" element={<AiPicks />} />
             <Route path="/models" element={<ModelIntelligence />} />
