@@ -7,6 +7,8 @@ import { Card, Msg } from "../ui";
 import { useSimulationPlayback } from "../../hooks/useSimulationPlayback";
 import { Controls, shortName } from "./Broadcast";
 import { StartersCompare, type LineupMode } from "./StartersCompare";
+import { SegmentPanel } from "./SegmentPanel";
+import type { SegmentBlock } from "../../lib/api";
 
 // NHL Game Broadcast: one seeded game, event by event, from projection-service
 // (nhl_sim). Goals, shots, penalties, power plays, goalie pulls, clock and box
@@ -276,6 +278,7 @@ export function NhlBroadcast() {
                   <div className="text-[11px] text-gray-400">P(over 5.5) {formatPct(ens.data.total.lines.find((l) => l.line === 5.5)?.over ?? 0)} · OT {formatPct(ens.data.win.overtime)}</div></div>
                 <div><div className="text-[11px] text-gray-500">{teams[1]} win</div><div className="font-mono text-xl">{formatPct(ens.data.win.home)}</div></div>
               </div>
+              <SegmentPanel teams={teams} h1={(ens.data as { h1?: SegmentBlock }).h1} score={(ens.data as { score?: { away: { mean: number; q10: number; q90: number }; home: { mean: number; q10: number; q90: number } } }).score} />
               <div className="text-[12px] text-gray-400">{ens.data.goalies.map((g) => `${g.name} (${g.team}) saves ${g.saves.q50} (80%: ${g.saves.q10}–${g.saves.q90})`).join(" · ")}</div>
               <div className="grid grid-cols-2 gap-4">
                 {(["away", "home"] as const).map((side, t) => (

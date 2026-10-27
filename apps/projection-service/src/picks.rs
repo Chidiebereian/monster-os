@@ -39,6 +39,7 @@ use tokio_postgres::types::Json;
 
 use crate::blend;
 use crate::lines;
+use crate::segments;
 use crate::State;
 
 fn dberr(e: &tokio_postgres::Error) -> String {
@@ -52,7 +53,7 @@ fn r1(x: f64) -> f64 { (x * 10.0).round() / 10.0 }
 fn r3(x: f64) -> f64 { (x * 1000.0).round() / 1000.0 }
 fn pct(x: f64) -> f64 { r1(x * 100.0) }
 
-pub const SPORTS: [&str; 3] = ["nba", "nhl", "nfl"];
+pub const SPORTS: [&str; 4] = ["nba", "nhl", "nfl", "mlb"];
 pub const GRADES: [&str; 8] = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
 
 // ---------------------------------------------------------------------------
@@ -158,6 +159,31 @@ pub(crate) fn price(payload: &Value, team: bool, market: &str, subject: &str, si
             let d = if team { Dist::from_json(&payload["dist"]["total"]) } else { Dist::from_json(&payload["total"]) }?;
             Some(Priced::from_dist(&d, side == "over", line?))
         }
+        // team totals and the first-segment markets: every engine serves the same
+        // keys (`score.home|away`, `h1.*`), see segments::Joint
+        "team_total_home" | "team_total_away" => {
+            let d = Dist::from_json(&payload["score"][if market == "team_total_home" { "home" } else { "away" }])?;
+            Some(Priced::from_dist(&d, side == "over", line?))
+        }
+        "moneyline_1h" => {
+            let w = &payload["h1"]["win"];
+            let (h, a, t) = (w["home"].as_f64()?, w["away"].as_f64()?, w["tie"].as_f64().unwrap_or(0.0));
+            let (win, loss) = if side == "home" { (h, a) } else { (a, h) };
+            // a tied first half refunds a two-way moneyline
+            Some(Priced { win, loss, push: t, projection: payload["h1"]["margin_home"]["mean"].as_f64(), q: None, p_active: None })
+        }
+        "spread_1h" => {
+            let l = line?;
+            let d = Dist::from_json(&payload["h1"]["margin_home"])?;
+            let (o, u, p) = d.split(if side == "home" { -l } else { l });
+            let (win, loss) = if side == "home" { (o, u) } else { (u, o) };
+            Some(Priced { win, loss, push: p, projection: Some(d.mean()), q: Some((d.quantile(0.1), d.quantile(0.5), d.quantile(0.9))), p_active: None })
+        }
+        "total_1h" | "team_total_home_1h" | "team_total_away_1h" => {
+            let k = match market { "total_1h" => "total", "team_total_home_1h" => "home", _ => "away" };
+            let d = Dist::from_json(&payload["h1"][k])?;
+            Some(Priced::from_dist(&d, side == "over", line?))
+        }
         stat => {
             let (p, _) = player_entry(payload, subject)?;
             let d = Dist::from_json(if stat == "saves" && p["saves"].is_object() { &p["saves"] } else { &p["stats"][stat] })?;
@@ -251,9 +277,9 @@ pub(crate) fn tier(rows: &[Evidence]) -> (&'static str, Option<Evidence>) {
 pub(crate) fn prop_tier(ev: &HashMap<(String, String), Vec<Evidence>>, engine: &str, market: &str) -> (&'static str, Option<Evidence>) {
     let own = ev.get(&(engine.to_string(), market.to_string())).map(|v| v.as_slice()).unwrap_or(&[]);
     let t = tier(own);
-    if !own.is_empty() || matches!(market, "moneyline" | "spread" | "total") { return t; }
+    if !own.is_empty() || segments::is_game_market(market) { return t; }
     let mut related: Vec<(&String, (&'static str, Option<Evidence>))> = ev.iter()
-        .filter(|((e, m), _)| e == engine && !matches!(m.as_str(), "moneyline" | "spread" | "total" | "_none"))
+        .filter(|((e, m), _)| e == engine && !segments::is_game_market(m) && m != "_none")
         .map(|((_, m), rows)| (m, tier(rows))).collect();
     related.sort_by(|a, b| a.0.cmp(b.0));
     if related.iter().any(|(_, (t, _))| *t == "proven" || *t == "baseline") { return t; }
@@ -306,13 +332,17 @@ fn signed_pct(x: f64) -> String { let p = pct(x); if p > 0.0 { format!("+{p}%") 
 fn fmt_num(x: f64) -> String { if (x - x.round()).abs() < 1e-9 { format!("{}", x.round() as i64) } else { format!("{:.1}", x) } }
 fn odds_str(p: i32) -> String { if p > 0 { format!("+{p}") } else { p.to_string() } }
 
-pub(crate) fn pick_label(market: &str, side: &str, line: Option<f64>, home: &str, away: &str) -> String {
+pub(crate) fn pick_label(sport: &str, market: &str, side: &str, line: Option<f64>, home: &str, away: &str) -> String {
     let team = if side == "home" { home } else { away };
+    let ou = if side == "over" { "Over" } else { "Under" };
+    let seg = if market.ends_with("_1h") { format!("{} ", segments::tag(sport)) } else { String::new() };
     match market {
-        "moneyline" => format!("{team} ML"),
-        "spread" => format!("{team} {}", line.map(signed).unwrap_or_default()),
-        "total" => format!("{} {}", if side == "over" { "Over" } else { "Under" }, line.map(fmt_num).unwrap_or_default()),
-        m => format!("{} {} {}", if side == "over" { "Over" } else { "Under" }, line.map(fmt_num).unwrap_or_default(), stat_label(m)),
+        "moneyline" | "moneyline_1h" => format!("{team} {seg}ML"),
+        "spread" | "spread_1h" => format!("{team} {seg}{}", line.map(signed).unwrap_or_default()),
+        "total" | "total_1h" => format!("{seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
+        "team_total_home" | "team_total_home_1h" => format!("{home} {seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
+        "team_total_away" | "team_total_away_1h" => format!("{away} {seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
+        m => format!("{ou} {} {}", line.map(fmt_num).unwrap_or_default(), stat_label(m)),
     }
 }
 
@@ -399,8 +429,8 @@ async fn team_form(db: &tokio_postgres::Client, sport: &str, teams: &[String]) -
 // Writeups
 // ---------------------------------------------------------------------------
 
-fn evidence_sentence(tier: &str, ev: &Option<Evidence>, market: &str) -> String {
-    let what = if matches!(market, "moneyline" | "spread" | "total") { format!("{} lines", market) } else { format!("{} props", stat_label(market).to_lowercase()) };
+fn evidence_sentence(sport: &str, tier: &str, ev: &Option<Evidence>, market: &str) -> String {
+    let what = if segments::is_game_market(market) { format!("{} lines", segments::market_label(sport, market).to_lowercase()) } else { format!("{} props", stat_label(market).to_lowercase()) };
     match (tier, ev) {
         ("proven", Some(e)) if e.source == "live" => format!("Track record: on {} settled {what}, this engine's probabilities have beaten the de-vigged market.", e.n),
         ("proven", Some(e)) => format!("Track record: in walk-forward backtests this engine beat real {what} in {} of {} seasons and was never significantly worse.", e.better, e.seasons),
@@ -439,15 +469,25 @@ pub(crate) fn template(f: &Value) -> String {
         }
     } else {
         let (home, away) = (s("home_team"), s("away_team"));
-        match s("market").as_str() {
-            "moneyline" => out.push(format!("{away} at {home}: the {} gives {} a {}% chance to win; the de-vigged price at {} implies {}%, an edge of {} points.",
-                s("engine_label"), s("pick_team"), pct(n("p_model").unwrap_or(0.0)), s("book_title"), pct(n("p_market").unwrap_or(0.0)), pct(n("edge").unwrap_or(0.0)))),
-            "spread" => out.push(format!("{away} at {home}: the {} projects a home margin of {}, so {} {} covers {}% of the time (pushes excluded) against {}% implied by {}, an edge of {} points.",
+        let market = s("market");
+        // first-segment markets: "in the 1st half" / "in the 1st period" / "in the first 5 innings"
+        let seg = if market.ends_with("_1h") { format!(" in the {}", s("segment_label")) } else { String::new() };
+        let tm = if market.starts_with("team_total_home") { Some(home.clone()) } else if market.starts_with("team_total_away") { Some(away.clone()) } else { None };
+        match segments::base_market(&market) {
+            "moneyline" => {
+                let ties = match n("p_push") { Some(t) if market.ends_with("_1h") && t > 0.0 => format!(" (it is tied after the {} in {}% of simulations, which refunds the bet)", s("segment_label"), pct(t)), _ => String::new() };
+                out.push(format!("{away} at {home}: the {} gives {} a {}% chance to lead{seg}{ties}; the de-vigged price at {} implies {}%, an edge of {} points.",
+                    s("engine_label"), s("pick_team"), pct(n("p_model").unwrap_or(0.0)), s("book_title"), pct(n("p_market").unwrap_or(0.0)), pct(n("edge").unwrap_or(0.0))))
+            }
+            "spread" => out.push(format!("{away} at {home}: the {} projects a home margin of {}{seg}, so {} {} covers {}% of the time (pushes excluded) against {}% implied by {}, an edge of {} points.",
                 s("engine_label"), signed(n("projection").unwrap_or(0.0)), s("pick_team"), signed(n("line").unwrap_or(0.0)), pct(n("p_model").unwrap_or(0.0)),
                 pct(n("p_market").unwrap_or(0.0)), s("book_title"), pct(n("edge").unwrap_or(0.0)))),
-            _ => out.push(format!("{away} at {home}: the {} projects {} total (median {}), so the {side_word} {} hits {}% of the time against {}% implied by {}, an edge of {} points.",
-                s("engine_label"), fmt_num(n("projection").unwrap_or(0.0)), fmt_num(n("q50").unwrap_or(0.0)), fmt_num(n("line").unwrap_or(0.0)),
-                pct(n("p_model").unwrap_or(0.0)), pct(n("p_market").unwrap_or(0.0)), s("book_title"), pct(n("edge").unwrap_or(0.0)))),
+            _ => {
+                let what = match &tm { Some(t) => format!("{t} to score {}", fmt_num(n("projection").unwrap_or(0.0))), None => format!("{} total", fmt_num(n("projection").unwrap_or(0.0))) };
+                out.push(format!("{away} at {home}: the {} projects {what}{seg} (median {}), so the {side_word} {} hits {}% of the time against {}% implied by {}, an edge of {} points.",
+                    s("engine_label"), fmt_num(n("q50").unwrap_or(0.0)), fmt_num(n("line").unwrap_or(0.0)),
+                    pct(n("p_model").unwrap_or(0.0)), pct(n("p_market").unwrap_or(0.0)), s("book_title"), pct(n("edge").unwrap_or(0.0))))
+            }
         }
         let form = |t: &str, k: &str| -> Option<String> {
             let v = &f[k];
@@ -641,7 +681,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let mut quotes: HashMap<(Key, String), Vec<Quote>> = HashMap::new(); // (selection, side) -> quotes
     for ((key, book, side), (line, price, link, obs, open, ps, name)) in &sides {
         let Some((oline, oprice, ..)) = sides.get(&(key.clone(), book.clone(), other(side).to_string())) else { continue };
-        let same = match key.1.as_str() { "moneyline" => true, "spread" => matches!((line, oline), (Some(a), Some(b)) if (a + b).abs() < 1e-9), _ => line == oline };
+        let same = match segments::base_market(&key.1) { "moneyline" => true, "spread" => matches!((line, oline), (Some(a), Some(b)) if (a + b).abs() < 1e-9), _ => line == oline };
         if !same { continue; }
         quotes.entry((key.clone(), side.clone())).or_default().push(Quote { book: book.clone(), a_line: *line, a_price: *price, b_price: *oprice, a_link: link.clone(),
             observed: *obs, open_line: *open, provider_subject: ps.clone(), subject_name: name.clone() });
@@ -749,7 +789,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     }
     let mut teams: Vec<String> = Vec::new();
     for c in &keep { if let Some(l) = ledgers.get(c.engine.as_str()).and_then(|m| m.get(&c.key.0)) {
-        for s in ["home", "away"] { if let Some(t) = l.payload[s].as_str() { teams.push(t.to_string()); } } } }
+        for s in ["home", "away"] { let t = lines::payload_team(&l.payload, s); if !t.is_empty() { teams.push(t); } } } }
     teams.sort(); teams.dedup();
     let form = team_form(db, sport, &teams).await?;
     let heads: HashMap<String, String> = {
@@ -764,10 +804,10 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let mut updated = 0;
     for c in &keep {
         let l = &ledgers[c.engine.as_str()][&c.key.0];
-        let (home, away) = (l.payload["home"].as_str().unwrap_or("").to_string(), l.payload["away"].as_str().unwrap_or("").to_string());
+        let (home, away) = (lines::payload_team(&l.payload, "home"), lines::payload_team(&l.payload, "away"));
         let pm = c.priced.p();
         let grade = cap(edge_grade(c.edge).unwrap_or("C"), c.tier);
-        let label = pick_label(&c.key.1, &c.side, c.q.a_line, &home, &away);
+        let label = pick_label(sport, &c.key.1, &c.side, c.q.a_line, &home, &away);
         let exists = existing.contains(&(c.key.0.clone(), c.key.1.clone(), c.key.2.clone(), c.side.clone(), c.engine.clone()));
         if exists {
             updated += db.execute("UPDATE ai_picks SET latest_line=$1, latest_price=$2, latest_book=$3, latest_p_market=$4, latest_edge=$5, updated_at=now() \
@@ -792,9 +832,11 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             ("blend_source", json!(c.w.market_source)), ("blend_text", json!(blend::source_text(&c.w))),
             ("p_push", json!(r3(c.priced.push))), ("projection", json!(c.priced.projection.map(|x| r1(x)))),
             ("engine", json!(c.engine)), ("engine_label", json!(engine_label(&c.engine))), ("model_version", json!(c.version)), ("lineup_mode", json!(c.lineup)),
-            ("tier", json!(c.tier)), ("evidence_text", json!(evidence_sentence(c.tier, &c.evd, &c.key.1))), ("open_line", json!(c.q.open_line)),
+            ("tier", json!(c.tier)), ("evidence_text", json!(evidence_sentence(sport, c.tier, &c.evd, &c.key.1))), ("open_line", json!(c.q.open_line)),
             ("home_team", json!(home)), ("away_team", json!(away)), ("subject_name", json!(subject_name)), ("team", json!(subject_team)),
-            ("opponent", json!(opponent)), ("home", json!(subject_team == home)), ("stat_label", json!(stat_label(&c.key.1))),
+            ("opponent", json!(opponent)), ("home", json!(subject_team == home)),
+            ("stat_label", json!(if kind == "game" { segments::market_label(sport, &c.key.1) } else { stat_label(&c.key.1).to_string() })),
+            ("segment_label", json!(segments::label(sport))),
             ("pick_team", json!(if c.side == "home" { home.clone() } else { away.clone() }))] { f.insert(k.into(), v); }
         if let Some((a, b, cc)) = c.priced.q { f.insert("q10".into(), json!(a)); f.insert("q50".into(), json!(b)); f.insert("q90".into(), json!(cc)); }
         if let Some(a) = c.priced.p_active { f.insert("p_active".into(), json!(r3(a))); }
@@ -879,7 +921,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             let against = match c.side.as_str() { "over" => lnow > o, "under" => lnow < o, _ => lnow < o };
             if (lnow - o).abs() > 1e-9 && against { flags.push(json!({ "code": "line_moved_against", "text": format!("line moved from {} to {} since open, against this side", fmt_num(o), fmt_num(lnow)) })); }
         }
-        if c.tier == "losing" || c.tier == "unproven" { flags.push(json!({ "code": format!("{}_model", c.tier), "text": evidence_sentence(c.tier, &c.evd, &c.key.1) })); }
+        if c.tier == "losing" || c.tier == "unproven" { flags.push(json!({ "code": format!("{}_model", c.tier), "text": evidence_sentence(sport, c.tier, &c.evd, &c.key.1) })); }
         let facts = Value::Object(f);
         let tpl = template(&facts);
         let (writeup, wsrc) = (tpl.clone(), "template".to_string());
@@ -939,7 +981,7 @@ async fn record_lines(db: &tokio_postgres::Client, sport: &str, quotes: &HashMap
     let mut n = 0;
     for (((game, market, subject), side), qs) in quotes {
         let kind_prop = subject != "game";
-        if side != if matches!(market.as_str(), "moneyline" | "spread") { "home" } else { "over" } { continue; }
+        if side != if segments::home_away(market) { "home" } else { "over" } { continue; }
         // main line
         let mut count: Vec<(Option<f64>, usize)> = Vec::new();
         for q in qs { match count.iter_mut().find(|(l, _)| *l == q.a_line) { Some(x) => x.1 += 1, None => count.push((q.a_line, 1)) } }
@@ -1029,6 +1071,7 @@ pub(crate) async fn prop_actuals(db: &tokio_postgres::Client, sport: &str, game:
 
 pub(crate) fn result_of(market: &str, side: &str, line: Option<f64>, actual: f64) -> &'static str {
     // actual = stat value, or the home margin for moneyline/spread, or the total
+    let market = if segments::is_game_market(market) { segments::base_market(market) } else { market };
     let diff = match (market, side) {
         ("moneyline", "home") => actual,
         ("moneyline", _) => -actual,
@@ -1055,7 +1098,7 @@ pub(crate) async fn settle(state: &State, sport: &str) -> Result<Value, String> 
             let (id, market, subject, side, line, price, book, p_mkt, start): (i64, String, String, String, Option<f64>, i32, String, f64, Option<DateTime<Utc>>) =
                 (r.get(0), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
             let actual = if subject == "game" {
-                go.game.get(if market == "total" { "total" } else { "home_margin" }).copied()
+                go.game.get(segments::outcome_key(&market)).copied()
             } else {
                 match &props { Some(p) => p.get(&subject).and_then(|m| m.get(market.as_str()).copied()), None => { continue } }
             };
@@ -1128,7 +1171,7 @@ pub(crate) async fn run(state: &State, sport: &str, force: bool) -> Value {
 pub struct RunQ { sport: Option<String>, #[serde(default)] force: bool }
 
 pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Responder {
-    let sports: Vec<String> = match &q.sport { Some(s) if SPORTS.contains(&s.as_str()) => vec![s.clone()], Some(_) => return HttpResponse::BadRequest().json(json!({ "error": "sport must be nba, nhl or nfl" })), None => SPORTS.iter().map(|s| s.to_string()).collect() };
+    let sports: Vec<String> = match &q.sport { Some(s) if SPORTS.contains(&s.as_str()) => vec![s.clone()], Some(_) => return HttpResponse::BadRequest().json(json!({ "error": "sport must be nba, nhl, nfl or mlb" })), None => SPORTS.iter().map(|s| s.to_string()).collect() };
     let mut out = Vec::new();
     for s in sports { out.push(run(&state, &s, q.force).await); }
     HttpResponse::Ok().json(json!({ "runs": out }))
@@ -1160,13 +1203,15 @@ fn playable_now(status: &str, line: Option<f64>, price: i32, playable: Option<i3
 
 fn pick_json(r: &tokio_postgres::Row, full: bool) -> Value {
     let (market, side, line, home, away): (String, String, Option<f64>, Option<String>, Option<String>) = (r.get("market"), r.get("side"), r.get("line"), r.get("home"), r.get("away"));
-    let label = pick_label(&market, &side, line, home.as_deref().unwrap_or(""), away.as_deref().unwrap_or(""));
+    let sport: String = r.get("sport");
+    let label = pick_label(&sport, &market, &side, line, home.as_deref().unwrap_or(""), away.as_deref().unwrap_or(""));
     let flags: Json<Value> = r.get("risk_flags");
     let book: String = r.get("book");
     let mut v = json!({
         "id": r.get::<_, i64>("id"), "sport": r.get::<_, String>("sport"), "engine": r.get::<_, String>("engine"), "model_version": r.get::<_, String>("model_version"),
         "ledger_id": r.get::<_, i64>("ledger_id"), "game_id": r.get::<_, String>("game_id"), "game_label": r.get::<_, String>("game_label"), "home": home, "away": away,
-        "starts_at": r.get::<_, Option<DateTime<Utc>>>("starts_at"), "kind": r.get::<_, String>("kind"), "market": market, "market_label": stat_label(&market),
+        "starts_at": r.get::<_, Option<DateTime<Utc>>>("starts_at"), "kind": r.get::<_, String>("kind"), "market": market,
+        "market_label": if segments::is_game_market(&market) { segments::market_label(&sport, &market) } else { stat_label(&market).to_string() },
         "subject": r.get::<_, String>("subject"), "subject_name": r.get::<_, String>("subject_name"), "subject_team": r.get::<_, Option<String>>("subject_team"),
         "headshot": r.get::<_, Option<String>>("headshot"), "side": side, "label": label, "line": line, "book": book, "book_title": book_title(&book),
         "price": r.get::<_, i32>("price"), "link": r.get::<_, Option<String>>("link"),
@@ -1424,6 +1469,36 @@ mod tests {
         assert_eq!(prop_tier(&ev, "nba", "total").0, "unproven", "game markets never inherit");
         ev.insert(("nba".into(), "reb".into()), vec![e(0, 5)]);
         assert_eq!(prop_tier(&ev, "nba", "pra").0, "unproven", "a proven-ish sibling blocks inheritance");
+    }
+
+    #[test]
+    fn first_segment_and_team_total_markets_price_from_payload() {
+        let p = json!({ "score": { "home": dist(0, &[0.0, 0.0, 0.5, 0.5]), "away": dist(0, &[0.25, 0.75]) },
+            "h1": { "win": { "home": 0.5, "away": 0.3, "tie": 0.2 }, "margin_home": dist(-1, &[0.3, 0.2, 0.5]),
+                    "total": dist(1, &[0.4, 0.6]), "home": dist(0, &[0.5, 0.5]), "away": dist(0, &[0.8, 0.2]) } });
+        // team totals: home scores 2 or 3
+        assert!((price(&p, false, "team_total_home", "game", "over", Some(2.5)).unwrap().win - 0.5).abs() < 1e-12);
+        assert!((price(&p, false, "team_total_away", "game", "under", Some(0.5)).unwrap().win - 0.25).abs() < 1e-12);
+        // a tied half refunds the moneyline
+        let ml = price(&p, false, "moneyline_1h", "game", "away", None).unwrap();
+        assert!((ml.win - 0.3).abs() < 1e-12 && (ml.push - 0.2).abs() < 1e-12 && (ml.p() - 0.375).abs() < 1e-12);
+        // 1H spread: home -0.5 covers when the margin is +1
+        assert!((price(&p, false, "spread_1h", "game", "home", Some(-0.5)).unwrap().win - 0.5).abs() < 1e-12);
+        assert!((price(&p, false, "spread_1h", "game", "away", Some(0.5)).unwrap().win - 0.5).abs() < 1e-12);
+        assert!((price(&p, false, "total_1h", "game", "over", Some(1.5)).unwrap().win - 0.6).abs() < 1e-12);
+        assert!((price(&p, true, "team_total_away_1h", "game", "over", Some(0.5)).unwrap().win - 0.2).abs() < 1e-12);
+        assert!(price(&json!({}), false, "total_1h", "game", "over", Some(1.5)).is_none());
+    }
+
+    #[test]
+    fn new_markets_settle_and_label() {
+        assert_eq!(result_of("moneyline_1h", "home", None, 0.0), "push");
+        assert_eq!(result_of("spread_1h", "away", Some(2.5), -2.0), "win");
+        assert_eq!(result_of("team_total_home", "over", Some(110.5), 111.0), "win");
+        assert_eq!(result_of("team_total_away_1h", "under", Some(2.5), 3.0), "loss");
+        assert_eq!(pick_label("nhl", "moneyline_1h", "home", None, "BOS", "TOR"), "BOS 1P ML");
+        assert_eq!(pick_label("mlb", "team_total_away_1h", "over", Some(2.5), "NYY", "LAD"), "LAD F5 Over 2.5");
+        assert_eq!(pick_label("nba", "spread_1h", "away", Some(3.5), "BOS", "LAL"), "LAL 1H +3.5");
     }
 
     #[test]

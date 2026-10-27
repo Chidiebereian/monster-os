@@ -5,6 +5,7 @@ import { api, type GameRow, type PropRow } from "../lib/api";
 import { formatAmerican, formatPct } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import { PlayerHitDetail, RateCell, Streak, TeamHitDetail, fmtSpread, type Side } from "../components/HitRates";
+import { segmentOf } from "../lib/markets";
 
 const SPORTS = [
   { key: "nba", label: "NBA" },
@@ -87,7 +88,7 @@ function PropsSheet({ sport }: { sport: string }) {
       {source === "projection" && !stat && <div className="text-[11px] text-amber">Model lines need a single prop — pick one above (showing market lines).</div>}
       {isLoading && <Msg>Grading every live prop line…</Msg>}
       {error && <Msg tone="error">{(error as Error).message}</Msg>}
-      {data && rows.length === 0 && <Msg>No props match. The market feed may not have posted lines for this sport yet.</Msg>}
+      {data && rows.length === 0 && <Msg>{data.count === 0 && data.note ? `No prop lines yet: ${data.note}.` : "No props match. The market feed may not have posted lines for this sport yet."}</Msg>}
       {rows.length > 0 && (
         <Table head={
           <tr>
@@ -191,10 +192,15 @@ function GamesSheet({ sport }: { sport: string }) {
 function GameCard({ g, sport, open, onOpen }: { g: GameRow; sport: string; open: string | null; onOpen: (team: string | null) => void }) {
   const hasClosing = !!g.home_team.markets.ats_closing;
   const when = g.starts_at ? new Date(g.starts_at).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+  const h1 = g.market?.h1;
+  const seg = segmentOf(sport);
   const sides = [
-    { team: g.away, s: g.away_team, spread: g.spread_home == null ? null : -g.spread_home, ml: g.market?.ml_away_odds, opp: g.home },
-    { team: g.home, s: g.home_team, spread: g.spread_home, ml: g.market?.ml_home_odds, opp: g.away },
+    { team: g.away, s: g.away_team, spread: g.spread_home == null ? null : -g.spread_home, ml: g.market?.ml_away_odds, opp: g.home,
+      tt: g.market?.away_total ?? null, ml1: h1?.ml_away_odds, sp1: h1?.spread == null ? null : -h1.spread, tt1: h1?.away_total ?? null },
+    { team: g.home, s: g.home_team, spread: g.spread_home, ml: g.market?.ml_home_odds, opp: g.away,
+      tt: g.market?.home_total ?? null, ml1: h1?.ml_home_odds, sp1: h1?.spread ?? null, tt1: h1?.home_total ?? null },
   ];
+  const hasSeg = sides.some((x) => x.s.markets.win_1h);
   return (
     <Card className="space-y-3">
       <div className="flex items-baseline gap-2 flex-wrap">
@@ -203,6 +209,7 @@ function GameCard({ g, sport, open, onOpen }: { g: GameRow; sport: string; open:
         <div className="ml-auto text-xs text-gray-400 font-mono">
           {g.spread_home != null && <>{g.home} {fmtSpread(g.spread_home)} · </>}
           {g.total != null && <>O/U {g.total}</>}
+          {h1 && <> · {seg.tag} {h1.spread != null ? `${g.home} ${fmtSpread(h1.spread)}` : ""}{h1.total != null ? ` O/U ${h1.total}` : ""}</>}
         </div>
       </div>
       <div className="overflow-auto">
@@ -239,6 +246,40 @@ function GameCard({ g, sport, open, onOpen }: { g: GameRow; sport: string; open:
           </tbody>
         </table>
       </div>
+      {hasSeg && (
+        <div className="overflow-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-[11px] uppercase tracking-wide text-gray-500">
+                <th className="text-left font-medium py-1">Team totals · {seg.label}</th>
+                <th className="text-left font-medium">TT</th>
+                <th className="text-left font-medium">TT over L10</th>
+                <th className="text-left font-medium">{seg.tag} ML</th>
+                <th className="text-left font-medium">{seg.tag} lead L10</th>
+                <th className="text-left font-medium">{seg.tag} cover L10</th>
+                <th className="text-left font-medium">{seg.tag} over L10</th>
+                <th className="text-left font-medium">{seg.tag} TT over L10</th>
+                <th className="text-left font-medium">{seg.tag} pts L10</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sides.map(({ team, s, tt, ml1, sp1, tt1 }) => (
+                <tr key={team} onClick={() => onOpen(team)} className={clsx("border-t border-glass cursor-pointer hover:bg-white/[0.03]", open === team && "bg-violet/10")}>
+                  <td className="py-1.5 font-medium">{team}</td>
+                  <td className="font-mono text-xs">{tt ?? "—"}</td>
+                  <td><RateCell s={s.markets.team_total_over?.l10} side="over" compact /></td>
+                  <td className="font-mono text-xs">{formatAmerican(ml1)}</td>
+                  <td><RateCell s={s.markets.win_1h?.l10} side="over" compact /></td>
+                  <td>{sp1 != null ? <span className="inline-flex items-center gap-1"><span className="font-mono text-[11px] text-gray-500">{fmtSpread(sp1)}</span><RateCell s={s.markets.cover_1h?.l10} side="over" compact /></span> : <span className="text-gray-600">—</span>}</td>
+                  <td>{h1?.total != null ? <RateCell s={s.markets.over_1h?.l10} side="over" compact /> : <span className="text-gray-600">—</span>}</td>
+                  <td>{tt1 != null ? <span className="inline-flex items-center gap-1"><span className="font-mono text-[11px] text-gray-500">{tt1}</span><RateCell s={s.markets.team_total_over_1h?.l10} side="over" compact /></span> : <span className="text-gray-600">—</span>}</td>
+                  <td className="font-mono text-xs text-gray-300">{s.averages.points_for_1h?.l10 ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
       {open && (() => {
         const side = sides.find((x) => x.team === open);
         return side ? <TeamHitDetail key={open} sport={sport} team={side.team} spread={side.spread} total={g.total} opponent={side.opp} /> : null;

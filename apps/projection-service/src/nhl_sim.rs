@@ -206,6 +206,8 @@ pub struct GameResult {
     pub saves: [i32; 2],
     pub overtime: bool,
     pub shootout: bool,
+    /// [away, home] score after the 1st period
+    pub seg: [i32; 2],
 }
 
 struct Pen { team: usize, left: f64, minor: bool }
@@ -414,9 +416,11 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     let mut s = G { g, rng, period: 1, clock: 1200.0, score: [0, 0], shots: [0, 0], saves: [0, 0],
         stats: [vec![[0; NST]; n[0]], vec![[0; NST]; n[1]]], pens: Vec::new(), pulled: [false, false], pull_at: [-1.0, -1.0], events };
     let mut shootout = false;
+    let mut first = [0, 0];
     for p in 1..=3 {
         s.period = p;
         s.play_period(1200.0);
+        if p == 1 { first = s.score; }
         if p < 3 || s.score[0] == s.score[1] { s.emit("end_period", 0, None, None, None, None, "", None, 0.0, false, 0); }
         s.pulled = [false, false];
     }
@@ -460,7 +464,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     s.clock = 0.0;
     s.emit("game_end", 0, None, None, None, None, "", None, 0.0, false, 0);
     let active = [0, 1].map(|t| g.teams[t].skaters.iter().map(|k| k.p_active > 0.5).collect::<Vec<_>>());
-    GameResult { score: s.score, stats: s.stats, active, shots: s.shots, saves: s.saves, overtime: s.period >= 4, shootout }
+    GameResult { score: s.score, stats: s.stats, active, shots: s.shots, saves: s.saves, overtime: s.period >= 4, shootout, seg: first }
 }
 
 pub fn single_game(g: &GameInput, seed: u64) -> (GameResult, Vec<Event>) {
@@ -492,10 +496,15 @@ pub struct Ensemble {
     pub saves: [Hist; 2],
     pub player: [Vec<Vec<Hist>>; 2],
     pub active_n: [Vec<u64>; 2],
+    /// 1st-period (home, away) joint score
+    pub h1: crate::segments::Joint,
+    /// full-game (home, away) joint score, for alternate puck lines
+    pub full: crate::segments::Joint,
 }
 impl Ensemble {
     fn new(n: [usize; 2]) -> Self {
         Ensemble { n: 0, score: [Hist::new(), Hist::new()], total: Hist::new(), home_win: 0, regulation_tie: 0, home_puckline: 0, away_puckline: 0,
+            h1: crate::segments::Joint::for_sport("nhl"), full: crate::segments::Joint::new(16),
             shots: [Hist::new(), Hist::new()], saves: [Hist::new(), Hist::new()],
             player: [0, 1].map(|t| (0..n[t]).map(|_| (0..PROPS.len()).map(|_| Hist::new()).collect()).collect()), active_n: [vec![0; n[0]], vec![0; n[1]]] }
     }
@@ -507,6 +516,8 @@ impl Ensemble {
         self.regulation_tie += r.overtime as u64;
         self.home_puckline += (r.score[1] - r.score[0] >= 2) as u64;
         self.away_puckline += (r.score[0] - r.score[1] >= 2) as u64;
+        self.h1.add(r.seg[1], r.seg[0]);
+        self.full.add(r.score[1], r.score[0]);
         for t in 0..2 {
             for (i, st) in r.stats[t].iter().enumerate() {
                 if !r.active[t][i] { continue; }
@@ -525,6 +536,8 @@ impl Ensemble {
         }
         self.total.merge(&o.total);
         self.home_win += o.home_win; self.regulation_tie += o.regulation_tie; self.home_puckline += o.home_puckline; self.away_puckline += o.away_puckline;
+        self.h1.merge(&o.h1);
+        self.full.merge(&o.full);
     }
 }
 

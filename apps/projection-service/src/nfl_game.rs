@@ -1776,6 +1776,7 @@ fn ensemble_json(game: &GameInput, e: &sim::Ensemble, gref: &GameRef, meta: &Val
         "total": hist_json(&e.total, &gref.total_line.into_iter().collect::<Vec<_>>()),
         "margin_home": hist_json(&e.margin, &gref.spread_line.into_iter().collect::<Vec<_>>()),
         "plays": { "away": r3(e.plays[0].mean()), "home": r3(e.plays[1].mean()) },
+        "h1": e.h1.json("nfl"),
         "market": market,
         "players": { "away": team_players[0], "home": team_players[1] },
         "inputs": meta,
@@ -1799,7 +1800,7 @@ pub async fn new_session(db: &tokio_postgres::Client, game_id: &str, seed: u64, 
         .filter(|(i, p)| p.p_active < 1.0 && !res.active.get(*i).copied().unwrap_or(true))
         .map(|(_, p)| json!({ "id": p.id, "name": p.name, "p_active": r3(p.p_active) })).collect();
     let fin = json!({
-        "score": res.score, "overtime": res.overtime, "plays": res.plays, "uncertain_players_inactive": sat_out.clone(),
+        "score": res.score, "overtime": res.overtime, "h1": res.seg, "plays": res.plays, "uncertain_players_inactive": sat_out.clone(),
         "box_score": res.stats.iter().enumerate().filter(|(_, s)| s.iter().any(|v| *v != 0))
             .map(|(i, s)| json!([i, s])).collect::<Vec<_>>(),
     });
@@ -2168,6 +2169,9 @@ async fn forecasts_avg(db: &tokio_postgres::Client, gref: &GameRef, game: &GameI
         let (o, u, _, _) = e.total.line(tl);
         out.push(Forecast::game("total_over", "0.5 (closing total is the line)", "total", tl, o / (o + u).max(1e-9), 0.5).pushes());
     }
+    // team totals and the 1st half (segments.rs); nflverse spread_line is the expected home margin
+    let full_over = |home: bool, l: f64| { let (o, u, _, _) = e.score[home as usize].line(l); o / (o + u).max(1e-9) };
+    out.extend(crate::segments::forecasts("nfl", gref.spread_line, gref.total_line, &e.h1, &full_over));
     let prior = load_plays(db, "game_date < $1 AND season >= $2 AND (passer_id = ANY($3) OR rusher_id = ANY($3) OR receiver_id = ANY($3))",
         &[&gref.date, &(gref.season - 1), &game.players.iter().map(|p| p.id.clone()).collect::<Vec<_>>()]).await?;
     let mut hist: HashMap<String, Vec<[f64; 5]>> = HashMap::new();
@@ -2225,7 +2229,9 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
     let (Some(hs), Some(as_)) = (g.home_score, g.away_score) else { return Ok(None) };
     let plays = load_plays(db, "game_id = $1", &[&id]).await?;
     if plays.iter().filter(|p| p.scrimmage()).count() < 40 { return Ok(None); }
-    Ok(Some(outcomes_from(hs, as_, &plays)))
+    let mut o = outcomes_from(hs, as_, &plays);
+    crate::segments::augment(db, "nfl", id, &mut o).await;
+    Ok(Some(o))
 }
 
 /// Walk-forward evaluation of one completed game (inputs strictly before kickoff).

@@ -18,6 +18,7 @@ const SPORTS = [
   { key: "nba", label: "NBA" },
   { key: "nhl", label: "NHL" },
   { key: "nfl", label: "NFL" },
+  { key: "mlb", label: "MLB" },
 ];
 const KINDS = [{ key: "all", label: "All" }, { key: "prop", label: "Player Props" }, { key: "game", label: "Game Lines" }];
 const SIDES = [{ key: "all", label: "All" }, { key: "over", label: "Over" }, { key: "under", label: "Under" }];
@@ -217,8 +218,8 @@ function Chip({ children, tone }: { children: ReactNode; tone?: "violet" | "pos"
 }
 
 function ProjChip({ p }: { p: Pick }) {
-  if (p.projection == null || p.line == null || p.market === "moneyline") return null;
-  if (p.market === "spread") {
+  if (p.projection == null || p.line == null || p.market.startsWith("moneyline")) return null;
+  if (p.market.startsWith("spread")) {
     // projection is the home margin; show it from the picked team's side
     const m = p.side === "home" ? p.projection : -p.projection;
     return <Chip>Proj margin {m >= 0 ? "+" : ""}{num(m)}</Chip>;
@@ -330,9 +331,9 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
         <Box><span className="text-xs text-gray-400">MARKET (NO-VIG)</span> <span className="font-mono text-lg">{pct(p.p_market, 1)}</span></Box>
         <Box tone="pos"><span className="text-xs text-gray-400">EDGE</span> <span className="font-mono text-lg text-emerald-light">{signedPct(p.edge)}</span></Box>
         <Box><span className="text-xs text-gray-400">EV / UNIT</span> <span className="font-mono text-lg">{signedPct(p.ev)}</span></Box>
-        {p.projection != null && p.market !== "moneyline" && (
-          <Box tone="violet"><span className="text-xs text-gray-400">{p.market === "spread" ? "PROJ MARGIN (HOME)" : "PROJ"}</span> <span className="font-mono text-lg">{num(p.projection, 2)}</span>
-            {p.line != null && p.market !== "spread" && <span className="text-xs text-gray-500"> / {num(p.line)}</span>}</Box>
+        {p.projection != null && !p.market.startsWith("moneyline") && (
+          <Box tone="violet"><span className="text-xs text-gray-400">{p.market.startsWith("spread") ? "PROJ MARGIN (HOME)" : "PROJ"}</span> <span className="font-mono text-lg">{num(p.projection, 2)}</span>
+            {p.line != null && !p.market.startsWith("spread") && <span className="text-xs text-gray-500"> / {num(p.line)}</span>}</Box>
         )}
       </div>
 

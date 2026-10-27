@@ -65,7 +65,7 @@ fn erf(x: f64) -> f64 {
 }
 
 struct Target { date: NaiveDate, start: Option<DateTime<Utc>>, home: String, away: String, spread: Option<f64>, total: Option<f64> }
-struct Past { date: NaiveDate, home: String, away: String, hs: f64, as_: f64 }
+struct Past { date: NaiveDate, home: String, away: String, hs: f64, as_: f64, seg: Option<(f64, f64)> }
 
 async fn target(db: &tokio_postgres::Client, sport: &str, id: &str) -> Result<Target, String> {
     let r = match sport {
@@ -82,32 +82,50 @@ async fn target(db: &tokio_postgres::Client, sport: &str, id: &str) -> Result<Ta
 
 async fn past(db: &tokio_postgres::Client, sport: &str, before: NaiveDate, lookback: i32) -> Result<Vec<Past>, String> {
     let rows = match sport {
-        "nba" => db.query("SELECT game_date, home, away, home_score, away_score FROM nba_games_espn \
+        "nba" => db.query("SELECT game_date, home, away, home_score, away_score, s.home_1h, s.away_1h FROM nba_games_espn g \
+                           LEFT JOIN game_segments s ON s.sport = 'nba' AND s.game_id = g.espn_id \
                            WHERE completed AND season_type IN (2,3) AND home_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
-        "nhl" => db.query("SELECT game_date, home, away, home_score, away_score FROM nhl_games_api \
+        "nhl" => db.query("SELECT game_date, home, away, home_score, away_score, s.home_1h, s.away_1h FROM nhl_games_api g \
+                           LEFT JOIN game_segments s ON s.sport = 'nhl' AND s.game_id = g.game_id::text \
                            WHERE completed AND game_type IN (2,3) AND home_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
-        _ => db.query("SELECT game_date, home_team, away_team, home_score, away_score FROM sports_games \
-                       WHERE sport = 'nfl' AND home_score IS NOT NULL AND away_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
+        _ => db.query("SELECT game_date, home_team, away_team, home_score, away_score, s.home_1h, s.away_1h FROM sports_games g \
+                       LEFT JOIN game_segments s ON s.sport = g.sport AND s.game_id = g.game_id \
+                       WHERE g.sport = 'nfl' AND home_score IS NOT NULL AND away_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
     }.map_err(|e| dberr(&e))?;
-    Ok(rows.iter().map(|r| Past { date: r.get(0), home: r.get(1), away: r.get(2), hs: r.get::<_, i32>(3) as f64, as_: r.get::<_, i32>(4) as f64 }).collect())
+    Ok(rows.iter().map(|r| {
+        let seg = match (r.get::<_, Option<i32>>(5), r.get::<_, Option<i32>>(6)) { (Some(h), Some(a)) => Some((h as f64, a as f64)), _ => None };
+        Past { date: r.get(0), home: r.get(1), away: r.get(2), hs: r.get::<_, i32>(3) as f64, as_: r.get::<_, i32>(4) as f64, seg }
+    }).collect())
 }
 
 /// Expected points for (home, away) and the dispersion, from games before the target date.
 struct Means { mu_home: f64, mu_away: f64, dispersion: f64, games: usize, teams: usize }
 
 fn fit_means(games: &[Past], t: &Target, tune: &Tuning) -> Result<Means, String> {
+    fit_scores(games, t, tune, |g| Some((g.hs, g.as_)))
+}
+
+/// The same model on first-segment scores (1st half / 1st period).
+fn fit_means_h1(games: &[Past], t: &Target, tune: &Tuning) -> Option<Means> {
+    if games.iter().filter(|g| g.seg.is_some()).count() < 100 { return None; }
+    fit_scores(games, t, tune, |g| g.seg).ok()
+}
+
+fn fit_scores(games: &[Past], t: &Target, tune: &Tuning, score: impl Fn(&Past) -> Option<(f64, f64)>) -> Result<Means, String> {
+    let games: Vec<&Past> = games.iter().filter(|g| score(g).is_some()).collect();
     let mut idx: HashMap<&str, usize> = HashMap::new();
-    for g in games { for team in [g.home.as_str(), g.away.as_str()] { let n = idx.len(); idx.entry(team).or_insert(n); } }
+    for g in &games { for team in [g.home.as_str(), g.away.as_str()] { let n = idx.len(); idx.entry(team).or_insert(n); } }
     let (Some(&h), Some(&a)) = (idx.get(t.home.as_str()), idx.get(t.away.as_str())) else {
         return Err(format!("no games before {} for {} or {}", t.date, t.home, t.away));
     };
     let mut obs = Vec::with_capacity(games.len() * 2);
-    for g in games {
+    for g in &games {
         let age = (t.date - g.date).num_days() as f64;
         let w = 0.5f64.powf(age / tune.halflife_days);
         let (gh, ga) = (idx[g.home.as_str()], idx[g.away.as_str()]);
-        obs.push(Obs { y: g.hs, team: gh, opp: ga, home: 1.0, w });
-        obs.push(Obs { y: g.as_, team: ga, opp: gh, home: 0.0, w });
+        let (hs, as_) = score(g).unwrap();
+        obs.push(Obs { y: hs, team: gh, opp: ga, home: 1.0, w });
+        obs.push(Obs { y: as_, team: ga, opp: gh, home: 0.0, w });
     }
     let f = fit(&obs, idx.len(), 40, tune.ridge);
     Ok(Means {
@@ -148,6 +166,14 @@ fn simulate(sport: &str, m: &Means, n: usize, seed: u64) -> Vec<(f64, f64)> {
     }).collect()
 }
 
+/// First-segment scores: no overtime, so ties stand (a tied 1st half refunds a moneyline).
+fn simulate_h1(sport: &str, m: &Means, n: usize, seed: u64) -> crate::segments::Joint {
+    let mut rng = Rng::new(seed ^ 0x6831_6831);
+    let mut j = crate::segments::Joint::for_sport(sport);
+    for _ in 0..n { j.add(negbin(&mut rng, m.mu_home, m.dispersion) as i32, negbin(&mut rng, m.mu_away, m.dispersion) as i32); }
+    j
+}
+
 /// P(x > line) among non-push outcomes.
 fn over(xs: &[(f64, f64)], f: impl Fn(&(f64, f64)) -> f64, line: f64) -> f64 {
     let (mut o, mut u) = (0.0f64, 0.0f64);
@@ -156,7 +182,17 @@ fn over(xs: &[(f64, f64)], f: impl Fn(&(f64, f64)) -> f64, line: f64) -> f64 {
 }
 
 /// The sport simulator's game markets, same lines and baselines.
-fn forecasts(sport: &str, t: &Target, sims: &[(f64, f64)]) -> Vec<Forecast> {
+fn forecasts(sport: &str, t: &Target, sims: &[(f64, f64)], h1: &crate::segments::Joint) -> Vec<Forecast> {
+    let mut out = game_forecasts(sport, t, sims);
+    // team totals and the first segment (segments.rs); team points = (total +/- margin) / 2
+    let full_over = |home: bool, l: f64| over(sims, |x| if home { (x.1 + x.0) / 2.0 } else { (x.1 - x.0) / 2.0 }, l);
+    // NBA spreads are bettor convention (negative = home favoured); nflverse spread_line is the expected home margin
+    let exp_margin = match sport { "nba" => t.spread.map(|s| -s), "nfl" => t.spread, _ => None };
+    out.extend(crate::segments::forecasts(sport, exp_margin, t.total, h1, &full_over));
+    out
+}
+
+fn game_forecasts(sport: &str, t: &Target, sims: &[(f64, f64)]) -> Vec<Forecast> {
     let margin = |x: &(f64, f64)| x.0;
     let total = |x: &(f64, f64)| x.1;
     let n = sims.len().max(1) as f64;
@@ -184,18 +220,20 @@ fn forecasts(sport: &str, t: &Target, sims: &[(f64, f64)]) -> Vec<Forecast> {
     }
 }
 
-async fn run(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64) -> Result<(Target, Means, Vec<(f64, f64)>), String> {
+async fn run(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64) -> Result<(Target, Means, Vec<(f64, f64)>, crate::segments::Joint), String> {
     let tune = tuning_for(sport, cfg);
     let t = target(&state.db, sport, id).await?;
     let games = past(&state.db, sport, t.date, tune.lookback_days as i32).await?;
     if games.len() < 100 { return Err(format!("only {} completed games before {}", games.len(), t.date)); }
     let (sport_s, tune2) = (sport.to_string(), tune.clone());
-    let (t, m, sims) = actix_web::web::block(move || {
+    let (t, m, sims, h1) = actix_web::web::block(move || {
         let m = fit_means(&games, &t, &tune2)?;
         let sims = simulate(&sport_s, &m, n, seed);
-        Ok::<_, String>((t, m, sims))
+        let h1 = fit_means_h1(&games, &t, &tune2).map(|m1| simulate_h1(&sport_s, &m1, n, seed))
+            .unwrap_or_else(|| crate::segments::Joint::for_sport(&sport_s));
+        Ok::<_, String>((t, m, sims, h1))
     }).await.map_err(|e| e.to_string())??;
-    Ok((t, m, sims))
+    Ok((t, m, sims, h1))
 }
 
 /// Integer distribution of simulated values: {"pmf_offset": min, "pmf": [P(min), P(min+1), ...]}.
@@ -210,8 +248,8 @@ fn int_dist(xs: impl Iterator<Item = f64>) -> Value {
 
 /// Production prediction for the ledger.
 pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
-    let (t, m, sims) = run(state, sport, id, cfg, n, seed).await?;
-    let fc = forecasts(sport, &t, &sims);
+    let (t, m, sims, h1) = run(state, sport, id, cfg, n, seed).await?;
+    let fc = forecasts(sport, &t, &sims, &h1);
     let nn = sims.len().max(1) as f64;
     let mean = |f: fn(&(f64, f64)) -> f64| sims.iter().map(f).sum::<f64>() / nn;
     let payload = json!({
@@ -219,6 +257,9 @@ pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u6
         "proj_home": (m.mu_home * 100.0).round() / 100.0, "proj_away": (m.mu_away * 100.0).round() / 100.0, "dispersion": m.dispersion,
         "margin_home": mean(|x| x.0), "total": mean(|x| x.1),
         "dist": { "margin": int_dist(sims.iter().map(|x| x.0)), "total": int_dist(sims.iter().map(|x| x.1)) },
+        // team totals and the first segment, in the simulators' shape
+        "score": { "home": int_dist(sims.iter().map(|x| (x.1 + x.0) / 2.0)), "away": int_dist(sims.iter().map(|x| (x.1 - x.0) / 2.0)) },
+        "h1": if h1.n > 0 { h1.json(sport) } else { Value::Null },
         "market": { "spread": t.spread, "total": t.total },
         "forecasts": fc.iter().map(|f| json!({ "market": f.market, "line": f.line, "p": f.p_model })).collect::<Vec<_>>(),
         "fit": { "games": m.games, "teams": m.teams, "tuning": tuning_for(sport, cfg).describe() },
@@ -230,12 +271,71 @@ pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u6
 /// Walk-forward evaluation of one completed game.
 pub async fn evaluate(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64, outcomes: Option<Outcomes>) -> Result<Option<GameEval>, String> {
     let Some(o) = outcomes else { return Ok(None) };
-    let (t, _m, sims) = match run(state, sport, id, cfg, n, seed).await { Ok(x) => x, Err(_) => return Ok(None) };
-    let fc = forecasts(sport, &t, &sims);
+    let (t, _m, sims, h1) = match run(state, sport, id, cfg, n, seed).await { Ok(x) => x, Err(_) => return Ok(None) };
+    let fc = forecasts(sport, &t, &sims, &h1);
     let nn = sims.len().max(1) as f64;
     let sim_total = sims.iter().map(|x| x.1).sum::<f64>() / nn;
     let diag = o.game.get("total").map(|&a| vec![("total", sim_total, a)]).unwrap_or_default();
     Ok(Some(GameEval { forecasts: fc, outcomes: o, diag }))
+}
+
+// ---------------------------------------------------------------------------
+// Projections page: first-segment matchup for any two teams
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct H1Query {
+    home: String,
+    away: String,
+    /// home line, bettor convention (negative = home favoured): home covers when margin + spread > 0
+    spread: Option<f64>,
+    total: Option<f64>,
+    home_total: Option<f64>,
+    away_total: Option<f64>,
+    n: Option<usize>,
+    seed: Option<u64>,
+}
+
+/// GET /matchup/{sport}/h1 — the 1st half (NHL: 1st period) for any two teams,
+/// from the team engine's first-segment model fit on every game up to today
+/// (the same model AI Picks prices team-engine 1H lines with).
+pub async fn h1_matchup(state: actix_web::web::Data<State>, path: actix_web::web::Path<String>, q: actix_web::web::Query<H1Query>) -> impl actix_web::Responder {
+    use actix_web::HttpResponse;
+    let sport = path.into_inner();
+    if !matches!(sport.as_str(), "nba" | "nhl" | "nfl") { return HttpResponse::BadRequest().json(json!({ "error": "sport must be nba, nhl or nfl" })); }
+    let cfg = crate::learning::champion(&state.db, &format!("{sport}_team")).await.map(|(_, c)| c).unwrap_or(Value::Null);
+    let tune = tuning_for(&sport, &cfg);
+    let today = (Utc::now() - chrono::Duration::hours(5)).date_naive();
+    let t = Target { date: today + chrono::Duration::days(1), start: None, home: q.home.clone(), away: q.away.clone(), spread: None, total: None };
+    let games = match past(&state.db, &sport, t.date, tune.lookback_days as i32).await { Ok(g) => g, Err(e) => return HttpResponse::InternalServerError().json(json!({ "error": e })) };
+    let n = q.n.unwrap_or(100_000).clamp(1000, 400_000);
+    let seed = q.seed.unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(1) as u64);
+    let (sp, q2) = (sport.clone(), (q.spread, q.total, q.home_total, q.away_total));
+    let out = actix_web::web::block(move || -> Result<Value, String> {
+        let m = fit_means_h1(&games, &t, &tune).ok_or_else(|| format!("no first-segment scores for {} or {} yet", t.home, t.away))?;
+        let j = simulate_h1(&sp, &m, n, seed);
+        let r4 = |x: f64| (x * 10000.0).round() / 10000.0;
+        let at = |f: &dyn Fn(i32, i32) -> i32, line: f64| { let (o, u) = j.over_under(f, line); json!({ "line": line, "over": r4(o), "under": r4(u), "push": r4(1.0 - o - u) }) };
+        let (spread, total, ht, at_) = q2;
+        let mut v = j.json(&sp);
+        v["mu_home"] = json!((m.mu_home * 100.0).round() / 100.0);
+        v["mu_away"] = json!((m.mu_away * 100.0).round() / 100.0);
+        // spread: "over" = home covers (margin + spread > 0)
+        v["at"] = json!({
+            "spread": spread.map(|s| at(&|x, y| x - y, -s)),
+            "total": total.map(|l| at(&|x, y| x + y, l)),
+            "home_total": ht.map(|l| at(&|x, _| x, l)),
+            "away_total": at_.map(|l| at(&|_, y| y, l)),
+        });
+        v["games"] = json!(m.games);
+        Ok(v)
+    }).await;
+    match out {
+        // home / away hold the score distributions; the teams go beside them
+        Ok(Ok(mut v)) => { v["home_team"] = json!(q.home); v["away_team"] = json!(q.away); v["n"] = json!(n); HttpResponse::Ok().json(v) }
+        Ok(Err(e)) => HttpResponse::UnprocessableEntity().json(json!({ "error": e })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e.to_string() })),
+    }
 }
 
 #[cfg(test)]
@@ -243,7 +343,7 @@ mod tests {
     use super::*;
 
     fn g(d: u32, h: &str, a: &str, hs: f64, as_: f64) -> Past {
-        Past { date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap() + chrono::Duration::days(d as i64), home: h.into(), away: a.into(), hs, as_ }
+        Past { date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap() + chrono::Duration::days(d as i64), home: h.into(), away: a.into(), hs, as_, seg: Some((hs / 2.0, as_ / 2.0)) }
     }
 
     #[test]
@@ -259,7 +359,7 @@ mod tests {
         let m = fit_means(&games, &t, &Tuning::default()).unwrap();
         assert!(m.mu_home > m.mu_away + 5.0, "{} vs {}", m.mu_home, m.mu_away);
         let sims = simulate("nba", &m, 20_000, 7);
-        let fc = forecasts("nba", &t, &sims);
+        let fc = forecasts("nba", &t, &sims, &crate::segments::Joint::for_sport("nba"));
         let p = |k: &str| fc.iter().find(|f| f.market == k).unwrap().p_model;
         assert!(p("home_win") > 0.7);
         // covering -8.5 is harder than winning

@@ -560,6 +560,8 @@ fn payload(gref: &GameRef, game: &GameInput, e: &sim::Ensemble, meta: Value, see
         "puckline": { "home_minus_1_5": r4(e.home_puckline as f64 / nn), "away_minus_1_5": r4(e.away_puckline as f64 / nn) },
         "score": { "away": hist_json(&e.score[0], &[]), "home": hist_json(&e.score[1], &[]) },
         "total": hist_json(&e.total, &[5.5, 6.5]),
+        "margin_home": e.full.json("nhl")["margin_home"].clone(),
+        "h1": e.h1.json("nhl"),
         "goalies": ([0, 1].map(|t| json!({ "team": game.teams[t].abbr, "name": game.teams[t].goalie.name, "saves": hist_json(&e.saves[t], &[e.saves[t].mean().floor() + 0.5]),
             "shots_against": hist_json(&e.shots[1 - t], &[]) }))),
         "players": { "away": players[0], "home": players[1] },
@@ -601,7 +603,7 @@ pub async fn new_session(state: &State, id: &str, seed: u64, o: Opts) -> Result<
     let meta = json!({ "sport": "nhl", "game_id": id, "date": gref.date, "away": gref.away, "home": gref.home, "roster": roster,
         "goalies": [game.teams[0].goalie.name.clone(), game.teams[1].goalie.name.clone()],
         "actual": { "away_score": gref.away_score, "home_score": gref.home_score, "last_period": gref.last_period }, "inputs": meta });
-    Ok((meta, events, json!({ "score": res.score, "overtime": res.overtime, "shootout": res.shootout }), gref.date))
+    Ok((meta, events, json!({ "score": res.score, "overtime": res.overtime, "shootout": res.shootout, "h1": res.seg }), gref.date))
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +685,9 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
         Forecast::game("home_puckline", "league home -1.5 rate 0.33", "home_margin", 1.5, e.home_puckline as f64 / nn, 0.33),
         Forecast::game("away_puckline", "league away -1.5 rate 0.27", "away_margin", 1.5, e.away_puckline as f64 / nn, 0.27),
     ];
+    // team totals and the 1st period (segments.rs)
+    let full_over = |home: bool, l: f64| { let (o, u, _, _) = e.score[home as usize].line(l); o / (o + u).max(1e-9) };
+    out.extend(crate::segments::forecasts("nhl", None, None, &e.h1, &full_over));
     let pids: Vec<i64> = game.teams.iter().flat_map(|t| t.skaters.iter().map(|p| p.id)).chain(game.teams.iter().map(|t| t.goalie.id)).collect();
     let hist = db.query("SELECT b.player_id, COALESCE(b.sog,0), COALESCE(b.goals,0)+COALESCE(b.assists,0), COALESCE(b.saves,0), COALESCE(b.goals,0), COALESCE(b.assists,0), COALESCE(b.blocks,0) \
                          FROM nhl_box_api b JOIN nhl_games_api g USING (game_id) \
@@ -744,6 +749,7 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         m.insert("assists", r.get::<_, i32>(7) as f64);
         m.insert("blocks", r.get::<_, i32>(8) as f64);
     }
+    crate::segments::augment(db, "nhl", id, &mut o).await;
     Ok(Some(o))
 }
 

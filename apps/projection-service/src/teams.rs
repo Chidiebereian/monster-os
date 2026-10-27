@@ -455,6 +455,9 @@ pub struct MatchupQuery {
     seed: Option<u64>,
     spread: Option<f64>, // home spread: home covers if (home-away) + spread > 0
     total: Option<f64>,
+    /// team-total lines (home / away points)
+    home_total: Option<f64>,
+    away_total: Option<f64>,
 }
 
 pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> impl Responder {
@@ -497,6 +500,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
     });
     let (spread, total) = (q.spread, q.total);
 
+    let (home_total, away_total) = (q.home_total, q.away_total);
     let out = web::block(move || {
         let mut rng = Rng(seed);
         let (mut hw, mut aw, mut tie, mut cover, mut over) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -515,6 +519,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
             margins.push(margin);
             totals.push(tot);
         }
+        let team_totals = crate::segments::team_totals_json(&margins, &totals, home_total, away_total);
         margins.sort_by(|a, b| a.total_cmp(b));
         totals.sort_by(|a, b| a.total_cmp(b));
         let q = |v: &[f64], p: f64| v[((p * (v.len() - 1) as f64) as usize).min(v.len() - 1)];
@@ -530,7 +535,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
             "cover_prob": spread.map(|_| cover as f64/nf),
             "over_prob": total.map(|_| over as f64/nf),
             "margin_hist": hist(&margins, 40),
-            "total_hist": hist(&totals, 40),
+            "total_hist": hist(&totals, 40), "team_totals": team_totals,
         })
     }).await;
 

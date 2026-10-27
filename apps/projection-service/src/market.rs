@@ -239,7 +239,7 @@ pub(crate) async fn fetch_props(state: &State, sport: &str, stats: &[&'static st
 // --------------------------------------------------------------------------
 /// Game lines from market_lines (see `recorded_props`): per game and market the
 /// main line, priced at DraftKings when it quotes it, else the first book that does.
-async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<Value>, String> {
+pub(crate) async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<Value>, String> {
     let rows = db.query("SELECT DISTINCT ON (m.book, m.game_id, m.market, m.side) m.book, m.game_id, m.market, m.side, m.line, m.price, g.home_team, g.away_team, m.starts_at         FROM market_lines m JOIN sports_games g ON g.sport = m.sport AND g.game_id = m.game_id         WHERE m.sport=$1 AND m.kind='game' AND m.starts_at > now() AND m.observed_at > now() - interval '6 hours'         ORDER BY m.book, m.game_id, m.market, m.side, m.observed_at DESC", &[&sport]).await.map_err(|e| e.to_string())?;
     // game -> (home, away, start, market -> book -> line key -> (a side, b side))
     type Book = HashMap<String, HashMap<String, (Option<(Option<f64>, i32)>, Option<(Option<f64>, i32)>)>>;
@@ -248,7 +248,7 @@ async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<
         let (book, gid, market, side, line, price): (String, String, String, String, Option<f64>, i32) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
         let g = by.entry(gid).or_insert_with(|| (r.get(6), r.get(7), r.get(8), HashMap::new()));
         // pair sides at the same number (a spread's away side is the negated home line)
-        let k = match market.as_str() { "spread" => format!("{}", if side == "away" { -line.unwrap_or(0.0) } else { line.unwrap_or(0.0) }), "moneyline" => "ml".into(), _ => format!("{}", line.unwrap_or(0.0)) };
+        let k = match crate::segments::base_market(&market) { "spread" => format!("{}", if side == "away" { -line.unwrap_or(0.0) } else { line.unwrap_or(0.0) }), "moneyline" => "ml".into(), _ => format!("{}", line.unwrap_or(0.0)) };
         let q = g.3.entry(market).or_default().entry(book).or_default().entry(k).or_default();
         if side == "home" || side == "over" { q.0 = Some((line, price)) } else { q.1 = Some((line, price)) }
     }
@@ -263,15 +263,24 @@ async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<
         Some((a?, b?))
     };
     let mut out = Vec::new();
-    for (_, (home, away, start, mk)) in by {
-        let ml = pick(mk.get("moneyline"));
-        let sp = pick(mk.get("spread"));
-        let tot = pick(mk.get("total"));
+    // one segment's lines: moneyline, spread, total and both team totals
+    let block = |mk: &HashMap<String, Book>, sfx: &str| -> Value {
+        let g = |m: &str| pick(mk.get(&format!("{m}{sfx}")));
+        let (ml, sp, tot, th, ta) = (g("moneyline"), g("spread"), g("total"), g("team_total_home"), g("team_total_away"));
         let novig = ml.map(|((_, h), (_, a))| { let (ih, ia) = (implied(h as f64), implied(a as f64)); (ih / (ih + ia) * 1000.0).round() / 1000.0 });
-        out.push(json!({ "home": home, "away": away, "starts_at": start,
-            "ml_home_odds": ml.map(|x| x.0 .1), "ml_away_odds": ml.map(|x| x.1 .1), "novig_home_win": novig,
+        json!({ "ml_home_odds": ml.map(|x| x.0 .1), "ml_away_odds": ml.map(|x| x.1 .1), "novig_home_win": novig,
             "spread": sp.and_then(|x| x.0 .0), "spread_home_odds": sp.map(|x| x.0 .1), "spread_away_odds": sp.map(|x| x.1 .1),
-            "total": tot.and_then(|x| x.0 .0), "over_odds": tot.map(|x| x.0 .1), "under_odds": tot.map(|x| x.1 .1) }));
+            "total": tot.and_then(|x| x.0 .0), "over_odds": tot.map(|x| x.0 .1), "under_odds": tot.map(|x| x.1 .1),
+            "home_total": th.and_then(|x| x.0 .0), "home_over_odds": th.map(|x| x.0 .1), "home_under_odds": th.map(|x| x.1 .1),
+            "away_total": ta.and_then(|x| x.0 .0), "away_over_odds": ta.map(|x| x.0 .1), "away_under_odds": ta.map(|x| x.1 .1) })
+    };
+    for (_, (home, away, start, mk)) in by {
+        let mut v = block(&mk, "");
+        v["home"] = json!(home); v["away"] = json!(away); v["starts_at"] = json!(start);
+        // first segment (1st half / 1st period / first 5 innings), when any book quotes it
+        let h1 = block(&mk, "_1h");
+        if h1.as_object().map(|o| o.values().any(|x| !x.is_null())).unwrap_or(false) { v["h1"] = h1; }
+        out.push(v);
     }
     out.sort_by(|a, b| a["starts_at"].as_str().cmp(&b["starts_at"].as_str()));
     Ok(out)
@@ -335,6 +344,51 @@ async fn recorded_props(db: &tokio_postgres::Client, sport: &str, market: &str) 
         let (o, u) = books[*book][&main];
         out.push(json!({ "player": name, "player_id": subj, "team": Value::Null, "line": main.parse::<f64>().ok(),
             "over_odds": o, "under_odds": u, "book": crate::picks::book_title(book), "books": n }));
+    }
+    Ok(out)
+}
+
+/// Recorded prop lines as cheat-sheet rows: the main line per player and stat,
+/// with the player's team, the opponent and the venue from the game. No provider
+/// budget is spent (see `recorded_props`).
+pub(crate) async fn recorded_prop_lines(db: &tokio_postgres::Client, sport: &str, keys: &[&'static str]) -> Result<Vec<PropLine>, String> {
+    let mut out = Vec::new();
+    for &key in keys {
+        let Some(m) = recorded_market(sport, key) else { continue };
+        let rows = db.query(
+            "SELECT DISTINCT ON (l.book, l.game_id, l.subject, l.side) l.book, l.game_id, l.subject, l.subject_name, l.side, l.line, l.price, l.starts_at, \
+                    g.home_team, g.away_team, p.team, p.display_name \
+             FROM market_lines l LEFT JOIN sports_games g ON g.sport = l.sport AND g.game_id = l.game_id \
+             LEFT JOIN sports_players p ON p.sport = l.sport AND p.player_id = l.subject \
+             WHERE l.sport=$1 AND l.kind='prop' AND l.market=$2 AND l.starts_at > now() AND l.observed_at > now() - interval '8 hours' \
+             ORDER BY l.book, l.game_id, l.subject, l.side, l.observed_at DESC", &[&sport, &m]).await.map_err(|e| e.to_string())?;
+        // (game, subject) -> info + book -> line -> (over, under)
+        type Info = (String, Option<String>, Option<String>, Option<String>, Value);
+        let mut by: HashMap<(String, String), (Info, HashMap<String, HashMap<String, (Option<i32>, Option<i32>)>>)> = HashMap::new();
+        for r in &rows {
+            let (book, game, subj, side): (String, String, String, String) = (r.get(0), r.get(1), r.get(2), r.get(4));
+            let (Some(line), price) = (r.get::<_, Option<f64>>(5), r.get::<_, i32>(6)) else { continue };
+            let name = r.get::<_, Option<String>>(11).or(r.get(3)).unwrap_or_default();
+            let start = json!(r.get::<_, Option<chrono::DateTime<chrono::Utc>>>(7));
+            let e = by.entry((game, subj)).or_insert_with(|| ((name, r.get(10), r.get(8), r.get(9), start), HashMap::new()));
+            let q = e.1.entry(book).or_default().entry(format!("{line}")).or_default();
+            if side == "over" { q.0 = Some(price) } else { q.1 = Some(price) }
+        }
+        for ((_, subj), ((name, team, home, away, start), books)) in by {
+            let mut count: HashMap<String, usize> = HashMap::new();
+            for lines in books.values() { for (l, (o, u)) in lines { if o.is_some() && u.is_some() { *count.entry(l.clone()).or_default() += 1; } } }
+            let Some((main, _)) = count.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))) else { continue };
+            let mut names: Vec<&String> = books.keys().filter(|b| books[*b].get(&main).map(|(o, u)| o.is_some() && u.is_some()).unwrap_or(false)).collect();
+            names.sort_by_key(|b| (b.as_str() != "draftkings", b.to_string()));
+            let Some(book) = names.first() else { continue };
+            let (o, u) = books[*book][&main];
+            let Ok(line) = main.parse::<f64>() else { continue };
+            let canon = |t: &str| crate::hitrates::canon(sport, t);
+            let is_home = match (&team, &home) { (Some(t), Some(h)) => Some(canon(t) == canon(h)), _ => None };
+            let opponent = match is_home { Some(true) => away.clone(), Some(false) => home.clone(), None => None };
+            out.push(PropLine { stat: key, player: name, player_id: Some(subj), team, opponent, home: is_home, starts_at: start,
+                line, over_odds: o.map(|x| x as f64), under_odds: u.map(|x| x as f64) });
+        }
     }
     Ok(out)
 }

@@ -237,6 +237,8 @@ pub struct GameResult {
     pub active: [Vec<bool>; 2],
     pub overtime: bool,
     pub possessions: [i32; 2],
+    /// [away, home] score at halftime (end of Q2)
+    pub seg: [i32; 2],
 }
 
 const SEG: f64 = 120.0; // stint length, seconds
@@ -497,6 +499,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     };
     let mut elapsed_total = 0.0;
     let mut seg_idx = 0usize;
+    let mut half = [0, 0];
     loop {
         // stint boundary -> substitutions
         let seg_now = ((elapsed_total / SEG) as usize).min(max_segments - 1);
@@ -532,6 +535,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
                 break;
             }
             if s.period >= 10 { break; }
+            if s.period == 2 { half = s.score; }
             s.emit("end_period", 0, None, None, None, None, 0, false, false, (0, 0), None, 0, (vec![], vec![]));
             s.period += 1;
             s.clock = if s.period <= 4 { 720.0 } else { 300.0 };
@@ -544,7 +548,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     s.clock = 0.0;
     s.emit("game_end", 0, None, None, None, None, 0, false, false, (0, 0), None, 0, (vec![], vec![]));
     let active = [0, 1].map(|t| g.teams[t].players.iter().map(|p| p.p_active > 0.5).collect::<Vec<_>>());
-    GameResult { score: s.score, stats: s.stats, active, overtime: s.period > 4, possessions: s.poss }
+    GameResult { score: s.score, stats: s.stats, active, overtime: s.period > 4, possessions: s.poss, seg: half }
 }
 
 pub fn single_game(g: &GameInput, seed: u64) -> (GameResult, Vec<Event>) {
@@ -612,13 +616,15 @@ pub struct Ensemble {
     pub player: [Vec<Vec<Hist>>; 2],
     pub active_n: [Vec<u64>; 2],
     pub possessions: [f64; 2],
+    /// 1st-half (home, away) joint score
+    pub h1: crate::segments::Joint,
 }
 pub const MARGIN_OFFSET: i32 = 80;
 impl Ensemble {
     fn new(n: [usize; 2]) -> Self {
         Ensemble { n: 0, score: [Hist::new(), Hist::new()], total: Hist::new(), margin: vec![0; 161], home_win: 0, overtime: 0,
             player: [0, 1].map(|t| (0..n[t]).map(|_| (0..PROPS.len()).map(|_| Hist::new()).collect()).collect()),
-            active_n: [vec![0; n[0]], vec![0; n[1]]], possessions: [0.0, 0.0] }
+            active_n: [vec![0; n[0]], vec![0; n[1]]], possessions: [0.0, 0.0], h1: crate::segments::Joint::for_sport("nba") }
     }
     fn add(&mut self, r: &GameResult) {
         self.n += 1;
@@ -628,6 +634,7 @@ impl Ensemble {
         self.margin[m] += 1;
         self.home_win += (r.score[1] > r.score[0]) as u64;
         self.overtime += r.overtime as u64;
+        self.h1.add(r.seg[1], r.seg[0]);
         for t in 0..2 {
             self.possessions[t] += r.possessions[t] as f64;
             for (i, s) in r.stats[t].iter().enumerate() {
@@ -649,6 +656,7 @@ impl Ensemble {
         for (a, b) in self.margin.iter_mut().zip(&o.margin) { *a += b; }
         self.home_win += o.home_win;
         self.overtime += o.overtime;
+        self.h1.merge(&o.h1);
     }
     /// P(home margin > line), P(< line)
     pub fn margin_line(&self, line: f64) -> (f64, f64) {

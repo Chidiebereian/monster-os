@@ -397,7 +397,13 @@ pub async fn player(state: web::Data<State>, path: web::Path<(String, String)>, 
 // --------------------------------------------------------------------------
 
 struct TeamGame { season: i32, date: Option<NaiveDate>, opp: String, home: bool, pf: f64, pa: f64,
-                  hist_spread: Option<f64>, hist_total: Option<f64> }
+                  hist_spread: Option<f64>, hist_total: Option<f64>,
+                  /// first-segment points for / against (1st half, 1st period, first 5 innings; segments.rs)
+                  seg: Option<(f64, f64)> }
+
+/// The first-segment lines a team is graded on (team's own spread, bettor convention).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SegLines { spread: Option<f64>, total: Option<f64>, team_total: Option<f64> }
 
 /// Completed games for a team, newest first. `hist_spread` is the team's own
 /// closing spread in bettor convention (negative = favored).
@@ -407,10 +413,12 @@ async fn team_games(state: &State, sport: &str, team: &str, limit: i64) -> Resul
     let rows = state.db.query(
         "SELECT * FROM ( \
            SELECT DISTINCT ON (game_date, home_team, away_team) \
-             season, game_date, home_team, away_team, home_score, away_score, spread_line, total_line FROM sports_games \
-           WHERE sport=$1 AND home_score IS NOT NULL AND away_score IS NOT NULL AND (home_team=$2 OR away_team=$2) \
+             season, game_date, home_team, away_team, home_score, away_score, spread_line, total_line, s.home_1h, s.away_1h FROM sports_games g \
+           LEFT JOIN game_segments s ON s.sport = g.sport AND s.game_id = g.game_id \
+           WHERE g.sport=$1 AND home_score IS NOT NULL AND away_score IS NOT NULL AND (home_team=$2 OR away_team=$2) \
+             AND lower(COALESCE(g.status, 'final')) IN ('final', 'completed early') \
              AND COALESCE(game_type, 'REG') NOT IN ('PRE', 'ASG') \
-           ORDER BY game_date, home_team, away_team, spread_line NULLS LAST) t \
+           ORDER BY game_date, home_team, away_team, spread_line NULLS LAST, s.home_1h NULLS LAST) t \
          ORDER BY game_date DESC NULLS LAST, season DESC LIMIT $3",
         &[&sport, &team, &limit],
     ).await.map_err(|e| e.to_string())?;
@@ -425,6 +433,10 @@ async fn team_games(state: &State, sport: &str, team: &str, limit: i64) -> Resul
             opp: canon(sport, &opp.unwrap_or_default()), home,
             pf: if home { hs } else { as_ }, pa: if home { as_ } else { hs },
             hist_spread: sl.map(|l| if home { -l } else { l }), hist_total: r.get("total_line"),
+            seg: match (r.get::<_, Option<i32>>("home_1h"), r.get::<_, Option<i32>>("away_1h")) {
+                (Some(h), Some(a)) => Some(if home { (h as f64, a as f64) } else { (a as f64, h as f64) }),
+                _ => None,
+            },
         }
     }).collect())
 }
@@ -435,10 +447,15 @@ fn team_marks(games: &[TeamGame], f: impl Fn(&TeamGame) -> Option<Outcome>) -> V
 
 /// All market hit rates for one team. `spread` is the team's spread (bettor
 /// convention), `total` the game total, `team_total` the team's own points line.
-fn team_markets(games: &[TeamGame], spread: Option<f64>, total: Option<f64>, team_total: Option<f64>,
+fn team_markets(games: &[TeamGame], spread: Option<f64>, total: Option<f64>, team_total: Option<f64>, seg: SegLines,
                 opponent: Option<&str>, venue: Option<bool>) -> Value {
     let w = |m: Vec<Mark>| if m.is_empty() { Value::Null } else { windows(&m, opponent, venue) };
     json!({
+        // first segment: leading after it (a tie pushes), and its spread / totals
+        "win_1h": w(team_marks(games, |g| g.seg.map(|(f, a)| outcome(f - a, 0.0)))),
+        "cover_1h": seg.spread.map(|s| w(team_marks(games, |g| g.seg.map(|(f, a)| outcome(f - a + s, 0.0))))),
+        "over_1h": seg.total.map(|t| w(team_marks(games, |g| g.seg.map(|(f, a)| outcome(f + a, t))))),
+        "team_total_over_1h": seg.team_total.map(|t| w(team_marks(games, |g| g.seg.map(|(f, _)| outcome(f, t))))),
         "win": w(team_marks(games, |g| Some(outcome(g.pf - g.pa, 0.0)))),
         "cover": spread.map(|s| w(team_marks(games, |g| Some(outcome(g.pf - g.pa + s, 0.0))))),
         "over": total.map(|t| w(team_marks(games, |g| Some(outcome(g.pf + g.pa, t))))),
@@ -452,11 +469,16 @@ fn team_averages(games: &[TeamGame]) -> Value {
     let latest = games.first().map(|g| g.season);
     let avg = |n: usize, f: fn(&TeamGame) -> f64| mean(games.iter().take(n).map(f));
     let season = |f: fn(&TeamGame) -> f64| mean(games.iter().filter(|g| Some(g.season) == latest).map(f));
+    let pick = |g: &TeamGame, pf: bool| g.seg.map(|(f, a)| if pf { f } else { a });
+    let seg_avg = |n: usize, pf: bool| mean(games.iter().filter_map(|g| pick(g, pf)).take(n));
+    let seg_season = |pf: bool| mean(games.iter().filter(|g| Some(g.season) == latest).filter_map(|g| pick(g, pf)));
     json!({
         "points_for": { "l5": avg(5, |g| g.pf), "l10": avg(10, |g| g.pf), "season": season(|g| g.pf) },
         "points_against": { "l5": avg(5, |g| g.pa), "l10": avg(10, |g| g.pa), "season": season(|g| g.pa) },
         "margin": { "l5": avg(5, |g| g.pf - g.pa), "l10": avg(10, |g| g.pf - g.pa), "season": season(|g| g.pf - g.pa) },
         "total": { "l5": avg(5, |g| g.pf + g.pa), "l10": avg(10, |g| g.pf + g.pa), "season": season(|g| g.pf + g.pa) },
+        "points_for_1h": { "l5": seg_avg(5, true), "l10": seg_avg(10, true), "season": seg_season(true) },
+        "points_against_1h": { "l5": seg_avg(5, false), "l10": seg_avg(10, false), "season": seg_season(false) },
     })
 }
 
@@ -465,6 +487,10 @@ pub struct TeamQ {
     spread: Option<f64>,
     total: Option<f64>,
     team_total: Option<f64>,
+    /// first-segment lines (1st half / 1st period / first 5 innings)
+    spread_1h: Option<f64>,
+    total_1h: Option<f64>,
+    team_total_1h: Option<f64>,
     opponent: Option<String>,
     #[serde(default = "d_team_games")] games: usize,
 }
@@ -482,11 +508,14 @@ pub async fn team(state: web::Data<State>, path: web::Path<(String, String)>, q:
         "points_for": g.pf, "points_against": g.pa, "margin": g.pf - g.pa, "total": g.pf + g.pa,
         "closing_spread": g.hist_spread, "closing_total": g.hist_total,
         "covered_line": q.spread.map(|s| (g.pf - g.pa + s) > 0.0), "over_line": q.total.map(|t| g.pf + g.pa > t),
+        "points_for_1h": g.seg.map(|x| x.0), "points_against_1h": g.seg.map(|x| x.1),
     })).collect();
+    let seg = SegLines { spread: q.spread_1h, total: q.total_1h, team_total: q.team_total_1h };
     HttpResponse::Ok().json(json!({
         "sport": sport, "team": team, "opponent": opponent,
-        "lines": { "spread": q.spread, "total": q.total, "team_total": q.team_total },
-        "markets": team_markets(&games, q.spread, q.total, q.team_total, opponent.as_deref(), None),
+        "lines": { "spread": q.spread, "total": q.total, "team_total": q.team_total, "spread_1h": q.spread_1h, "total_1h": q.total_1h, "team_total_1h": q.team_total_1h },
+        "segment": crate::segments::label(&sport),
+        "markets": team_markets(&games, q.spread, q.total, q.team_total, seg, opponent.as_deref(), None),
         "averages": team_averages(&games),
         "log": log,
         "note": "cover/over apply the given line to past games; ats_closing/ou_closing use each game's own closing line (stored for NFL only).",
@@ -531,9 +560,22 @@ pub async fn cheatsheet_props(state: web::Data<State>, path: web::Path<String>, 
     // 1) the lines to grade
     let lines: Vec<PropLine> = match q.source.as_str() {
         "market" => {
-            let keys: Vec<&'static str> = defs.iter().map(|d| d.key).filter(|k| market::sgo_stat(&sport, k).is_some()).collect();
+            let keys: Vec<&'static str> = defs.iter().map(|d| d.key)
+                .filter(|k| market::sgo_stat(&sport, k).is_some() || market::recorded_market(&sport, k).is_some()).collect();
             if keys.is_empty() { return bad_request("no market mapped for this stat; use source=projection"); }
-            match market::fetch_props(&state, &sport, &keys).await { Ok(l) => l, Err(e) => return internal(e) }
+            // recorded lines first (ESPN / DraftKings, The Odds API and SportsGameOdds, recorded for AI
+            // Picks every 20 min, no budget spent); a live SportsGameOdds pull only when none are stored
+            let recorded = match market::recorded_prop_lines(&state.db, &sport, &keys).await { Ok(l) => l, Err(e) => return internal(e) };
+            if !recorded.is_empty() { recorded } else {
+                let live: Vec<&'static str> = keys.iter().copied().filter(|k| market::sgo_stat(&sport, k).is_some()).collect();
+                match market::fetch_props(&state, &sport, &live).await {
+                    Ok(l) => l,
+                    // rate limited / out of entities: an empty board with the reason, not an error
+                    Err(e) => return HttpResponse::Ok().json(json!({ "sport": sport, "source": q.source, "sort": q.sort, "side": q.side,
+                        "stats": defs.iter().map(|d| d.key).collect::<Vec<_>>(), "count": 0, "props": [],
+                        "note": format!("no recorded prop lines for upcoming games yet, and the live SportsGameOdds pull failed ({e}); recorded lines refresh every 20 minutes") })),
+                }
+            }
         }
         "projection" => {
             let Some(def) = (if defs.len() == 1 { Some(defs[0]) } else { None }) else {
@@ -621,6 +663,10 @@ pub async fn cheatsheet_props(state: web::Data<State>, path: web::Path<String>, 
 
 struct GameLine { home: String, away: String, starts_at: Value, spread: Option<f64>, total: Option<f64>, market: Value }
 
+impl GameLine {
+    fn num(&self, path: &[&str]) -> Option<f64> { let mut v = &self.market; for k in path { v = &v[*k]; } v.as_f64() }
+}
+
 /// Upcoming games with stored lines — the fallback when the live market is
 /// unavailable. Stored spread is home margin, flipped to bettor convention.
 async fn stored_upcoming(state: &State, sport: &str) -> Result<Vec<GameLine>, String> {
@@ -640,12 +686,17 @@ async fn stored_upcoming(state: &State, sport: &str) -> Result<Vec<GameLine>, St
 pub async fn cheatsheet_games(state: web::Data<State>, path: web::Path<String>) -> impl Responder {
     let sport = path.into_inner();
     if registry(&sport).is_empty() { return bad_request("unknown sport"); }
-    let (games, source) = match market::fetch_games(&state, &sport).await {
-        Ok(g) if !g.is_empty() => (g.into_iter().map(|v| GameLine {
-            home: v["home"].as_str().unwrap_or("").to_string(), away: v["away"].as_str().unwrap_or("").to_string(),
-            starts_at: v["starts_at"].clone(), spread: v["spread"].as_f64(), total: v["total"].as_f64(), market: v,
-        }).collect::<Vec<_>>(), "market"),
-        Ok(_) | Err(_) => match stored_upcoming(&state, &sport).await { Ok(g) => (g, "schedule"), Err(e) => return internal(e) },
+    let to_lines = |g: Vec<Value>| g.into_iter().map(|v| GameLine {
+        home: v["home"].as_str().unwrap_or("").to_string(), away: v["away"].as_str().unwrap_or("").to_string(),
+        starts_at: v["starts_at"].clone(), spread: v["spread"].as_f64(), total: v["total"].as_f64(), market: v,
+    }).collect::<Vec<_>>();
+    // recorded lines first (free, every book, team totals and the first segment), then a live pull, then the schedule
+    let (games, source) = match market::recorded_games(&state.db, &sport).await {
+        Ok(g) if !g.is_empty() => (to_lines(g), "market"),
+        _ => match market::fetch_games(&state, &sport).await {
+            Ok(g) if !g.is_empty() => (to_lines(g), "market"),
+            Ok(_) | Err(_) => match stored_upcoming(&state, &sport).await { Ok(g) => (g, "schedule"), Err(e) => return internal(e) },
+        },
     };
 
     let mut cache: HashMap<String, Vec<TeamGame>> = HashMap::new();
@@ -663,18 +714,20 @@ pub async fn cheatsheet_games(state: web::Data<State>, path: web::Path<String>) 
             "spread_home": g.spread, "total": g.total, "market": g.market,
             "home_team": {
                 "games": hg.len(),
-                "markets": team_markets(hg, g.spread, g.total, None, Some(&away), Some(true)),
+                "markets": team_markets(hg, g.spread, g.total, g.num(&["home_total"]),
+                    SegLines { spread: g.num(&["h1", "spread"]), total: g.num(&["h1", "total"]), team_total: g.num(&["h1", "home_total"]) }, Some(&away), Some(true)),
                 "averages": team_averages(hg),
             },
             "away_team": {
                 "games": ag.len(),
-                "markets": team_markets(ag, g.spread.map(|s| -s), g.total, None, Some(&home), Some(false)),
+                "markets": team_markets(ag, g.spread.map(|s| -s), g.total, g.num(&["away_total"]),
+                    SegLines { spread: g.num(&["h1", "spread"]).map(|s| -s), total: g.num(&["h1", "total"]), team_total: g.num(&["h1", "away_total"]) }, Some(&home), Some(false)),
                 "averages": team_averages(ag),
             },
         }));
     }
     HttpResponse::Ok().json(json!({
-        "sport": sport, "source": source, "count": out.len(), "games": out,
+        "sport": sport, "source": source, "segment": crate::segments::label(&sport), "count": out.len(), "games": out,
         "note": "cover/over apply tonight's line to each team's past games; venue = tonight's home/away split; h2h = last 10 meetings.",
     }))
 }

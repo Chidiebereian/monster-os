@@ -105,6 +105,13 @@ impl Roster {
     }
 }
 
+/// A ledger payload's team code: top-level `home` / `away` (NBA, NHL, NFL, team
+/// engines) or `game.home` / `game.away` (the MLB simulator, whose top-level
+/// `home` / `away` hold each side's lineup).
+pub(crate) fn payload_team(p: &Value, side: &str) -> String {
+    p[side].as_str().or_else(|| p["game"][side].as_str()).unwrap_or("").to_string()
+}
+
 pub(crate) struct Upcoming {
     pub game_id: String,
     pub start: DateTime<Utc>,
@@ -122,8 +129,8 @@ pub(crate) async fn upcoming(db: &tokio_postgres::Client, sport: &str) -> Result
          ORDER BY game_id, (sport = $2) DESC, id DESC", &[&engines, &sport]).await.map_err(|e| dberr(&e))?;
     Ok(rows.iter().map(|r| {
         let p: Json<Value> = r.get(2);
-        Upcoming { game_id: r.get(0), start: r.get(1), home: p.0["home"].as_str().unwrap_or("").to_string(),
-            away: p.0["away"].as_str().unwrap_or("").to_string(), roster: Roster::from_payload(&p.0) }
+        Upcoming { game_id: r.get(0), start: r.get(1), home: payload_team(&p.0, "home"),
+            away: payload_team(&p.0, "away"), roster: Roster::from_payload(&p.0) }
     }).collect())
 }
 
@@ -472,6 +479,12 @@ const SGO_PROP_STATS: [(&str, &[&str]); 3] = [
     ("nfl", &["pass_yds", "rush_yds", "rec_yds", "receptions"]),
 ];
 
+/// Every game market name (static, for `Line::market`).
+const GAME_MARKET_NAMES: [&str; 10] = crate::segments::GAME_MARKETS;
+
+/// SportsGameOdds periodID of the first segment.
+fn sgo_segment(sport: &str) -> &'static str { if sport == "nhl" { "1p" } else { "1h" } }
+
 pub(crate) fn parse_sgo(sport: &str, events: &[Value], games: &[Upcoming]) -> Vec<Line> {
     let stats: &'static [&'static str] = SGO_PROP_STATS.iter().find(|(s, _)| *s == sport).map(|(_, v)| *v).unwrap_or(&[]);
     let mut out = Vec::new();
@@ -482,11 +495,16 @@ pub(crate) fn parse_sgo(sport: &str, events: &[Value], games: &[Upcoming]) -> Ve
         let Some(odds) = ev["odds"].as_object() else { continue };
         let eid = ev["eventID"].as_str().unwrap_or("").to_string();
         // (market, side, oddID, partner oddID, line field, subject, name, provider id)
-        let mut sels: Vec<(&'static str, &'static str, String, String, &'static str, String, Option<String>, Option<String>)> = vec![
-            ("moneyline", "home", "points-home-game-ml-home".into(), "points-away-game-ml-away".into(), "", "game".into(), None, None),
-            ("spread", "home", "points-home-game-sp-home".into(), "points-away-game-sp-away".into(), "spread", "game".into(), None, None),
-            ("total", "over", "points-all-game-ou-over".into(), "points-all-game-ou-under".into(), "overUnder", "game".into(), None, None),
-        ];
+        let mut sels: Vec<(&'static str, &'static str, String, String, &'static str, String, Option<String>, Option<String>)> = Vec::new();
+        // full game and the first segment (SGO period "1h"; "1p" for hockey; MLB's "1h" is the first five innings)
+        for (period, sfx) in [("game", ""), (sgo_segment(sport), "_1h")] {
+            let m = |base: &str| -> &'static str { GAME_MARKET_NAMES.iter().find(|n| **n == format!("{base}{sfx}")).copied().unwrap_or("") };
+            sels.push((m("moneyline"), "home", format!("points-home-{period}-ml-home"), format!("points-away-{period}-ml-away"), "", "game".into(), None, None));
+            sels.push((m("spread"), "home", format!("points-home-{period}-sp-home"), format!("points-away-{period}-sp-away"), "spread", "game".into(), None, None));
+            sels.push((m("total"), "over", format!("points-all-{period}-ou-over"), format!("points-all-{period}-ou-under"), "overUnder", "game".into(), None, None));
+            sels.push((m("team_total_home"), "over", format!("points-home-{period}-ou-over"), format!("points-home-{period}-ou-under"), "overUnder", "game".into(), None, None));
+            sels.push((m("team_total_away"), "over", format!("points-away-{period}-ou-over"), format!("points-away-{period}-ou-under"), "overUnder", "game".into(), None, None));
+        }
         if let Some(players) = ev["players"].as_object() {
             for (pid, p) in players {
                 let name = p["name"].as_str().unwrap_or("").to_string();
@@ -509,7 +527,7 @@ pub(crate) fn parse_sgo(sport: &str, events: &[Value], games: &[Upcoming]) -> Ve
                 let (al, bl) = if field.is_empty() { (None, None) } else { (num(&av[field]), num(&bv[field])) };
                 if !field.is_empty() && (al.is_none() || bl.is_none()) { continue; }
                 // the pair must be the same market: spread sides mirror, totals match
-                match market { "spread" => if (al.unwrap() + bl.unwrap()).abs() > 1e-9 { continue }, "moneyline" => {}, _ => if al != bl { continue } }
+                match crate::segments::base_market(market) { "spread" => if (al.unwrap() + bl.unwrap()).abs() > 1e-9 { continue }, "moneyline" => {}, _ => if al != bl { continue } }
                 let link = |v: &Value| first([v["deeplink"].as_str(), v["deepLink"].as_str(), v["link"].as_str()]).map(str::to_string);
                 let mk = |s: &'static str, line: Option<f64>, price: i32, link: Option<String>| Line {
                     source: "sgo", game_id: g.game_id.clone(), event_ref: eid.clone(), starts_at: start, kind, market, subject: subject.clone(),
@@ -712,6 +730,36 @@ mod tests {
         assert_eq!(ls.len(), 6);
         assert!(ls.iter().any(|l| l.market == "spread" && l.side == "home" && l.line == Some(3.5)));
         assert_eq!(ls.iter().find(|l| l.side == "over").unwrap().link.as_deref(), Some("https://fd/x"));
+    }
+
+    #[test]
+    fn sgo_parses_team_totals_and_the_first_segment() {
+        let g = up("g1", "DET", "BOS", json!({}));
+        let ev = json!([{ "eventID": "E", "status": { "startsAt": (Utc::now() + Duration::hours(3)).to_rfc3339() },
+            "teams": { "home": { "names": { "short": "DET" } }, "away": { "names": { "short": "BOS" } } },
+            "odds": {
+                "points-home-1h-ml-home": { "byBookmaker": { "fanduel": { "odds": "-120" } } },
+                "points-away-1h-ml-away": { "byBookmaker": { "fanduel": { "odds": "+100" } } },
+                "points-home-1h-sp-home": { "byBookmaker": { "fanduel": { "odds": "-110", "spread": "-1.5" } } },
+                "points-away-1h-sp-away": { "byBookmaker": { "fanduel": { "odds": "-110", "spread": "+1.5" } } },
+                "points-all-1h-ou-over": { "byBookmaker": { "fanduel": { "odds": "-110", "overUnder": "112.5" } } },
+                "points-all-1h-ou-under": { "byBookmaker": { "fanduel": { "odds": "-110", "overUnder": "112.5" } } },
+                "points-away-game-ou-over": { "byBookmaker": { "draftkings": { "odds": "-115", "overUnder": "108.5" } } },
+                "points-away-game-ou-under": { "byBookmaker": { "draftkings": { "odds": "-105", "overUnder": "108.5" } } } } }]);
+        let ls = parse_sgo("nba", ev.as_array().unwrap(), &[g]);
+        let has = |m: &str, s: &str| ls.iter().any(|l| l.market == m && l.side == s);
+        assert!(has("moneyline_1h", "home") && has("moneyline_1h", "away"));
+        assert!(has("spread_1h", "away") && has("total_1h", "under"));
+        assert!(has("team_total_away", "over") && has("team_total_away", "under"));
+        assert_eq!(ls.len(), 8, "{ls:?}");
+        // hockey's first segment is the 1st period
+        let g = up("g2", "DET", "BOS", json!({}));
+        let ev = json!([{ "eventID": "E", "status": { "startsAt": (Utc::now() + Duration::hours(3)).to_rfc3339() },
+            "teams": { "home": { "names": { "short": "DET" } }, "away": { "names": { "short": "BOS" } } },
+            "odds": { "points-all-1p-ou-over": { "byBookmaker": { "fanduel": { "odds": "+120", "overUnder": "1.5" } } },
+                      "points-all-1p-ou-under": { "byBookmaker": { "fanduel": { "odds": "-150", "overUnder": "1.5" } } } } }]);
+        let ls = parse_sgo("nhl", ev.as_array().unwrap(), &[g]);
+        assert_eq!(ls.iter().filter(|l| l.market == "total_1h").count(), 2);
     }
 
     #[test]

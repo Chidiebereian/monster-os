@@ -147,9 +147,9 @@ pub async fn settle(db: &tokio_postgres::Client, sport: &str) -> Result<u64, Str
         let props = crate::picks::prop_actuals(db, sport, &game).await?;
         for e in db.query("SELECT engine, market, subject, line FROM pick_line_evals WHERE sport=$1 AND game_id=$2 AND settled_at IS NULL", &[&sport, &game]).await.map_err(|e| dberr(&e))? {
             let (engine, market, subject, line): (String, String, String, f64) = (e.get(0), e.get(1), e.get(2), e.get(3));
-            let actual = if subject == "game" { go.game.get(if market == "total" { "total" } else { "home_margin" }).copied() }
+            let actual = if subject == "game" { go.game.get(crate::segments::outcome_key(&market)).copied() }
                 else { props.as_ref().and_then(|p| p.get(&subject)).and_then(|m| m.get(market.as_str()).copied()) };
-            let side = if matches!(market.as_str(), "moneyline" | "spread") { "home" } else { "over" };
+            let side = if crate::segments::home_away(&market) { "home" } else { "over" };
             let y: Option<f64> = actual.and_then(|a| match result_of(&market, side, Some(line), a) { "win" => Some(1.0), "loss" => Some(0.0), _ => None });
             n += db.execute("UPDATE pick_line_evals SET actual=$5, y=$6, settled_at=now() WHERE engine=$1 AND game_id=$2 AND market=$3 AND subject=$4 AND line=$7",
                 &[&engine, &game, &market, &subject, &actual, &y, &line]).await.map_err(|e| dberr(&e))?;

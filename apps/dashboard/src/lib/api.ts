@@ -96,12 +96,15 @@ export const api = {
   backtest: (sport = "nfl", opts: { from?: number; to?: number } = {}) => getJson<Backtest>(`/projection-service/backtest/${sport}?${qs(opts)}`),
   playerBacktest: (sport: string, stat: string, opts: { test_games?: number; min_games?: number } = {}) =>
     getJson<PlayerBacktest>(`/projection-service/backtest/player/${sport}/${stat}?${qs(opts)}`),
-  matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; n?: number } = {}) =>
+  matchup: (sport: string, home: string, away: string, opts: { spread?: number; puckline?: number; total?: number; home_total?: number; away_total?: number; n?: number } = {}) =>
     getJson<Matchup>(`/projection-service/matchup/${sport}?${qs({ home, away, ...opts })}`),
+  matchupH1: (sport: string, home: string, away: string, opts: { spread?: number; total?: number; home_total?: number; away_total?: number; n?: number } = {}) =>
+    getJson<SegmentMatchup>(`/projection-service/matchup/${sport}/h1?${qs({ home, away, ...opts })}`),
+  marketScreen: (sport: string, market: string) => getJson<MarketScreen>(`/projection-service/market/${sport}/screen?${qs({ market })}`),
   statList: (sport: string) => getJson<{ sport: string; stats: { key: string; label: string; unit: string; family: string }[] }>(`/projection-service/stats/${sport}`),
   playerHitRates: (sport: string, playerId: string, opts: { stat: string; line?: number; opponent?: string; games?: number }) =>
     getJson<PlayerHitRates>(`/projection-service/hitrates/${sport}/player/${playerId}?${qs(opts)}`),
-  teamHitRates: (sport: string, team: string, opts: { spread?: number; total?: number; team_total?: number; opponent?: string; games?: number } = {}) =>
+  teamHitRates: (sport: string, team: string, opts: { spread?: number; total?: number; team_total?: number; spread_1h?: number; total_1h?: number; team_total_1h?: number; opponent?: string; games?: number } = {}) =>
     getJson<TeamHitRates>(`/projection-service/hitrates/${sport}/team/${team}?${qs(opts)}`),
   propsCheatsheet: (sport: string, opts: { stat?: string; source?: string; sort?: string; side?: string; min_games?: number; limit?: number; include_lopsided?: string } = {}) =>
     getJson<PropsCheatsheet>(`/projection-service/cheatsheet/${sport}/props?${qs(opts)}`),
@@ -200,11 +203,18 @@ export interface Game {
   spread_line: number | null; total_line: number | null; status: string | null;
 }
 export interface GamesList { count: number; games: Game[]; }
-export interface MarketGame {
-  home: string; away: string; starts_at: string | null;
+/** One segment's recorded lines: moneyline, spread (home), total and both team totals. */
+export interface MarketLines {
   ml_home_odds: number | null; ml_away_odds: number | null; novig_home_win: number | null;
   spread: number | null; spread_home_odds: number | null; spread_away_odds: number | null;
   total: number | null; over_odds: number | null; under_odds: number | null;
+  home_total?: number | null; home_over_odds?: number | null; home_under_odds?: number | null;
+  away_total?: number | null; away_over_odds?: number | null; away_under_odds?: number | null;
+}
+export interface MarketGame extends MarketLines {
+  home: string; away: string; starts_at: string | null;
+  /** first segment (1st half; NHL 1st period; MLB first 5 innings), when quoted */
+  h1?: MarketLines;
 }
 export interface MarketProp {
   player: string; player_id: string | null; team: string | null;
@@ -241,6 +251,21 @@ export interface Matchup {
   proj_total: number; median_total: number; total_p10: number; total_p90: number;
   cover_prob: number | null; over_prob: number | null;
   margin_hist: SimHistogram; total_hist: SimHistogram;
+  team_totals?: { home: TeamTotalSide; away: TeamTotalSide };
+}
+export interface LineSplit { line: number; over: number; under: number; push: number }
+export interface TeamTotalSide { mean: number; q10: number; q50: number; q90: number; at_line: LineSplit | null }
+/** A simulated integer distribution (pmf from pmf_offset). */
+export interface IntDist { pmf: number[]; pmf_offset: number; mean: number; q10: number; q50: number; q90: number }
+/** First segment of a matchup (1st half / 1st period / first 5 innings). */
+export interface SegmentBlock {
+  label: string; tag: string; n: number;
+  win: { home: number; away: number; tie: number };
+  home: IntDist; away: IntDist; total: IntDist; margin_home: IntDist;
+}
+export interface SegmentMatchup extends SegmentBlock {
+  home_team?: string; away_team?: string; mu_home: number; mu_away: number; games: number;
+  at: { spread: LineSplit | null; total: LineSplit | null; home_total: LineSplit | null; away_total: LineSplit | null };
 }
 export interface Candle { t: number; o: number; h: number; l: number; c: number; v: number; n: number; }
 export interface Candles { market_id: string | null; outcome_index: number | null; interval_secs: number; candles: Candle[]; }
@@ -269,17 +294,21 @@ export interface PlayerHitRates {
 export interface TeamMarkets {
   win: HitWindows | null; cover: HitWindows | null; over: HitWindows | null; team_total_over: HitWindows | null;
   ats_closing: HitWindows | null; ou_closing: HitWindows | null;
+  /** first segment: leading after it (ties push), its spread, total and the team's own total */
+  win_1h?: HitWindows | null; cover_1h?: HitWindows | null; over_1h?: HitWindows | null; team_total_over_1h?: HitWindows | null;
 }
 type Split = { l5: number | null; l10: number | null; season: number | null };
-export interface TeamAverages { points_for: Split; points_against: Split; margin: Split; total: Split; }
+export interface TeamAverages { points_for: Split; points_against: Split; margin: Split; total: Split; points_for_1h?: Split; points_against_1h?: Split; }
 export interface TeamHitRates {
   sport: string; team: string; opponent: string | null;
-  lines: { spread: number | null; total: number | null; team_total: number | null };
+  lines: { spread: number | null; total: number | null; team_total: number | null; spread_1h?: number | null; total_1h?: number | null; team_total_1h?: number | null };
+  segment?: string;
   markets: TeamMarkets; averages: TeamAverages;
   log: {
     season: number; date: string | null; opponent: string; home: boolean; points_for: number; points_against: number;
     margin: number; total: number; closing_spread: number | null; closing_total: number | null;
     covered_line: boolean | null; over_line: boolean | null;
+    points_for_1h?: number | null; points_against_1h?: number | null;
   }[];
   note: string;
 }
@@ -295,7 +324,17 @@ export interface GameRow {
   home: string; away: string; starts_at: string | null; spread_home: number | null; total: number | null;
   market: MarketGame | null; home_team: GameSide; away_team: GameSide;
 }
-export interface GamesCheatsheet { sport: string; source: "market" | "schedule"; count: number; games: GameRow[]; note: string; }
+export interface GamesCheatsheet { sport: string; source: "market" | "schedule"; segment?: string; count: number; games: GameRow[]; note: string; }
+
+/** Odds Screen row for any game market, from recorded multi-book lines (projection-service /market/{sport}/screen). */
+export interface MarketScreenRow {
+  game: string; game_id: string; home: string; away: string; commence_time: string | null;
+  market: string; market_label: string; side: string; line: number | null; outcome: string; main_line: boolean;
+  best_price: number; best_book: string; books: Record<string, number>; book_count: number;
+  fair_probability: number; fair_odds: number; best_implied_probability: number; edge: number;
+  model_engine?: string; model_probability?: number; model_push?: number; model_edge?: number; model_ev?: number; projection?: number | null;
+}
+export interface MarketScreen { sport: string; market: string; market_label: string; segment: string; as_of: string | null; count: number; rows: MarketScreenRow[]; note: string }
 
 // --- MLB game simulator ---
 export interface MlbSlateGame {

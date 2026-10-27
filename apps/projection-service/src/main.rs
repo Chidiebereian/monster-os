@@ -59,6 +59,8 @@ mod nhl_game;
 mod nhl_sim;
 mod nhl_teams;
 mod proj_sync;
+mod segments;
+mod screen;
 mod teams;
 
 const NFLVERSE_PLAYER_STATS: &str =
@@ -659,6 +661,7 @@ async fn main() -> std::io::Result<()> {
             .route("/backtest/{sport}", web::get().to(team_model::backtest))
             .route("/backtest/player/{sport}/{stat}", web::get().to(player_backtest::backtest_q))
             .route("/market/{sport}/games", web::get().to(market::games))
+            .route("/market/{sport}/screen", web::get().to(screen::screen))
             .route("/hitrates/{sport}/player/{player_id}", web::get().to(hitrates::player))
             .route("/hitrates/{sport}/team/{team}", web::get().to(hitrates::team))
             .route("/cheatsheet/{sport}/props", web::get().to(hitrates::cheatsheet_props))
@@ -718,6 +721,7 @@ async fn main() -> std::io::Result<()> {
             .route("/learning/{sport}/cycle", web::post().to(learning::cycle))
             .route("/learning/{sport}/candidates", web::post().to(learning::register))
             .route("/learning/{sport}/evaluate", web::post().to(learning::evaluate_candidate))
+            .route("/learning/{sport}/scorecard", web::get().to(learning::scorecard_http))
             .route("/learning/{sport}/promote", web::post().to(learning::promote))
             .route("/learning/{sport}/rollback", web::post().to(learning::rollback))
             .route("/sim/sessions", web::get().to(sim_sessions::list))
@@ -740,6 +744,8 @@ async fn main() -> std::io::Result<()> {
             .route("/projections/nba/{stat}/{player_id}", web::get().to(nba::get_player_stat))
             .route("/fit/nba/teams", web::post().to(nba_teams::fit_teams))
             .route("/sync/projections", web::post().to(proj_sync::sync_http))
+            .route("/ingest/segments", web::post().to(segments::ingest_http))
+            .route("/matchup/{sport}/h1", web::get().to(team_engine::h1_matchup))
             .route("/teams/nba", web::get().to(nba_teams::list_ratings))
             .route("/games/nba", web::get().to(nba_teams::list_games))
             .route("/matchup/nba", web::get().to(nba_teams::matchup))

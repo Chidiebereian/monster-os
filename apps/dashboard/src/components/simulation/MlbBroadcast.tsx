@@ -8,6 +8,8 @@ import { Card, Msg } from "../ui";
 import { useSimulationPlayback } from "../../hooks/useSimulationPlayback";
 import { Controls, shortName } from "./Broadcast";
 import { StartersCompare, type LineupMode } from "./StartersCompare";
+import { SegmentPanel } from "./SegmentPanel";
+import type { SegmentBlock } from "../../lib/api";
 
 // MLB Game Broadcast: one seeded game, plate appearance by plate appearance,
 // from projection-service (mlb_sim). Outcomes, bases, outs, score, line score
@@ -254,6 +256,7 @@ function MlbPrediction({ d }: { d?: MlbSim }) {
           {o85 && <div className="text-[11px] text-gray-400">P(over 8.5) {formatPct(o85.over)}</div>}</div>
         <div><div className="text-[11px] text-gray-500">{d.game.home} win</div><div className="font-mono text-xl">{formatPct(d.team.home_win)}</div></div>
       </div>
+      <SegmentPanel teams={[d.game.away, d.game.home]} h1={(d as { h1?: SegmentBlock }).h1} score={{ away: d.away.runs, home: d.home.runs }} />
       <div className="grid grid-cols-2 gap-4">
         <div><div className="text-[11px] font-semibold tracking-widest text-gray-400">HOME RUN</div>
           {hr.map((b) => <div key={b.player_id} className="flex justify-between"><span className="truncate">{b.name} <span className="text-gray-500 text-[11px]">{b.team}</span></span><span className="font-mono">{formatPct(p(b, "hr", 0.5))}</span></div>)}</div>

@@ -512,7 +512,7 @@ fn d_limit() -> i64 { 50 }
 pub async fn ledger(state: web::Data<State>, q: web::Query<ListQuery>) -> impl Responder {
     let rows = match state.db.query(
         "SELECT l.id, l.sport, l.game_id, l.game_date::text, l.game_start::text, l.frozen_at::text, l.model_version, l.lineup_mode, l.n_sims, l.payload_sha256, \
-                l.payload->>'away', l.payload->>'home', \
+                COALESCE(l.payload->'game'->>'away', l.payload->>'away'), COALESCE(l.payload->'game'->>'home', l.payload->>'home'), \
                 count(f.*), count(f.scored_at), count(f.y), avg((f.p_model - f.y)^2), avg((f.p_base - f.y)^2) \
          FROM prediction_ledger l LEFT JOIN prediction_forecasts f ON f.ledger_id = l.id \
          WHERE ($1::text IS NULL OR l.sport = $1 OR l.sport = $1 || '_team') GROUP BY l.id ORDER BY l.game_date DESC, l.id DESC LIMIT $2",
@@ -684,6 +684,42 @@ pub async fn evaluate_candidate(state: web::Data<State>, path: web::Path<String>
     if let Err(e) = db.execute("UPDATE model_registry SET evidence=$3 WHERE sport=$1 AND version=$2", &[&sport, &q.version, &Json(&report)]).await { return internal(dberr(&e)); }
     audit(db, &sport, "evaluate", Some(&q.version), json!({ "champion": champ, "season": season, "games": report["games"], "pass": pass, "improves": report["gate"]["improves"], "degrades": report["gate"]["degrades"] })).await;
     HttpResponse::Ok().json(report)
+}
+
+#[derive(Deserialize)]
+pub struct ScorecardQuery {
+    season: Option<i32>,
+    #[serde(default = "d_sc_games")] games: usize,
+    #[serde(default = "d_sc_n")] n: usize,
+    #[serde(default = "d_sc_draws")] draws: usize,
+}
+fn d_sc_games() -> usize { 120 }
+fn d_sc_n() -> usize { 2000 }
+fn d_sc_draws() -> usize { 20 }
+
+/// GET /learning/{sport}/scorecard?season=&games= — read-only walk-forward
+/// check of the champion: every forecast market (game lines, team totals, the
+/// first segment, props) scored against its baseline on past games, inputs
+/// strictly before each game. Writes nothing.
+pub async fn scorecard_http(state: web::Data<State>, path: web::Path<String>, q: web::Query<ScorecardQuery>) -> impl Responder {
+    let sport = path.into_inner();
+    if let Err(r) = check_sport(&sport) { return r; }
+    let (champ, cfg) = match champion(&state.db, &sport).await { Ok(c) => c, Err(e) => return internal(e) };
+    let season = q.season.unwrap_or(match base(&sport) { "nhl" => 20252026, "nba" => 2026, _ => 2025 });
+    let picked = match eval_games(&state, &sport, season, q.games.clamp(10, 1500)).await { Ok(p) => p, Err(e) => return internal(e) };
+    let t0 = std::time::Instant::now();
+    let mut sc = Scorecard::default();
+    let mut used = 0;
+    for gid in &picked {
+        let seed = fnv(&["scorecard", &sport, gid]);
+        match evaluate_lineup(&state, &sport, gid, &cfg, q.n.clamp(500, 20_000), q.draws.clamp(5, 200), seed, "projected").await {
+            Ok(Some(e)) => { used += 1; sc.add_all(&e.forecasts, &e.outcomes); }
+            Ok(None) => {}
+            Err(e) => eprintln!("scorecard {gid}: {e}"),
+        }
+    }
+    HttpResponse::Ok().json(json!({ "sport": sport, "champion": champ, "season": season, "games": used, "secs": t0.elapsed().as_secs(),
+        "markets": sc.report(), "note": "brier_diff = model - baseline (negative = the model is better); se is the paired standard error" }))
 }
 
 /// Champion and candidate simulate the same games with the same seeds; the

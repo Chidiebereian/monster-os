@@ -7,6 +7,8 @@ import { Card, Msg } from "../ui";
 import { useSimulationPlayback } from "../../hooks/useSimulationPlayback";
 import { Controls, shortName } from "./Broadcast";
 import { StartersCompare, type LineupMode } from "./StartersCompare";
+import { SegmentPanel } from "./SegmentPanel";
+import type { SegmentBlock } from "../../lib/api";
 
 // NBA Game Broadcast: one seeded game, possession by possession, from
 // projection-service (nba_sim). Scores, clock, who is on the floor, box scores
@@ -303,6 +305,7 @@ export function NbaBroadcast() {
                   {ens.data.market.over_under != null && <div className="text-[11px] text-gray-400">P(over {ens.data.market.over_under}) {formatPct(ens.data.market.p_over ?? 0)}</div>}</div>
                 <div><div className="text-[11px] text-gray-500">{teams[1]} win</div><div className="font-mono text-xl">{formatPct(ens.data.win.home)}</div></div>
               </div>
+              <SegmentPanel teams={teams} h1={(ens.data as { h1?: SegmentBlock }).h1} score={(ens.data as { score?: { away: { mean: number; q10: number; q90: number }; home: { mean: number; q10: number; q90: number } } }).score} />
               <div className="grid grid-cols-2 gap-4">
                 {(["away", "home"] as const).map((side, t) => (
                   <div key={side}>

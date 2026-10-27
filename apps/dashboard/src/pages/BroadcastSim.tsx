@@ -13,6 +13,8 @@ import { NhlBroadcast } from "../components/simulation/NhlBroadcast";
 import { StartersCompare, type LineupMode } from "../components/simulation/StartersCompare";
 import { formatPct } from "../lib/odds";
 import { Card, Msg } from "../components/ui";
+import { SegmentPanel } from "../components/simulation/SegmentPanel";
+import type { SegmentBlock } from "../lib/api";
 
 // Game Broadcast: one seeded simulated game played back like a TV broadcast.
 // projection-service generates the whole authoritative event log (every play,
@@ -125,6 +127,7 @@ function Prediction({ q, teams }: { q: { data?: NflEnsemble; isLoading: boolean;
           {d.market.spread_line != null && <div className="text-gray-400">P({teams[1]} covers {d.market.spread_line > 0 ? `-${d.market.spread_line}` : `+${-d.market.spread_line}`}) {formatPct(d.market.p_home_cover ?? 0)}</div>}
         </div>
       </div>
+      <SegmentPanel teams={teams} h1={(d as { h1?: SegmentBlock }).h1} score={d.score} />
       <div className="grid [&>*]:min-w-0 grid-cols-2 gap-4">
         {(["away", "home"] as const).map((side, i) => {
           const t = top(side);

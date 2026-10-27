@@ -1346,6 +1346,13 @@ async fn simulate_core(state: &State, pk: &str, q: SimQuery) -> Result<Ran, Http
             "total": dist_json(&out.total_runs, "total"), "totals": totals,
         },
         "away": sides["away"], "home": sides["home"],
+        // the shape the other simulators serve, so AI Picks and the pages price MLB the same way
+        "win": { "home": r4(home_win), "away": r4(1.0 - home_win) },
+        "score": { "away": dist_json(&out.team_runs[0], "runs"), "home": dist_json(&out.team_runs[1], "runs") },
+        "total": dist_json(&out.total_runs, "total"),
+        "margin_home": { "pmf_offset": -mlb_sim::MARGIN_OFFSET,
+            "pmf": out.margin_counts.iter().map(|c| r4(*c as f64 / n_valid.max(1) as f64)).collect::<Vec<_>>() },
+        "h1": out.h1.json("mlb"),
         "flags": flags,
         "limitations": LIMITATIONS,
     });
@@ -1635,7 +1642,7 @@ pub async fn new_session(state: &State, pk: &str, seed: u64, ov: Overrides) -> R
         v["text"] = json!(text);
         v
     }).collect();
-    let fin = json!({ "score": res.runs, "innings": res.innings });
+    let fin = json!({ "score": res.runs, "innings": res.innings, "h1": res.f5 });
     let meta = json!({
         "sport": "mlb", "game_id": pk, "date": p.date, "season": p.season, "postseason": p.gtype == "POST",
         "away": p.away, "home": p.home, "venue": p.g["venue"]["name"], "status": p.g["status"]["detailedState"],
@@ -2155,6 +2162,9 @@ async fn forecasts(db: &tokio_postgres::Client, out: &mlb_sim::SimOutput, lineup
         Forecast::game("home_win", "prior-season home win rate", "home_margin", 0.0, out.home_win(), lhw),
         Forecast::game("total_over_8_5", "prior-season over 8.5 rate", "total", 8.5, out.total_runs.line(8.5).over, lover),
     ];
+    // team totals and the first five innings (segments.rs)
+    let full_over = |home: bool, l: f64| { let p = out.team_runs[home as usize].line(l); p.over / (p.over + p.under).max(1e-9) };
+    fs.extend(crate::segments::forecasts("mlb", None, None, &out.h1, &full_over));
     let mut ids: Vec<String> = lineups.iter().flatten().cloned().collect();
     ids.extend(starters.iter().cloned());
     let names = names_of(db, &ids).await;
@@ -2196,6 +2206,7 @@ pub async fn outcomes(db: &tokio_postgres::Client, pk: &str) -> Result<Option<Ou
         if fval(&s.0, "pa") >= 1.0 { for k in ["h", "tb", "hr", "hrr", "k"] { m.insert(k, fval(&s.0, k)); } }
         if fval(&s.0, "p_gs") >= 1.0 { for k in ["p_k", "p_outs"] { m.insert(k, fval(&s.0, k)); } }
     }
+    crate::segments::augment(db, "mlb", pk, &mut o).await;
     Ok(Some(o))
 }
 

@@ -4,6 +4,8 @@ import clsx from "clsx";
 import { api, type MlbBacktest, type MlbBinaryReport, type MlbDist, type MlbSide, type MlbSim, type MlbSlateGame } from "../lib/api";
 import { formatPct } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
+import { SegmentPanel } from "../components/simulation/SegmentPanel";
+import type { SegmentBlock } from "../lib/api";
 
 // MLB Game Sim: pick a game, run the plate-appearance simulator (100k games by
 // default) and read every player's prop distribution off the SAME simulated
@@ -134,6 +136,7 @@ function SimResult({ sim }: { sim: MlbSim }) {
           <Stat label={`${sim.game.home} runs`} value={sim.home.runs.mean.toFixed(2)} />
           <Stat label={`${sim.game.home} -1.5`} value={formatPct(t.home_runline_minus_1_5)} />
         </div>
+        <SegmentPanel teams={[sim.game.away, sim.game.home]} h1={(sim as { h1?: SegmentBlock }).h1} score={{ away: sim.away.runs, home: sim.home.runs }} />
         <div className="flex flex-wrap gap-2 text-xs">
           {t.totals.filter((l) => l.line % 1 !== 0).map((l) => (
             <span key={l.line} className="px-2 py-1 rounded border border-glass font-mono">

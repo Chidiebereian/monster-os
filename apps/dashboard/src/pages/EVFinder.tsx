@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { useSettings } from "../store/settings";
 import { formatAmerican, formatPct, formatUsd, kellyFraction } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
+import { LIVE, MarketPicker, useBoard, type BoardRow } from "./Odds";
 
 // Module 6: +EV Finder. Surfaces the odds-board rows where the best available
 // number beats the no-vig fair (positive edge), with quarter-Kelly sizing; plus
@@ -20,33 +21,42 @@ export function EVFinder() {
 
 function PositiveEv() {
   const { sportKey, bankroll } = useSettings();
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["odds-screen", sportKey],
-    queryFn: () => api.oddsScreen(sportKey),
-    refetchInterval: 10_000,
-  });
+  const [market, setMarket] = useState(LIVE);
+  // "fair": the best price beats the books' no-vig consensus; "model": the engine's probability beats the price
+  const [basis, setBasis] = useState<"fair" | "model">("fair");
+  const { rows: data, isLoading, error } = useBoard(sportKey, market);
+  const pOf = (r: BoardRow) => (basis === "model" ? r.model_probability ?? null : r.fair_probability);
+  const evOf = (r: BoardRow) => (basis === "model" ? r.model_ev ?? null : r.edge);
   const rows = (data ?? [])
-    .filter((r) => r.edge != null && r.edge > 0 && r.fair_probability != null)
-    .sort((a, b) => (b.edge ?? 0) - (a.edge ?? 0));
+    .filter((r) => { const e = evOf(r); return e != null && e > 0 && pOf(r) != null; })
+    .sort((a, b) => (evOf(b) ?? 0) - (evOf(a) ?? 0));
+  const modelAvailable = (data ?? []).some((r) => r.model_probability != null);
 
   return (
     <div className="space-y-2">
-      <h2 className="font-medium">Positive-EV board</h2>
+      <div className="flex items-center gap-3 flex-wrap">
+        <h2 className="font-medium">Positive-EV board</h2>
+        <Pills options={[{ key: "fair", label: "vs no-vig fair" }, { key: "model", label: "vs model" }]} value={basis} onChange={(v) => setBasis(v as "fair" | "model")} />
+      </div>
+      <MarketPicker sportKey={sportKey} value={market} onChange={setMarket} />
+      {basis === "model" && market === LIVE && <Msg>The live moneyline feed has no model prices; pick a recorded market to rank by the model.</Msg>}
       {isLoading && <Msg>Scanning the board…</Msg>}
       {error && <Msg tone="error">{(error as Error).message}</Msg>}
-      {data && rows.length === 0 && <Msg>No +EV numbers on the board right now (all best prices ≤ fair).</Msg>}
+      {data && rows.length === 0 && !(basis === "model" && !modelAvailable) && <Msg>No +EV numbers on the board right now ({basis === "model" ? "the model sees no price above its fair line" : "all best prices ≤ fair"}).</Msg>}
+      {data && basis === "model" && !modelAvailable && market !== LIVE && <Msg>No game on this board has been priced by the champion engine yet.</Msg>}
       {rows.length > 0 && (
-        <Table head={<tr><Th>Game</Th><Th>Outcome</Th><Th className="text-right">Best</Th><Th>Book</Th><Th className="text-right">Fair</Th><Th className="text-right">Edge</Th><Th className="text-right">¼-Kelly</Th></tr>}>
+        <Table head={<tr><Th>Game</Th><Th>Outcome</Th><Th className="text-right">Best</Th><Th>Book</Th><Th className="text-right">{basis === "model" ? "Model" : "Fair"}</Th><Th className="text-right">{basis === "model" ? "EV" : "Edge"}</Th><Th className="text-right">¼-Kelly</Th></tr>}>
           {rows.map((r, i) => {
-            const k = kellyFraction(r.fair_probability as number, r.best_price);
+            const p = pOf(r) as number;
+            const k = kellyFraction(p, r.best_price);
             return (
               <tr key={i} className="border-t border-glass hover:bg-white/[0.03]">
                 <Td className="text-gray-300 whitespace-nowrap">{r.game}</Td>
                 <Td className="font-medium">{r.outcome}</Td>
                 <Td className="text-right font-mono text-emerald-light">{formatAmerican(r.best_price)}</Td>
                 <Td className="text-gray-400">{r.best_book}</Td>
-                <Td className="text-right font-mono text-gray-400">{formatAmerican(r.fair_odds)}</Td>
-                <Td className="text-right font-mono text-emerald-light">+{formatPct(r.edge)}</Td>
+                <Td className="text-right font-mono text-gray-400">{basis === "model" ? formatPct(p) : formatAmerican(r.fair_odds)}</Td>
+                <Td className="text-right font-mono text-emerald-light">+{formatPct(evOf(r) as number)}</Td>
                 <Td className="text-right font-mono">{formatUsd(k * bankroll)} <span className="text-gray-600 text-xs">({formatPct(k)})</span></Td>
               </tr>
             );

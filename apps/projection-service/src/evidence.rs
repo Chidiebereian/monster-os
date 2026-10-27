@@ -32,7 +32,7 @@ fn dberr(e: &tokio_postgres::Error) -> String {
 }
 
 /// Engines whose forecasts price picks.
-pub const PICK_ENGINES: [&str; 6] = ["nba", "nhl", "nfl", "nba_team", "nhl_team", "nfl_team"];
+pub const PICK_ENGINES: [&str; 7] = ["nba", "nhl", "nfl", "mlb", "nba_team", "nhl_team", "nfl_team"];
 const SIMS: usize = 2_000;
 const DRAWS: usize = 20;
 const MIN_GAMES: usize = 100;
@@ -66,6 +66,18 @@ pub(crate) fn pick_market(engine: &str, market: &str) -> Option<(&'static str, &
         ("nhl", "assists_1plus") => ("assists", "baseline"),
         ("nhl", "blocks_over_avg") => ("blocks", "baseline"),
         ("nhl", "home_puckline") | ("nhl", "away_puckline") => ("spread", "baseline"),
+        ("mlb", "home_win") => ("moneyline", "baseline"),
+        ("mlb", "total_over_8_5") => ("total", "baseline"),
+        // team totals and the first segment (segments::forecasts): their lines are
+        // derived from the full-game market or are league-standard, never a real
+        // quoted line, so they count as baseline evidence (grade cap B+)
+        (_, "h1_home_win") => ("moneyline_1h", "baseline"),
+        (_, "h1_home_cover") => ("spread_1h", "baseline"),
+        (_, "h1_total_over" | "h1_total_over_1_5" | "h1_total_over_4_5") => ("total_1h", "baseline"),
+        (_, "h1_home_total_over" | "h1_home_total_over_0_5" | "h1_home_total_over_2_5") => ("team_total_home_1h", "baseline"),
+        (_, "h1_away_total_over" | "h1_away_total_over_0_5" | "h1_away_total_over_2_5") => ("team_total_away_1h", "baseline"),
+        (_, "home_total_over" | "home_total_over_2_5" | "home_total_over_4_5") => ("team_total_home", "baseline"),
+        (_, "away_total_over" | "away_total_over_2_5" | "away_total_over_4_5") => ("team_total_away", "baseline"),
         _ => return None,
     })
 }

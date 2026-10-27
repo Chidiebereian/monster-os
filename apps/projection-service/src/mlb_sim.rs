@@ -405,6 +405,8 @@ pub struct GameResult {
     pub starter: [PitLine; 2],
     pub bullpen: [PitLine; 2],
     pub innings: u8,
+    /// [away, home] runs after five full innings
+    pub f5: [u16; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -701,6 +703,7 @@ fn sim_game_rec(g: &GameInput, t: &Tables, rng: &mut Rng, events: Option<&mut Ve
                 r.push(&res, "inning_end", inning, bat as u8, 0, false, 0, "", 3, [None; 3], 0, 0, vec![], 0, 3, [None; 3], on_mound);
             }
         }
+        if inning == 5 { res.f5 = res.runs; }
         if inning >= g.innings && res.runs[0] != res.runs[1] {
             res.innings = inning;
             if let Some(r) = rec.as_mut() {
@@ -801,6 +804,8 @@ pub struct SimOutput {
     /// home margin histogram offset by MARGIN_OFFSET
     pub margin_counts: Vec<u32>,
     pub extra_innings: u32,
+    /// first-five-innings (home, away) joint runs
+    pub h1: crate::segments::Joint,
 }
 pub const MARGIN_OFFSET: i32 = 40;
 
@@ -834,6 +839,7 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> SimOutput {
         total_runs: Hist::new(),
         margin_counts: vec![0; (2 * MARGIN_OFFSET + 1) as usize],
         extra_innings: 0,
+        h1: crate::segments::Joint::for_sport("mlb"),
     };
     for d in 0..draws {
         let mut rng = Rng::new(derive_seed(seed, &["draw", &d.to_string()]));
@@ -860,6 +866,7 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> SimOutput {
                 out.team_runs[side].add(r.runs[side]);
             }
             out.total_runs.add(r.runs[0] + r.runs[1]);
+            out.h1.add(r.f5[1] as i32, r.f5[0] as i32);
             let m = (r.runs[1] as i32 - r.runs[0] as i32).clamp(-MARGIN_OFFSET, MARGIN_OFFSET);
             out.margin_counts[(m + MARGIN_OFFSET) as usize] += 1;
         }

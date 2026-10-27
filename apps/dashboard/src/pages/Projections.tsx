@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
-import { api, type PlayerProjection, type SimHistogram } from "../lib/api";
+import { api, type MarketGame, type MarketLines, type PlayerProjection, type SimHistogram } from "../lib/api";
 import { americanToDecimal, americanToImpliedProb, decimalOf, formatAmerican, formatPct, fractionalOf, impliedOrNull, impliedPctText, noVig, parseOdds, stepAmerican } from "../lib/odds";
 import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
 
@@ -416,17 +416,49 @@ const GAME_DEFAULTS: Record<string, { spread: string; total: string; home: strin
   nba: { spread: "-5.5", total: "225.5", home: "BOS", away: "LAL", unit: "points" },
 };
 
+// First-half lines as a share of the full-game market (regressions over 2019-2026
+// games with closing lines: NBA margin 0.595 / total 0.505, NFL 0.57 / 0.51).
+const H1_SCALE: Record<string, { margin: number; total: number }> = { nba: { margin: 0.595, total: 0.505 }, nfl: { margin: 0.57, total: 0.51 } };
+const SEGMENT: Record<string, { label: string; tag: string }> = { nhl: { label: "1st period", tag: "1P" }, mlb: { label: "first 5 innings", tag: "F5" } };
+const seg = (sport: string) => SEGMENT[sport] ?? { label: "1st half", tag: "1H" };
+const halfLine = (x: number) => Math.round(x * 2) / 2;
+const hook = (x: number) => Math.floor(x) + 0.5;
+const signed = (x: number) => (x > 0 ? `+${x}` : `${x}`);
+
+/** Lines the page derives when the user (or the market) has not set them. */
+function derivedLines(sport: string, spread: number, total: number) {
+  const homePts = (total - spread) / 2; // home spread is bettor convention: negative = home favoured
+  const sc = H1_SCALE[sport];
+  const h1Spread = sport === "nhl" ? -0.5 : halfLine((sc?.margin ?? 0.55) * spread);
+  const h1Total = sport === "nhl" ? 1.5 : halfLine((sc?.total ?? 0.5) * total);
+  const h1Home = sport === "nhl" ? 0.5 : hook((h1Total - h1Spread) / 2);
+  const h1Away = sport === "nhl" ? 0.5 : hook((h1Total + h1Spread) / 2);
+  return {
+    homeTotal: hook(homePts), awayTotal: hook(total - homePts),
+    h1Spread, h1Total, h1Home, h1Away,
+  };
+}
+
+type LineKey = "homeTotal" | "awayTotal" | "h1Spread" | "h1Total" | "h1Home" | "h1Away";
+
 function GameProjections({ sport }: { sport: string }) {
   const nhl = sport === "nhl";
   const def = GAME_DEFAULTS[sport] ?? GAME_DEFAULTS.nfl;
   const scoreUnit = def.unit;
   const lineLabel = nhl ? "Home puckline" : "Home spread";
+  const S = seg(sport);
   const ratings = useQuery({ queryKey: ["team-ratings", sport], queryFn: () => api.teamRatings(sport) });
   const teams = (ratings.data?.teams ?? []).map((t) => t.team).sort();
   const [home, setHome] = useState<string>("");
   const [away, setAway] = useState<string>("");
   const [spread, setSpread] = useState(def.spread);
   const [total, setTotal] = useState(def.total);
+  // team totals and first-segment lines: blank = derived from the spread and total
+  const [lineSet, setLineSet] = useState<Partial<Record<LineKey, string>>>({});
+  // American odds per selection, full game ("ml_home") and first segment ("h1_ml_home")
+  const [odds, setOdds] = useState<Record<string, string>>({});
+  const oddsOf = (k: string) => odds[k] ?? "-110";
+  const setOdd = (k: string) => (v: string) => setOdds((o) => ({ ...o, [k]: v }));
 
   useEffect(() => {
     if (teams.length && !home) {
@@ -435,43 +467,86 @@ function GameProjections({ sport }: { sport: string }) {
     }
   }, [teams, home, def]);
 
+  const derived = derivedLines(sport, Number(spread) || 0, Number(total) || 0);
+  const lineOf = (k: LineKey) => { const v = lineSet[k]; return v != null && v.trim() !== "" && Number.isFinite(Number(v)) ? Number(v) : derived[k]; };
+  const setLine = (k: LineKey) => (v: string) => setLineSet((l) => ({ ...l, [k]: v }));
+
   const m = useQuery({
-    queryKey: ["matchup", sport, home, away, spread, total],
+    queryKey: ["matchup", sport, home, away, spread, total, lineOf("homeTotal"), lineOf("awayTotal")],
     queryFn: () =>
       api.matchup(sport, home, away, {
         [nhl ? "puckline" : "spread"]: Number(spread) || undefined,
         total: Number(total) || undefined,
+        home_total: lineOf("homeTotal"), away_total: lineOf("awayTotal"),
         n: 100000,
       }),
     enabled: Boolean(home && away && home !== away),
     placeholderData: keepPreviousData,
   });
+  const h1 = useQuery({
+    queryKey: ["matchup-h1", sport, home, away, lineOf("h1Spread"), lineOf("h1Total"), lineOf("h1Home"), lineOf("h1Away")],
+    queryFn: () => api.matchupH1(sport, home, away, { spread: lineOf("h1Spread"), total: lineOf("h1Total"), home_total: lineOf("h1Home"), away_total: lineOf("h1Away"), n: 100000 }),
+    enabled: Boolean(home && away && home !== away),
+    placeholderData: keepPreviousData,
+  });
   const d = m.data;
+  const h = h1.data;
   const homeScore = d ? d.proj_home_points ?? d.proj_home_goals ?? 0 : 0;
   const awayScore = d ? d.proj_away_points ?? d.proj_away_goals ?? 0 : 0;
 
-  // upcoming games (with market lines for NFL) to prefill the matchup
+  // upcoming games to prefill the matchup: the schedule, with recorded market
+  // lines attached where the books have them (lines go stale after 6 h, the
+  // schedule doesn't, so the picker never empties out)
   const [gameId, setGameId] = useState("");
-  const [spreadOdds, setSpreadOdds] = useState("-110");
-  const [totalOdds, setTotalOdds] = useState("-110");
   const market = useQuery({ queryKey: ["market-games", sport], queryFn: () => api.marketGames(sport) });
-  const upcoming = market.data?.games ?? [];
+  const schedule = useQuery({
+    queryKey: ["games", sport, "scheduled"],
+    queryFn: () => api.games(sport, { status: "scheduled", limit: 400 }),
+  });
+  const lines = new Map((market.data?.games ?? []).map((g) => [`${g.away}@${g.home}`, g]));
+  const seen = new Set<string>();
+  const upcoming: { away: string; home: string; date: string | null; week: string | null; line: MarketGame | null }[] = [];
+  for (const g of [...(schedule.data?.games ?? [])].filter((g) => g.home && g.away).sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))) {
+    const k = `${g.away}@${g.home}`;
+    if (seen.has(k)) continue; // a team pair can recur later in the season; keep the soonest
+    seen.add(k);
+    upcoming.push({ away: g.away!, home: g.home!, date: g.date, week: g.week, line: lines.get(k) ?? null });
+  }
+  for (const [k, g] of lines) {
+    if (!seen.has(k)) upcoming.unshift({ away: g.away, home: g.home, date: g.starts_at?.slice(0, 10) ?? null, week: null, line: g });
+  }
+  const withLines = upcoming.filter((g) => g.line).length;
   function pickGame(idx: string) {
     setGameId(idx);
-    const g = upcoming[Number(idx)];
-    if (!g) return;
-    setHome(g.home);
-    setAway(g.away);
-    if (g.spread != null) setSpread(String(g.spread)); // SGO home spread (negative = home favored) maps straight to our matchup spread
+    const u = upcoming[Number(idx)];
+    if (!u) return;
+    setHome(u.home);
+    setAway(u.away);
+    const g = u.line;
+    if (!g) return; // schedule only: keep the lines the user has typed
+    if (g.spread != null) setSpread(String(g.spread)); // home spread (negative = home favored) maps straight to our matchup spread
     if (g.total != null) setTotal(String(g.total));
-    if (g.spread_home_odds != null) setSpreadOdds(String(g.spread_home_odds));
-    if (g.over_odds != null) setTotalOdds(String(g.over_odds));
+    const nl: Partial<Record<LineKey, string>> = {};
+    const no: Record<string, string> = {};
+    const put = (k: string, v: number | null | undefined) => { if (v != null) no[k] = String(v); };
+    const fill = (src: MarketLines | undefined, pre: string, keys: [LineKey | null, LineKey | null, LineKey | null, LineKey | null]) => {
+      if (!src) return;
+      const [spK, totK, htK, atK] = keys;
+      put(`${pre}ml_home`, src.ml_home_odds); put(`${pre}ml_away`, src.ml_away_odds);
+      put(`${pre}sp_home`, src.spread_home_odds); put(`${pre}sp_away`, src.spread_away_odds);
+      put(`${pre}tot_over`, src.over_odds); put(`${pre}tot_under`, src.under_odds);
+      put(`${pre}ht_over`, src.home_over_odds); put(`${pre}ht_under`, src.home_under_odds);
+      put(`${pre}at_over`, src.away_over_odds); put(`${pre}at_under`, src.away_under_odds);
+      if (spK && src.spread != null) nl[spK] = String(src.spread);
+      if (totK && src.total != null) nl[totK] = String(src.total);
+      if (htK && src.home_total != null) nl[htK] = String(src.home_total);
+      if (atK && src.away_total != null) nl[atK] = String(src.away_total);
+    };
+    fill(g, "", [null, null, "homeTotal", "awayTotal"]);
+    fill(g.h1, "h1_", ["h1Spread", "h1Total", "h1Home", "h1Away"]);
+    setLineSet(nl);
+    setOdds(no);
   }
-  // EV per $1 stake from a model probability and American odds.
-  const ev = (p: number, odds: string) => {
-    const dec = americanToDecimal(Number(odds) || 0);
-    return dec > 1 ? p * (dec - 1) - (1 - p) : 0;
-  };
 
   const teamSelect = (value: string, onChange: (v: string) => void, label: string) => (
     <label className="text-xs text-gray-500">
@@ -479,6 +554,60 @@ function GameProjections({ sport }: { sport: string }) {
       <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full mt-1 bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50">
         {teams.map((t) => <option key={t} value={t}>{t}</option>)}
       </select>
+    </label>
+  );
+
+  // market rows: (label, line, P(win), P(loss), odds key); pushes are the rest
+  type Row = { key: string; group: string; label: string; win: number; loss: number };
+  const sp = Number(spread) || 0;
+  const tot = Number(total) || 0;
+  const full: Row[] = [];
+  if (d) {
+    const tie = d.tie_prob ?? 0;
+    full.push({ key: "ml_home", group: "Moneyline", label: `${d.home} ML`, win: d.home_win_prob, loss: d.away_win_prob });
+    full.push({ key: "ml_away", group: "Moneyline", label: `${d.away} ML`, win: d.away_win_prob, loss: d.home_win_prob });
+    if (tie > 0.0005) full.forEach((r) => (r.label += " (tie pushes)"));
+    if (d.cover_prob != null) {
+      full.push({ key: "sp_home", group: nhl ? "Puck line" : "Spread", label: `${d.home} ${signed(sp)}`, win: d.cover_prob, loss: 1 - d.cover_prob });
+      full.push({ key: "sp_away", group: nhl ? "Puck line" : "Spread", label: `${d.away} ${signed(-sp)}`, win: 1 - d.cover_prob, loss: d.cover_prob });
+    }
+    if (d.over_prob != null) {
+      full.push({ key: "tot_over", group: "Total", label: `Over ${tot}`, win: d.over_prob, loss: 1 - d.over_prob });
+      full.push({ key: "tot_under", group: "Total", label: `Under ${tot}`, win: 1 - d.over_prob, loss: d.over_prob });
+    }
+    const tt = (side: "home" | "away", pre: "ht" | "at") => {
+      const a = d.team_totals?.[side]?.at_line;
+      if (!a) return;
+      const team = side === "home" ? d.home : d.away;
+      full.push({ key: `${pre}_over`, group: `${team} team total`, label: `${team} Over ${a.line}`, win: a.over, loss: a.under });
+      full.push({ key: `${pre}_under`, group: `${team} team total`, label: `${team} Under ${a.line}`, win: a.under, loss: a.over });
+    };
+    tt("home", "ht"); tt("away", "at");
+  }
+  const first: Row[] = [];
+  if (h) {
+    first.push({ key: "h1_ml_home", group: `${S.tag} Moneyline`, label: `${home} ${S.tag} ML`, win: h.win.home, loss: h.win.away });
+    first.push({ key: "h1_ml_away", group: `${S.tag} Moneyline`, label: `${away} ${S.tag} ML`, win: h.win.away, loss: h.win.home });
+    const a = h.at;
+    if (a.spread) {
+      first.push({ key: "h1_sp_home", group: `${S.tag} ${nhl ? "Puck line" : "Spread"}`, label: `${home} ${S.tag} ${signed(lineOf("h1Spread"))}`, win: a.spread.over, loss: a.spread.under });
+      first.push({ key: "h1_sp_away", group: `${S.tag} ${nhl ? "Puck line" : "Spread"}`, label: `${away} ${S.tag} ${signed(-lineOf("h1Spread"))}`, win: a.spread.under, loss: a.spread.over });
+    }
+    if (a.total) {
+      first.push({ key: "h1_tot_over", group: `${S.tag} Total`, label: `${S.tag} Over ${a.total.line}`, win: a.total.over, loss: a.total.under });
+      first.push({ key: "h1_tot_under", group: `${S.tag} Total`, label: `${S.tag} Under ${a.total.line}`, win: a.total.under, loss: a.total.over });
+    }
+    for (const [side, pre, team] of [["home_total", "h1_ht", home], ["away_total", "h1_at", away]] as const) {
+      const x = a[side];
+      if (!x) continue;
+      first.push({ key: `${pre}_over`, group: `${team} ${S.tag} team total`, label: `${team} ${S.tag} Over ${x.line}`, win: x.over, loss: x.under });
+      first.push({ key: `${pre}_under`, group: `${team} ${S.tag} team total`, label: `${team} ${S.tag} Under ${x.line}`, win: x.under, loss: x.over });
+    }
+  }
+
+  const lineInput = (k: LineKey, label: string) => (
+    <label className="text-xs text-gray-500">{label}
+      <Input type="number" value={lineSet[k] ?? ""} onChange={setLine(k)} placeholder={String(derived[k])} className="w-full mt-1" />
     </label>
   );
 
@@ -491,10 +620,14 @@ function GameProjections({ sport }: { sport: string }) {
             onChange={(e) => pickGame(e.target.value)}
             className="w-full bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
           >
-            <option value="">Pick a live market game (autofills lines + odds)…</option>
+            <option value="">
+              Pick an upcoming game{withLines ? ` · ${withLines} with live lines (autofill every market + odds)` : " · no live lines right now, enter them yourself"}…
+            </option>
             {upcoming.map((g, i) => (
               <option key={i} value={i}>
-                {g.away} @ {g.home}{g.spread != null ? ` · ${g.home} ${g.spread}` : ""}{g.total != null ? ` · O/U ${g.total}` : ""}
+                {g.away} @ {g.home}{sport === "nfl" && g.week ? ` · wk ${g.week}` : ""}{g.date ? ` · ${g.date}` : ""}
+                {g.line?.spread != null ? ` · ${g.home} ${g.line.spread > 0 ? "+" : ""}${g.line.spread}` : ""}{g.line?.total != null ? ` · O/U ${g.line.total}` : ""}
+                {g.line?.h1 ? ` · ${S.tag} lines` : ""}
               </option>
             ))}
           </select>
@@ -519,6 +652,11 @@ function GameProjections({ sport }: { sport: string }) {
                 {d.home} <span className="font-mono text-gray-300">{homeScore.toFixed(1)}</span>
                 <span className="text-xs text-gray-500 ml-2">{scoreUnit}</span>
               </div>
+              {h && (
+                <div className="text-sm text-gray-400">
+                  {S.label}: <span className="font-mono text-gray-200">{h.away.mean.toFixed(1)}–{h.home.mean.toFixed(1)}</span>
+                </div>
+              )}
               <div className="ml-auto text-xs text-gray-500">100k sim · log-linear Poisson</div>
             </div>
 
@@ -546,37 +684,17 @@ function GameProjections({ sport }: { sport: string }) {
         )}
       </Card>
 
-      {d && d.cover_prob != null && d.over_prob != null && (
+      {d && (
         <Card className="space-y-3">
           <div className="flex items-center gap-3 flex-wrap">
-            <h3 className="font-medium text-sm">Edge &amp; EV vs market</h3>
-            <span className="text-xs text-gray-500">model probability vs the price you pay</span>
-            <span className="ml-auto" />
-            <OddsInput inline label="Spread odds" value={spreadOdds} onChange={setSpreadOdds} />
-            <OddsInput inline label="Total odds" value={totalOdds} onChange={setTotalOdds} />
+            <h3 className="font-medium text-sm">Full game · edge &amp; EV vs market</h3>
+            <span className="text-xs text-gray-500">model probability vs the price you pay · pushes refund</span>
           </div>
-          <Table head={<tr><Th>Bet</Th><Th className="text-right">Model</Th><Th className="text-right">Implied</Th><Th className="text-right">Edge</Th><Th className="text-right">EV / $1</Th></tr>}>
-            {[
-              { label: `${d.home} ${Number(spread) <= 0 ? spread : "+" + spread} (cover)`, p: d.cover_prob, odds: spreadOdds },
-              { label: `${d.away} ${-Number(spread) <= 0 ? -Number(spread) : "+" + -Number(spread)} (cover)`, p: 1 - d.cover_prob, odds: spreadOdds },
-              { label: `Over ${total}`, p: d.over_prob, odds: totalOdds },
-              { label: `Under ${total}`, p: 1 - d.over_prob, odds: totalOdds },
-            ].map((r, i) => {
-              const implied = americanToImpliedProb(Number(r.odds) || 0);
-              const edge = r.p - implied;
-              const e = ev(r.p, r.odds);
-              return (
-                <tr key={i} className="border-t border-glass">
-                  <Td>{r.label}</Td>
-                  <Td className="text-right font-mono">{formatPct(r.p)}</Td>
-                  <Td className="text-right font-mono text-gray-400">{formatPct(implied)}</Td>
-                  <Td className={clsx("text-right font-mono", edge > 0 ? "text-emerald-light" : "text-gray-500")}>{edge >= 0 ? "+" : ""}{formatPct(edge)}</Td>
-                  <Td className={clsx("text-right font-mono", e > 0 ? "text-emerald-light" : "text-crimson-light")}>{e >= 0 ? "+" : ""}{(e * 100).toFixed(1)}%</Td>
-                </tr>
-              );
-            })}
-          </Table>
-          <div className="text-[11px] text-gray-500">+EV (green) = model probability beats the break-even implied by the price. The NFL backtest shows a total-points model rarely beats the closing line, so treat edges skeptically.</div>
+          <div className="grid grid-cols-2 gap-4 max-w-md">
+            {lineInput("homeTotal", `${home} team total`)}
+            {lineInput("awayTotal", `${away} team total`)}
+          </div>
+          <MarketTable rows={full} oddsOf={oddsOf} setOdd={setOdd} />
         </Card>
       )}
 
@@ -594,7 +712,65 @@ function GameProjections({ sport }: { sport: string }) {
           </Card>
         </div>
       )}
+      <Card className="space-y-3">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h3 className="font-medium text-sm">{S.label[0].toUpperCase() + S.label.slice(1)} · edge &amp; EV vs market</h3>
+          <span className="text-xs text-gray-500">
+            team model refit on {S.label} scores{h ? ` of ${h.games.toLocaleString()} games` : ""} · a tied {S.label} refunds the moneyline
+          </span>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {lineInput("h1Spread", `${S.tag} ${home} ${nhl ? "puck line" : "spread"}`)}
+          {lineInput("h1Total", `${S.tag} total`)}
+          {lineInput("h1Home", `${S.tag} ${home} team total`)}
+          {lineInput("h1Away", `${S.tag} ${away} team total`)}
+        </div>
+        <div className="text-[11px] text-gray-500">Blank lines are derived from the full-game spread and total{nhl ? " (NHL: −0.5 / 1.5 / 0.5)" : ` (${S.tag} spread ≈ ${H1_SCALE[sport]?.margin ?? 0.55}× and total ≈ ${H1_SCALE[sport]?.total ?? 0.5}× the game's)`}; picking a game with {S.tag} lines fills the real ones.</div>
+        {h1.error && <Msg tone="error">{(h1.error as Error).message}</Msg>}
+        {h && (
+          <>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <Stat label={`${home} leads after ${S.tag}`} value={formatPct(h.win.home)} tone="pos" />
+              <Stat label={`Tied after ${S.tag}`} value={formatPct(h.win.tie)} />
+              <Stat label={`${S.tag} proj total`} value={h.total.mean.toFixed(1)} />
+              <Stat label={`${S.tag} margin (${home})`} value={`${h.margin_home.mean >= 0 ? "+" : ""}${h.margin_home.mean.toFixed(1)}`} />
+            </div>
+            <MarketTable rows={first} oddsOf={oddsOf} setOdd={setOdd} />
+          </>
+        )}
+      </Card>
     </div>
+  );
+}
+
+/** One row per selection: model win probability (pushes excluded), the price,
+ *  its implied probability, the edge and EV per $1 (pushes refund the stake). */
+function MarketTable({ rows, oddsOf, setOdd }: { rows: { key: string; group: string; label: string; win: number; loss: number }[]; oddsOf: (k: string) => string; setOdd: (k: string) => (v: string) => void }) {
+  if (rows.length === 0) return null;
+  return (
+    <Table head={<tr><Th>Bet</Th><Th className="text-right">Model</Th><Th className="text-right">Push</Th><Th>Odds</Th><Th className="text-right">Implied</Th><Th className="text-right">Edge</Th><Th className="text-right">EV / $1</Th></tr>}>
+      {rows.map((r, i) => {
+        const p = r.win / Math.max(1e-9, r.win + r.loss);
+        const push = Math.max(0, 1 - r.win - r.loss);
+        const o = oddsOf(r.key);
+        const implied = americanToImpliedProb(Number(o) || 0);
+        const dec = americanToDecimal(Number(o) || 0);
+        const edge = p - implied;
+        const e = dec > 1 ? r.win * (dec - 1) - r.loss : 0;
+        const newGroup = i === 0 || rows[i - 1].group !== r.group;
+        return (
+          <tr key={r.key} className={clsx("border-t", newGroup ? "border-glass" : "border-transparent")}>
+            <Td>{r.label}</Td>
+            <Td className="text-right font-mono">{formatPct(p)}</Td>
+            <Td className="text-right font-mono text-gray-500">{push >= 0.0005 ? formatPct(push) : "—"}</Td>
+            <Td><OddsInput inline compact label="" value={o} onChange={setOdd(r.key)} /></Td>
+            <Td className="text-right font-mono text-gray-400">{formatPct(implied)}</Td>
+            <Td className={clsx("text-right font-mono", edge > 0 ? "text-emerald-light" : "text-gray-500")}>{edge >= 0 ? "+" : ""}{formatPct(edge)}</Td>
+            <Td className={clsx("text-right font-mono", e > 0 ? "text-emerald-light" : "text-crimson-light")}>{e >= 0 ? "+" : ""}{(e * 100).toFixed(1)}%</Td>
+          </tr>
+        );
+      })}
+    </Table>
   );
 }
 
@@ -646,7 +822,7 @@ function Implied({ odds }: { odds: number | string | null | undefined }) {
  *  arrows / arrow keys step through real American prices (-101 -> +100, never -99).
  *  Shows the implied probability, decimal and fractional odds as you type. The
  *  value handed back is always American. */
-function OddsInput({ label, value, onChange, inline = false }: { label: string; value: string; onChange: (v: string) => void; inline?: boolean }) {
+function OddsInput({ label, value, onChange, inline = false, compact = false }: { label: string; value: string; onChange: (v: string) => void; inline?: boolean; compact?: boolean }) {
   const [text, setText] = useState(value);
   // follow outside changes (market price filled in), not our own normalisation
   useEffect(() => { if (parseOdds(text) !== parseOdds(value)) setText(value); }, [value]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -673,7 +849,7 @@ function OddsInput({ label, value, onChange, inline = false }: { label: string; 
       </span>
     </span>
   );
-  if (inline) return <label className="text-xs text-gray-500 flex items-center gap-1">{label}{box}{hint}</label>;
+  if (inline) return <label className="text-xs text-gray-500 flex items-center gap-1">{label}{box}{!compact && hint}</label>;
   return (
     <label className="text-xs text-gray-500">
       <span className="flex justify-between gap-2"><span>{label}</span>{hint}</span>

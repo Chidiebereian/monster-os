@@ -514,6 +514,8 @@ pub struct GameResult {
     pub overtime: bool,
     /// who was active in this simulated game
     pub active: Vec<bool>,
+    /// [away, home] score at halftime
+    pub seg: [i32; 2],
 }
 
 enum Next {
@@ -537,6 +539,7 @@ struct G<'a> {
     opening_receiver: u8,
     over: bool,
     tod: bool,
+    half: [i32; 2],
     events: Option<&'a mut Vec<Event>>,
 }
 
@@ -786,6 +789,7 @@ impl<'a> G<'a> {
         }
         let b = self.before();
         let x = self.ball_x(self.pos, self.yl.clamp(0, 100));
+        if q == 2 { self.half = self.score; }
         let label = match q { 1 => "End of 1st quarter", 2 => "Halftime", 3 => "End of 3rd quarter", 4 => "End of regulation — overtime", _ => "End of overtime period" };
         self.qtr += 1;
         self.clock = period_len(self.qtr);
@@ -1190,7 +1194,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     let mut s = G {
         g, rng, qtr: 1, clock: 900, score: [0, 0], pos: opening, yl: 70, down: 1, togo: 10,
         stats: vec![[0; NSTAT]; g.players.len()], plays: [0, 0], ot_poss: [0, 0], opening_receiver: opening,
-        over: false, tod: false, events,
+        over: false, tod: false, half: [0, 0], events,
     };
     let mut next = Next::Kickoff(1 - opening);
     let mut guard = 0;
@@ -1223,7 +1227,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     s.clock = 0;
     s.emit("game_end", b, 0, [None; 4], None, (x, x), (false, false, false), 0, None, move || txt);
     GameResult { score: s.score, stats: s.stats, plays: s.plays, overtime: s.qtr >= 5,
-        active: g.players.iter().map(|p| p.p_active > 0.5).collect() }
+        active: g.players.iter().map(|p| p.p_active > 0.5).collect(), seg: s.half }
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1297,8 @@ pub struct Ensemble {
     pub anytime_td: Vec<u64>,
     /// games in which each player was active (player stats are conditional on this)
     pub active_n: Vec<u64>,
+    /// 1st-half (home, away) joint score
+    pub h1: crate::segments::Joint,
 }
 
 impl Ensemble {
@@ -1302,6 +1308,7 @@ impl Ensemble {
             n: 0, score: [Hist::new(0), Hist::new(0)], total: Hist::new(0), margin: Hist::new(-80),
             home_win: 0, away_win: 0, ties: 0, overtime: 0, plays: [Hist::new(0), Hist::new(0)],
             player: (0..np).map(|_| ph()).collect(), anytime_td: vec![0; np], active_n: vec![0; np],
+            h1: crate::segments::Joint::for_sport("nfl"),
         }
     }
     fn add(&mut self, r: &GameResult) {
@@ -1316,6 +1323,7 @@ impl Ensemble {
             _ => self.ties += 1,
         }
         self.overtime += r.overtime as u64;
+        self.h1.add(r.seg[1], r.seg[0]);
         self.plays[0].add(r.plays[0]);
         self.plays[1].add(r.plays[1]);
         for (i, s) in r.stats.iter().enumerate() {
@@ -1332,6 +1340,7 @@ impl Ensemble {
         self.total.merge(&o.total);
         self.margin.merge(&o.margin);
         self.home_win += o.home_win; self.away_win += o.away_win; self.ties += o.ties; self.overtime += o.overtime;
+        self.h1.merge(&o.h1);
         for (a, b) in self.player.iter_mut().zip(&o.player) { for (x, y) in a.iter_mut().zip(b) { x.merge(y); } }
         for (a, b) in self.anytime_td.iter_mut().zip(&o.anytime_td) { *a += b; }
         for (a, b) in self.active_n.iter_mut().zip(&o.active_n) { *a += b; }

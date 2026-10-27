@@ -108,13 +108,13 @@ pub(crate) async fn scan(state: &State, sport: &str) -> Result<Value, String> {
     let mut quotes: HashMap<(Key, String), Vec<Quote>> = HashMap::new();
     for ((key, book, side), (line, price, link, obs)) in &sides {
         let Some((oline, oprice, _, oobs)) = sides.get(&(key.clone(), book.clone(), other(side).to_string())) else { continue };
-        let same = match key.1.as_str() { "moneyline" => true, "spread" => matches!((line, oline), (Some(a), Some(b)) if (a + b).abs() < 1e-9), _ => line == oline };
+        let same = match crate::segments::base_market(&key.1) { "moneyline" => true, "spread" => matches!((line, oline), (Some(a), Some(b)) if (a + b).abs() < 1e-9), _ => line == oline };
         // both sides from the same fetch
         if !same || (*obs - *oobs).num_minutes().abs() > 5 { continue; }
         quotes.entry((key.clone(), side.clone())).or_default().push(Quote { book: book.clone(), line: *line, a: *price, b: *oprice, link: link.clone(), observed: *obs });
     }
     let games: Vec<String> = info.keys().map(|k| k.0.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
-    let teams: HashMap<String, (String, String)> = db.query("SELECT DISTINCT ON (game_id) game_id, payload->>'home', payload->>'away' FROM prediction_ledger \
+    let teams: HashMap<String, (String, String)> = db.query("SELECT DISTINCT ON (game_id) game_id, COALESCE(payload->'game'->>'home', payload->>'home'), COALESCE(payload->'game'->>'away', payload->>'away') FROM prediction_ledger \
         WHERE game_id = ANY($1) AND sport = ANY($2) ORDER BY game_id, id DESC", &[&games, &vec![sport.to_string(), format!("{sport}_team")]]).await.map_err(|e| dberr(&e))?
         .iter().map(|r| (r.get(0), (r.get::<_, Option<String>>(1).unwrap_or_default(), r.get::<_, Option<String>>(2).unwrap_or_default()))).collect();
 
@@ -194,7 +194,7 @@ pub(crate) async fn settle(state: &State, sport: &str) -> Result<Value, String> 
         for r in rows {
             let (id, market, subject, side, line, price, book, start): (i64, String, String, String, Option<f64>, i32, String, Option<DateTime<Utc>>) =
                 (r.get(0), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6), r.get(7), r.get(8));
-            let actual = if subject == "game" { go.game.get(if market == "total" { "total" } else { "home_margin" }).copied() } else {
+            let actual = if subject == "game" { go.game.get(crate::segments::outcome_key(&market)).copied() } else {
                 match &props { Some(p) => p.get(&subject).and_then(|m| m.get(market.as_str()).copied()), None => continue }
             };
             let res = actual.map(|a| result_of(&market, &side, line, a)).unwrap_or("void");
@@ -231,10 +231,12 @@ pub async fn list(state: web::Data<State>, q: web::Query<EdgesQ>) -> impl Respon
         let (market, side, line, home, away): (String, String, Option<f64>, Option<String>, Option<String>) = (r.get(8), r.get(11), r.get(12), r.get(4), r.get(5));
         let book: String = r.get(13);
         let (src, n): (String, i32) = (r.get(16), r.get(17));
-        json!({ "id": r.get::<_, i64>(0), "sport": r.get::<_, String>(1), "game_id": r.get::<_, String>(2), "game_label": r.get::<_, String>(3), "home": home, "away": away,
-            "starts_at": r.get::<_, Option<DateTime<Utc>>>(6), "kind": r.get::<_, String>(7), "market": market, "market_label": stat_label(&market),
+        let sp: String = r.get(1);
+        let mlabel = if crate::segments::is_game_market(&market) { crate::segments::market_label(&sp, &market) } else { stat_label(&market).to_string() };
+        json!({ "id": r.get::<_, i64>(0), "sport": sp, "game_id": r.get::<_, String>(2), "game_label": r.get::<_, String>(3), "home": home, "away": away,
+            "starts_at": r.get::<_, Option<DateTime<Utc>>>(6), "kind": r.get::<_, String>(7), "market": market, "market_label": mlabel,
             "subject": r.get::<_, String>(9), "subject_name": r.get::<_, String>(10), "side": side,
-            "label": pick_label(&market, &side, line, home.as_deref().unwrap_or(""), away.as_deref().unwrap_or("")), "line": line,
+            "label": pick_label(&sp, &market, &side, line, home.as_deref().unwrap_or(""), away.as_deref().unwrap_or("")), "line": line,
             "book": book, "book_title": book_title(&book), "price": r.get::<_, i32>(14), "link": r.get::<_, Option<String>>(15),
             "fair_source": src, "fair_books": n, "fair_text": source_text(&src, n as usize),
             "p_fair": r3(r.get(18)), "p_book": r3(r.get(19)), "ev": r3(r.get(20)), "stake": r4(r.get(21)),

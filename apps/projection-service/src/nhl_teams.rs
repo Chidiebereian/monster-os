@@ -379,6 +379,9 @@ pub struct MatchupQuery {
     seed: Option<u64>,
     puckline: Option<f64>, // home puckline, e.g. -1.5 (home must win by 2+)
     total: Option<f64>,
+    /// team-total lines (home / away points)
+    home_total: Option<f64>,
+    away_total: Option<f64>,
 }
 
 pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> impl Responder {
@@ -406,6 +409,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
     let seed = q.seed.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1));
     let (puckline, total) = (q.puckline, q.total);
 
+    let (home_total, away_total) = (q.home_total, q.away_total);
     let out = web::block(move || {
         let mut rng = Rng(seed);
         let (mut hw, mut aw, mut cover, mut over) = (0u64, 0u64, 0u64, 0u64);
@@ -428,6 +432,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
             if let Some(t) = total { if tot > t { over += 1; } }
             margins.push(margin); totals.push(tot);
         }
+        let team_totals = crate::segments::team_totals_json(&margins, &totals, home_total, away_total);
         margins.sort_by(|a, b| a.total_cmp(b));
         totals.sort_by(|a, b| a.total_cmp(b));
         let qf = |v: &[f64], p: f64| v[((p * (v.len() - 1) as f64) as usize).min(v.len() - 1)];
@@ -438,7 +443,7 @@ pub async fn matchup(state: web::Data<State>, q: web::Query<MatchupQuery>) -> im
             "proj_total": ((sh+sa)/nf*100.0).round()/100.0, "median_total": qf(&totals,0.5), "total_p10": qf(&totals,0.1), "total_p90": qf(&totals,0.9),
             "median_margin": qf(&margins,0.5), "margin_p10": qf(&margins,0.1), "margin_p90": qf(&margins,0.9),
             "cover_prob": puckline.map(|_| cover as f64/nf), "over_prob": total.map(|_| over as f64/nf),
-            "margin_hist": hist(&margins, 24), "total_hist": hist(&totals, 24),
+            "margin_hist": hist(&margins, 24), "total_hist": hist(&totals, 24), "team_totals": team_totals,
         })
     }).await;
     match out {

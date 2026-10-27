@@ -108,6 +108,15 @@ pub fn spawn(state: web::Data<State>) {
                 if let Err(e) = &v { println!("autopilot projections sync {sport}: {e}"); }
                 mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
             }
+            // 1st-half / 1st-period / first-5 scores of finished games (segments.rs):
+            // settles the 1st-half markets; backfills on the first run
+            for sport in crate::segments::SPORTS {
+                let job = format!("segments:{sport}");
+                if paused(&s2.db).await || !due(&s2.db, &job, 180).await { continue; }
+                let v = crate::segments::refresh_due(&s2, sport).await;
+                if let Err(e) = &v { println!("autopilot segments {sport}: {e}"); }
+                mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             // AI Picks evidence first: an engine whose code changed re-earns its grade caps
             if !paused(&s2.db).await {
                 if let Some(engine) = crate::evidence::due(&s2).await {

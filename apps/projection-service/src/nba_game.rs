@@ -658,6 +658,7 @@ fn payload(gref: &GameRef, game: &GameInput, e: &sim::Ensemble, meta: Value, see
         "margin_home": { "mean": r3(e.margin_mean()), "pmf_offset": -sim::MARGIN_OFFSET,
             "pmf": e.margin.iter().map(|c| r4(*c as f64 / nn)).collect::<Vec<_>>() },
         "possessions": { "away": r3(e.possessions[0] / nn), "home": r3(e.possessions[1] / nn) },
+        "h1": e.h1.json("nba"),
         "market": { "spread": spread_home, "over_under": gref.over_under,
             "p_home_cover": spread_home.map(|s| r4(e.margin_line(-s).0)), "p_over": gref.over_under.map(|l| r4(e.total.line(l).0)) },
         "players": { "away": players[0], "home": players[1] },
@@ -691,7 +692,7 @@ pub async fn new_session(state: &State, id: &str, seed: u64, o: Opts) -> Result<
         v["text"] = json!(text);
         v
     }).collect();
-    let fin = json!({ "score": res.score, "overtime": res.overtime });
+    let fin = json!({ "score": res.score, "overtime": res.overtime, "h1": res.seg });
     let roster: Vec<Value> = (0..2).map(|t| json!(game.teams[t].players.iter().enumerate().map(|(i, p)| json!({
         "idx": i, "id": p.id, "name": p.name, "pos": p.pos, "starter": p.starter, "p_active": r3(p.p_active), "active_in_this_game": res.active[t][i] })).collect::<Vec<_>>())).collect();
     let meta = json!({
@@ -826,6 +827,9 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
         let (o, u, _, _) = e.total.line(l);
         out.push(Forecast::game("total_over", "0.5 at the line", "total", l, o / (o + u).max(1e-9), 0.5).pushes());
     }
+    // team totals and the 1st half (segments.rs)
+    let full_over = |home: bool, l: f64| { let (o, u, _, _) = e.score[home as usize].line(l); o / (o + u).max(1e-9) };
+    out.extend(crate::segments::forecasts("nba", gref.spread.map(|s| -s), gref.over_under, &e.h1, &full_over));
     let pids: Vec<String> = game.teams.iter().flat_map(|t| t.players.iter().map(|p| p.id.clone())).collect();
     let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m, b.stl, b.blk, b.tov FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
                          WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND NOT b.dnp AND COALESCE(b.min,0) > 0",
@@ -873,6 +877,7 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         m.insert("min", r.get::<_, Option<f64>>(10).unwrap_or(0.0));
     }
     o.game.insert("possessions", pa);
+    crate::segments::augment(db, "nba", id, &mut o).await;
     Ok(Some(o))
 }
 

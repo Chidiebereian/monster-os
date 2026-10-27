@@ -7,6 +7,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type HitSummary, type HitWindows, type TeamHitRates } from "../lib/api";
+import { segmentOf } from "../lib/markets";
 import { formatPct } from "../lib/odds";
 import { Card, Input, Msg, Pills, Stat } from "./ui";
 import { HitRateChart, type HitBar } from "./HitRateChart";
@@ -128,7 +129,7 @@ export function PlayerHitDetail({ sport, playerId, stat, line: initialLine, oppo
 // Team detail (game lines)
 // --------------------------------------------------------------------------
 
-type TeamMarket = "cover" | "over" | "win" | "team_total_over" | "ats_closing";
+type TeamMarket = "cover" | "over" | "win" | "team_total_over" | "ats_closing" | "win_1h" | "cover_1h" | "over_1h" | "team_total_over_1h";
 
 export function TeamHitDetail({ sport, team, spread: s0, total: t0, opponent }: {
   sport: string; team: string; spread?: number | null; total?: number | null; opponent?: string | null;
@@ -136,11 +137,17 @@ export function TeamHitDetail({ sport, team, spread: s0, total: t0, opponent }: 
   const [spread, setSpread] = useState(s0 != null ? String(s0) : "");
   const [total, setTotal] = useState(t0 != null ? String(t0) : "");
   const [teamTotal, setTeamTotal] = useState("");
+  // first segment (1st half; NHL 1st period; MLB first 5 innings)
+  const [spread1, setSpread1] = useState("");
+  const [total1, setTotal1] = useState("");
+  const [teamTotal1, setTeamTotal1] = useState("");
+  const seg = segmentOf(sport);
   const [market, setMarket] = useState<TeamMarket>(s0 != null ? "cover" : "win");
   const num = (s: string) => (s === "" || Number.isNaN(Number(s)) ? undefined : Number(s));
   const { data, error, isLoading } = useQuery({
-    queryKey: ["hit-team", sport, team, spread, total, teamTotal, opponent],
-    queryFn: () => api.teamHitRates(sport, team, { spread: num(spread), total: num(total), team_total: num(teamTotal), opponent: opponent ?? undefined, games: 20 }),
+    queryKey: ["hit-team", sport, team, spread, total, teamTotal, spread1, total1, teamTotal1, opponent],
+    queryFn: () => api.teamHitRates(sport, team, { spread: num(spread), total: num(total), team_total: num(teamTotal),
+      spread_1h: num(spread1), total_1h: num(total1), team_total_1h: num(teamTotal1), opponent: opponent ?? undefined, games: 20 }),
   });
   if (isLoading) return <Msg>Loading team hit rates…</Msg>;
   if (error) return <Msg tone="error">{(error as Error).message}</Msg>;
@@ -151,6 +158,10 @@ export function TeamHitDetail({ sport, team, spread: s0, total: t0, opponent }: 
     ...(data.lines.total != null ? [{ key: "over", label: `Over ${data.lines.total}` }] : []),
     ...(data.lines.team_total != null ? [{ key: "team_total_over", label: `TT o${data.lines.team_total}` }] : []),
     ...(data.markets.ats_closing ? [{ key: "ats_closing", label: "ATS (closing)" }] : []),
+    ...(data.markets.win_1h ? [{ key: "win_1h", label: `${seg.tag} lead` }] : []),
+    ...(data.lines.spread_1h != null ? [{ key: "cover_1h", label: `${seg.tag} cover ${fmtSpread(data.lines.spread_1h)}` }] : []),
+    ...(data.lines.total_1h != null ? [{ key: "over_1h", label: `${seg.tag} over ${data.lines.total_1h}` }] : []),
+    ...(data.lines.team_total_1h != null ? [{ key: "team_total_over_1h", label: `${seg.tag} TT o${data.lines.team_total_1h}` }] : []),
   ];
   const active = options.some((o) => o.key === market) ? market : "win";
   const w = data.markets[active];
@@ -165,16 +176,22 @@ export function TeamHitDetail({ sport, team, spread: s0, total: t0, opponent }: 
           spread <Input type="number" value={spread} onChange={setSpread} className="w-16" />
           total <Input type="number" value={total} onChange={setTotal} className="w-20" />
           team total <Input type="number" value={teamTotal} onChange={setTeamTotal} className="w-16" />
+          <span className="text-gray-600">|</span>
+          {seg.tag} spread <Input type="number" value={spread1} onChange={setSpread1} className="w-16" />
+          {seg.tag} total <Input type="number" value={total1} onChange={setTotal1} className="w-16" />
+          {seg.tag} TT <Input type="number" value={teamTotal1} onChange={setTeamTotal1} className="w-16" />
         </div>
       </div>
       <Pills options={options} value={active} onChange={(v) => setMarket(v as TeamMarket)} />
       {w ? <WindowStrip w={w} side="over" /> : <Msg>No data for this market.</Msg>}
-      <HitRateChart {...teamChart(data, active)} signed={active !== "over" && active !== "team_total_over"} />
+      <HitRateChart {...teamChart(data, active)} signed={!["over", "team_total_over", "over_1h", "team_total_over_1h"].includes(active)} />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Stat label="Pts for L10" value={data.averages.points_for.l10 ?? "—"} />
         <Stat label="Pts against L10" value={data.averages.points_against.l10 ?? "—"} />
         <Stat label="Margin L10" value={data.averages.margin.l10 ?? "—"} />
         <Stat label="Total L10" value={data.averages.total.l10 ?? "—"} />
+        {data.averages.points_for_1h && <Stat label={`${seg.tag} pts for L10`} value={data.averages.points_for_1h.l10 ?? "—"} />}
+        {data.averages.points_against_1h && <Stat label={`${seg.tag} pts against L10`} value={data.averages.points_against_1h.l10 ?? "—"} />}
       </div>
       <div className="text-[11px] text-gray-500">{data.note}</div>
     </Card>
@@ -188,6 +205,24 @@ function teamChart(d: TeamHitRates, market: TeamMarket): { bars: HitBar[]; line:
   const tag = (g: TeamHitRates["log"][number]) => `${g.home ? "" : "@"}${g.opponent}`;
   const title = (g: TeamHitRates["log"][number], extra: string) =>
     `${g.date ?? g.season} ${g.home ? "vs" : "@"} ${g.opponent}: ${g.points_for}-${g.points_against}${extra}`;
+  // first segment: the same charts on the 1st-half / 1st-period / first-5 score
+  const s1 = games.filter((g) => g.points_for_1h != null && g.points_against_1h != null);
+  const pf1 = (g: TeamHitRates["log"][number]) => g.points_for_1h as number;
+  const pa1 = (g: TeamHitRates["log"][number]) => g.points_against_1h as number;
+  const t1 = (g: TeamHitRates["log"][number]) => ` (${pf1(g)}-${pa1(g)} early)`;
+  if (market === "win_1h") return { line: 0, unit: "margin", bars: s1.map((g, i) => ({ key: String(i), value: pf1(g) - pa1(g), result: res(pf1(g) - pa1(g), 0), label: tag(g), title: title(g, t1(g)) })) };
+  if (market === "cover_1h" && d.lines.spread_1h != null) {
+    const need = -d.lines.spread_1h;
+    return { line: need, unit: "margin", bars: s1.map((g, i) => ({ key: String(i), value: pf1(g) - pa1(g), result: res(pf1(g) - pa1(g), need), label: tag(g), title: title(g, t1(g)) })) };
+  }
+  if (market === "over_1h" && d.lines.total_1h != null) {
+    const t = d.lines.total_1h;
+    return { line: t, unit: "total", bars: s1.map((g, i) => ({ key: String(i), value: pf1(g) + pa1(g), result: res(pf1(g) + pa1(g), t), label: tag(g), title: title(g, t1(g)) })) };
+  }
+  if (market === "team_total_over_1h" && d.lines.team_total_1h != null) {
+    const t = d.lines.team_total_1h;
+    return { line: t, unit: "pts", bars: s1.map((g, i) => ({ key: String(i), value: pf1(g), result: res(pf1(g), t), label: tag(g), title: title(g, t1(g)) })) };
+  }
   if (market === "over" && d.lines.total != null) {
     const t = d.lines.total;
     return { line: t, unit: "total", bars: games.map((g, i) => ({ key: String(i), value: g.total, result: res(g.total, t), label: tag(g), title: title(g, ` (total ${g.total})`) })) };
