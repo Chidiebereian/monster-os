@@ -2,7 +2,8 @@ import { Fragment, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { api, type GameRow, type PropRow } from "../lib/api";
-import { formatAmerican, formatPct } from "../lib/odds";
+import { americanToDecimal, formatAmerican, formatPct } from "../lib/odds";
+import { useSettings } from "../store/settings";
 import { Card, Input, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import { PlayerHitDetail, RateCell, Streak, TeamHitDetail, fmtSpread, type Side } from "../components/HitRates";
 import { segmentOf } from "../lib/markets";
@@ -39,6 +40,19 @@ export function Cheatsheets() {
 // Player props
 // --------------------------------------------------------------------------
 
+const KELLY = [{ key: "0.25", label: "¼ Kelly" }, { key: "0.5", label: "½ Kelly" }, { key: "1", label: "Full" }];
+/** No single bet above this share of bankroll, whatever the Kelly fraction. */
+const KELLY_CAP = 0.05;
+
+/** Kelly stake as a fraction of bankroll. Pushes return the stake, so the
+ *  growth-optimal fraction is (b·win − loss) / (b·(win + loss)). */
+export function kellyStake(win: number, push: number, american: number | null | undefined, fraction: number): number {
+  if (american == null) return 0;
+  const b = americanToDecimal(american) - 1, loss = 1 - win - push;
+  if (b <= 0 || win + loss <= 0) return 0;
+  return Math.min(KELLY_CAP, Math.max(0, ((b * win - loss) / (b * (win + loss))) * fraction));
+}
+
 const SORTS = [
   { key: "l5", label: "L5" }, { key: "l10", label: "L10" }, { key: "l20", label: "L20" },
   { key: "season", label: "Season" }, { key: "h2h", label: "H2H" }, { key: "edge", label: "Model edge" },
@@ -52,6 +66,9 @@ function PropsSheet({ sport }: { sport: string }) {
   const [search, setSearch] = useState("");
   const [minRate, setMinRate] = useState("");
   const [open, setOpen] = useState<string | null>(null);
+  const [kelly, setKelly] = useState(() => { try { return localStorage.getItem("cheatsheets.kelly") ?? "0.25"; } catch { return "0.25"; } });
+  const saveKelly = (k: string) => { setKelly(k); try { localStorage.setItem("cheatsheets.kelly", k); } catch { /* private window */ } };
+  const bankroll = useSettings((s) => s.bankroll);
 
   const stats = useQuery({ queryKey: ["stat-list", sport], queryFn: () => api.statList(sport) });
   const effectiveSource = source === "projection" && !stat ? "market" : source;
@@ -83,6 +100,7 @@ function PropsSheet({ sport }: { sport: string }) {
         <Pills options={[{ key: "market", label: "Market lines" }, { key: "projection", label: "Model lines" }]} value={source} onChange={setSource} />
         <Input value={search} onChange={setSearch} placeholder="player / team" className="w-36" />
         min hit % <Input type="number" value={minRate} onChange={setMinRate} className="w-16" />
+        stake <Pills options={KELLY} value={kelly} onChange={saveKelly} />
         {isFetching && <span className="text-violet">updating…</span>}
       </div>
       {source === "projection" && !stat && <div className="text-[11px] text-amber">Model lines need a single prop — pick one above (showing market lines).</div>}
@@ -93,16 +111,16 @@ function PropsSheet({ sport }: { sport: string }) {
         <Table head={
           <tr>
             <Th>Player</Th><Th>Prop</Th><Th>Odds</Th><Th>L5</Th><Th>L10</Th><Th>L20</Th><Th>Season</Th>
-            <Th>H2H</Th><Th>Venue</Th><Th>Streak</Th><Th>Avg L10</Th><Th>Model</Th><Th>Edge</Th>
+            <Th>H2H</Th><Th>Venue</Th><Th>Streak</Th><Th>Avg L10</Th><Th>Model</Th><Th>Edge</Th><Th>Stake</Th>
           </tr>
         }>
           {rows.map((p) => {
             const key = `${p.player_id}-${p.stat}`;
             return (
               <Fragment key={key}>
-                <PropLine p={p} active={open === key} onClick={() => setOpen(open === key ? null : key)} />
+                <PropLine p={p} kelly={Number(kelly)} bankroll={bankroll} active={open === key} onClick={() => setOpen(open === key ? null : key)} />
                 {open === key && (
-                  <tr><td colSpan={13} className="p-3 bg-obsidian/40">
+                  <tr><td colSpan={14} className="p-3 bg-obsidian/40">
                     <PlayerHitDetail sport={sport} playerId={p.player_id} stat={p.stat} line={p.line} opponent={p.opponent} initialSide={p.side} />
                   </td></tr>
                 )}
@@ -114,19 +132,22 @@ function PropsSheet({ sport }: { sport: string }) {
       {data && (
         <div className="text-[11px] text-gray-500">
           {rows.length} of {data.count} lines · hit % excludes pushes · Venue = tonight's home/away split (last 20) · H2H = last 10 vs tonight's opponent ·
-          near-certain lines (priced under 15% / over 85%) are hidden · {data.note}.
+          near-certain lines (priced under 15% / over 85%) are hidden ·
+          Stake = {KELLY.find((k) => k.key === kelly)?.label} on the model probability, capped at {KELLY_CAP * 100}% of your bankroll; 1u = 1% of bankroll
+          (the model's prop edge is not yet proven against closing lines, so full Kelly will overbet) · {data.note}.
         </div>
       )}
     </div>
   );
 }
 
-function PropLine({ p, active, onClick }: { p: PropRow; active: boolean; onClick: () => void }) {
+function PropLine({ p, kelly, bankroll, active, onClick }: { p: PropRow; kelly: number; bankroll: number; active: boolean; onClick: () => void }) {
   const side = p.side as Side;
   const h = p.hit_rates;
   const prob = p.model ? (side === "over" ? p.model.p_over : p.model.p_under) : null;
   const edge = p.model ? (side === "over" ? p.model.edge_over : p.model.edge_under) : null;
   const odds = side === "over" ? p.over_odds : p.under_odds;
+  const stake = prob == null || !p.model ? null : kellyStake(prob, p.model.p_push ?? 0, odds, kelly);
   return (
     <tr onClick={onClick} className={clsx("border-t border-glass cursor-pointer hover:bg-white/[0.03]", active && "bg-violet/10")}>
       <Td>
@@ -149,6 +170,14 @@ function PropLine({ p, active, onClick }: { p: PropRow; active: boolean; onClick
       <Td className="font-mono">{prob == null ? "—" : formatPct(prob, 0)}</Td>
       <Td className={clsx("font-mono", edge != null && edge > 0.03 && "text-emerald-light", edge != null && edge < -0.03 && "text-crimson-light")}>
         {edge == null ? "—" : `${edge > 0 ? "+" : ""}${(edge * 100).toFixed(1)}%`}
+      </Td>
+      <Td className="font-mono whitespace-nowrap">
+        {stake == null ? "—" : stake <= 0 ? <span className="text-gray-600" title="No edge at this price: Kelly says don't bet">no bet</span> : (
+          <span title={`${formatPct(stake, 2)} of a $${bankroll} bankroll`}>
+            <span className={clsx(stake >= KELLY_CAP && "text-amber")}>{(stake * 100).toFixed(stake < 0.01 ? 2 : 1)}u</span>
+            <span className="text-gray-500 text-xs ml-1">${(stake * bankroll).toFixed(2)}</span>
+          </span>
+        )}
       </Td>
     </tr>
   );
