@@ -36,6 +36,16 @@ pub const NBA_STATS: &[StatDef] = &[
     StatDef { key: "pr",         label: "Pts+Reb",     column: "pr",      opportunity: "min_played", family: Family::Count,      unit: "P+R" },
     StatDef { key: "pa",         label: "Pts+Ast",     column: "pa",      opportunity: "min_played", family: Family::Count,      unit: "P+A" },
     StatDef { key: "ra",         label: "Reb+Ast",     column: "ra",      opportunity: "min_played", family: Family::Count,      unit: "R+A" },
+    StatDef { key: "stocks",     label: "Stl+Blk",     column: "stocks",  opportunity: "min_played", family: Family::Count,      unit: "S+B" },
+    StatDef { key: "fgm",        label: "FG Made",     column: "fgm",     opportunity: "min_played", family: Family::Count,      unit: "FGM" },
+    StatDef { key: "fga",        label: "FG Attempts", column: "fga",     opportunity: "min_played", family: Family::Count,      unit: "FGA" },
+    StatDef { key: "fg3a",       label: "3PT Attempts", column: "fg3a",   opportunity: "min_played", family: Family::Count,      unit: "3PA" },
+    StatDef { key: "ftm",        label: "FT Made",     column: "ftm",     opportunity: "min_played", family: Family::Count,      unit: "FTM" },
+    StatDef { key: "fta",        label: "FT Attempts", column: "fta",     opportunity: "min_played", family: Family::Count,      unit: "FTA" },
+    StatDef { key: "oreb",       label: "Off Rebounds", column: "oreb",   opportunity: "min_played", family: Family::Count,      unit: "OREB" },
+    StatDef { key: "dreb",       label: "Def Rebounds", column: "dreb",   opportunity: "min_played", family: Family::Count,      unit: "DREB" },
+    StatDef { key: "double_double", label: "Double-Double", column: "dd", opportunity: "min_played", family: Family::Count,      unit: "DD" },
+    StatDef { key: "triple_double", label: "Triple-Double", column: "td", opportunity: "min_played", family: Family::Count,      unit: "TD" },
 ];
 
 fn stat_def(key: &str) -> Option<&'static StatDef> { NBA_STATS.iter().find(|s| s.key == key) }

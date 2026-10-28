@@ -66,6 +66,32 @@ pub(crate) fn pick_market(engine: &str, market: &str) -> Option<(&'static str, &
         ("nhl", "assists_1plus") => ("assists", "baseline"),
         ("nhl", "blocks_over_avg") => ("blocks", "baseline"),
         ("nhl", "home_puckline") | ("nhl", "away_puckline") => ("spread", "baseline"),
+        // the rest of the NBA and NFL prop menus
+        ("nba", "pr_over_avg") => ("pr", "baseline"),
+        ("nba", "pa_over_avg") => ("pa", "baseline"),
+        ("nba", "ra_over_avg") => ("ra", "baseline"),
+        ("nba", "stocks_over_avg") => ("stocks", "baseline"),
+        ("nba", "fgm_over_avg") => ("fgm", "baseline"),
+        ("nba", "fga_over_avg") => ("fga", "baseline"),
+        ("nba", "fg3a_over_avg") => ("fg3a", "baseline"),
+        ("nba", "ftm_over_avg") => ("ftm", "baseline"),
+        ("nba", "fta_over_avg") => ("fta", "baseline"),
+        ("nba", "oreb_over_avg") => ("oreb", "baseline"),
+        ("nba", "dreb_over_avg") => ("dreb", "baseline"),
+        ("nba", "double_double_yes") => ("double_double", "baseline"),
+        ("nba", "triple_double_yes") => ("triple_double", "baseline"),
+        ("nfl", "pass_att_over_avg") => ("pass_att", "baseline"),
+        ("nfl", "completions_over_avg") => ("completions", "baseline"),
+        ("nfl", "pass_td_over_avg") => ("pass_td", "baseline"),
+        ("nfl", "interceptions_over_0_5") => ("interceptions", "baseline"),
+        ("nfl", "pass_rush_yds_over_avg") => ("pass_rush_yds", "baseline"),
+        ("nfl", "qb_rush_yds_over_avg") => ("rush_yds", "baseline"),
+        ("nfl", "carries_over_avg") => ("carries", "baseline"),
+        ("nfl", "targets_over_avg") => ("targets", "baseline"),
+        ("nfl", "rush_rec_yds_over_avg") => ("rush_rec_yds", "baseline"),
+        ("nfl", "anytime_td" | "tds_over_1_5") => ("tds", "baseline"),
+        ("nfl", "kick_pts_over_avg") => ("kick_pts", "baseline"),
+        ("nfl", "fgm_over_avg") => ("fgm", "baseline"),
         ("mlb", "home_win") => ("moneyline", "baseline"),
         ("mlb", "total_over_8_5") => ("total", "baseline"),
         // team totals and the first segment (segments::forecasts): their lines are
@@ -239,7 +265,10 @@ mod tests {
     fn markets_map_per_sport() {
         assert_eq!(pick_market("nba_team", "home_cover"), Some(("spread", "market")));
         assert_eq!(pick_market("nhl", "home_win"), Some(("moneyline", "baseline")));
-        assert_eq!(pick_market("nfl", "anytime_td"), None);
+        assert_eq!(pick_market("nfl", "anytime_td"), Some(("tds", "baseline")), "anytime TD is touchdowns over 0.5");
+        assert_eq!(pick_market("nfl", "rush_rec_yds_over_avg"), Some(("rush_rec_yds", "baseline")));
+        assert_eq!(pick_market("nba", "double_double_yes"), Some(("double_double", "baseline")));
+        assert_eq!(pick_market("nfl", "qb_rush_td"), None);
         assert_eq!(pick_market("nhl", "away_puckline"), Some(("spread", "baseline")));
         assert_eq!(pick_market("nba", "blk_over_avg"), Some(("blk", "baseline")));
     }

@@ -1283,6 +1283,22 @@ impl Hist {
     }
 }
 
+/// Combination props, stored after the NSTAT box-score stats in each player's
+/// histograms: rush+rec yards, pass+rush yards, touchdowns scored (rush + rec;
+/// "anytime TD" is over 0.5) and kicking points (3 x FG + XP).
+pub const COMBOS: [&str; 4] = ["rush_rec_yds", "pass_rush_yds", "tds", "kick_pts"];
+pub const RUSH_REC_YDS: usize = NSTAT;
+pub const PASS_RUSH_YDS: usize = NSTAT + 1;
+pub const TDS: usize = NSTAT + 2;
+pub const KICK_PTS: usize = NSTAT + 3;
+fn combo_values(s: &[i32; NSTAT]) -> [i32; 4] {
+    [s[RUSH_YDS] + s[REC_YDS], s[PASS_YDS] + s[RUSH_YDS], s[RUSH_TD] + s[REC_TD], 3 * s[FGM] + s[XPM]]
+}
+/// A stat key (box score or combo) -> its histogram index.
+pub fn stat_index(key: &str) -> Option<usize> {
+    STAT_KEYS.iter().position(|k| *k == key).or_else(|| COMBOS.iter().position(|k| *k == key).map(|i| NSTAT + i))
+}
+
 pub struct Ensemble {
     pub n: u64,
     pub score: [Hist; 2],
@@ -1293,7 +1309,7 @@ pub struct Ensemble {
     pub ties: u64,
     pub overtime: u64,
     pub plays: [Hist; 2],
-    pub player: Vec<Vec<Hist>>, // [player][stat]
+    pub player: Vec<Vec<Hist>>, // [player][stat]: NSTAT box-score stats, then COMBOS
     pub anytime_td: Vec<u64>,
     /// games in which each player was active (player stats are conditional on this)
     pub active_n: Vec<u64>,
@@ -1303,7 +1319,7 @@ pub struct Ensemble {
 
 impl Ensemble {
     fn new(np: usize) -> Self {
-        let ph = || (0..NSTAT).map(|k| Hist::new(if matches!(k, PASS_YDS | RUSH_YDS | REC_YDS) { -30 } else { 0 })).collect::<Vec<_>>();
+        let ph = || (0..NSTAT + COMBOS.len()).map(|k| Hist::new(if matches!(k, PASS_YDS | RUSH_YDS | REC_YDS | RUSH_REC_YDS | PASS_RUSH_YDS) { -30 } else { 0 })).collect::<Vec<_>>();
         Ensemble {
             n: 0, score: [Hist::new(0), Hist::new(0)], total: Hist::new(0), margin: Hist::new(-80),
             home_win: 0, away_win: 0, ties: 0, overtime: 0, plays: [Hist::new(0), Hist::new(0)],
@@ -1331,6 +1347,7 @@ impl Ensemble {
             if !r.active.get(i).copied().unwrap_or(true) { continue; }
             self.active_n[i] += 1;
             for k in 0..NSTAT { self.player[i][k].add(s[k]); }
+            for (j, v) in combo_values(s).iter().enumerate() { self.player[i][NSTAT + j].add(*v); }
             if s[RUSH_TD] + s[REC_TD] > 0 { self.anytime_td[i] += 1; }
         }
     }

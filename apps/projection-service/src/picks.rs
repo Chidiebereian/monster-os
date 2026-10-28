@@ -54,6 +54,9 @@ fn r3(x: f64) -> f64 { (x * 1000.0).round() / 1000.0 }
 fn pct(x: f64) -> f64 { r1(x * 100.0) }
 
 pub const SPORTS: [&str; 4] = ["nba", "nhl", "nfl", "mlb"];
+/// NFL prop markets with a game-log column (player history and hit rates).
+pub(crate) const NFL_PROPS: [&str; 15] = ["pass_yds", "rush_yds", "rec_yds", "receptions", "pass_td", "pass_att", "completions", "interceptions",
+    "carries", "targets", "rush_td", "rec_td", "rush_rec_yds", "pass_rush_yds", "tds"];
 pub const GRADES: [&str; 8] = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
 
 // ---------------------------------------------------------------------------
@@ -322,6 +325,12 @@ pub(crate) fn stat_label(market: &str) -> &'static str {
         "blk" => "Blocks", "tov" => "Turnovers", "pra" => "Pts + Rebs + Asts", "sog" => "Shots on Goal", "goals" => "Goals",
         "saves" => "Saves", "blocks" => "Blocked Shots", "pass_yds" => "Passing Yards", "rush_yds" => "Rushing Yards",
         "rec_yds" => "Receiving Yards", "receptions" => "Receptions", "moneyline" => "Moneyline", "spread" => "Spread", "total" => "Total",
+        "pr" => "Pts + Rebs", "pa" => "Pts + Asts", "ra" => "Rebs + Asts", "stocks" => "Steals + Blocks", "fgm" => "Field Goals Made",
+        "fga" => "Field Goal Attempts", "fg3a" => "3-Point Attempts", "ftm" => "Free Throws Made", "fta" => "Free Throw Attempts",
+        "oreb" => "Offensive Rebounds", "dreb" => "Defensive Rebounds", "double_double" => "Double-Double", "triple_double" => "Triple-Double",
+        "pass_td" => "Passing TDs", "pass_att" => "Pass Attempts", "completions" => "Completions", "interceptions" => "Interceptions",
+        "carries" => "Rush Attempts", "targets" => "Targets", "rush_td" => "Rushing TDs", "rec_td" => "Receiving TDs",
+        "rush_rec_yds" => "Rush + Rec Yards", "pass_rush_yds" => "Pass + Rush Yards", "tds" => "Touchdowns", "kick_pts" => "Kicking Points",
         _ => "",
     }
 }
@@ -342,8 +351,22 @@ pub(crate) fn pick_label(sport: &str, market: &str, side: &str, line: Option<f64
         "total" | "total_1h" => format!("{seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
         "team_total_home" | "team_total_home_1h" => format!("{home} {seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
         "team_total_away" | "team_total_away_1h" => format!("{away} {seg}{ou} {}", line.map(fmt_num).unwrap_or_default()),
+        // yes/no props (double-double, triple-double, anytime TD) read as yes / no
+        m if crate::lines::yes_no_market(m) && line == Some(0.5) => {
+            let what = if m == "tds" { "Anytime TD".to_string() } else { stat_label(m).to_string() };
+            format!("{what} {}", if side == "over" { "Yes" } else { "No" })
+        }
+        "tds" if line == Some(1.5) => format!("{} 2+ TDs", if side == "over" { "Yes" } else { "No" }),
         m => format!("{ou} {} {}", line.map(fmt_num).unwrap_or_default(), stat_label(m)),
     }
+}
+
+/// The partner of a one-sided (yes-only) quote: the price whose implied
+/// probability completes it to 1, so the "no-vig" probability is the yes
+/// price's raw implied probability (vig included, i.e. conservative).
+pub(crate) fn complement_price(a: i32) -> i32 {
+    let p = (1.0 - implied(a)).clamp(0.01, 0.99);
+    if p >= 0.5 { (-100.0 * p / (1.0 - p)).round() as i32 } else { (100.0 * (1.0 - p) / p).round() as i32 }
 }
 
 fn engine_label(engine: &str) -> &'static str {
@@ -363,15 +386,20 @@ async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]
     if ids.is_empty() { return Ok(out); }
     match sport {
         "nba" => {
-            let rows = db.query("SELECT player_id, pts, COALESCE(oreb,0)+COALESCE(dreb,0), ast, fg3m, stl, blk, tov, min, CASE WHEN b.team = g.home THEN g.away ELSE g.home END FROM ( \
+            let rows = db.query("SELECT player_id, pts, COALESCE(oreb,0)+COALESCE(dreb,0), ast, fg3m, stl, blk, tov, min, CASE WHEN b.team = g.home THEN g.away ELSE g.home END, \
+                fgm, fga, fg3a, ftm, fta, oreb, dreb FROM ( \
                 SELECT b.*, row_number() OVER (PARTITION BY b.player_id ORDER BY g2.game_date DESC) rn FROM nba_box_espn b JOIN nba_games_espn g2 USING (espn_id) \
                 WHERE b.player_id = ANY($1) AND g2.completed AND g2.season_type IN (2,3) AND NOT b.dnp AND COALESCE(b.min,0) > 0 AND g2.game_date < (now() - interval '5 hours')::date) b \
                 JOIN nba_games_espn g USING (espn_id) WHERE rn <= 82 ORDER BY player_id, g.game_date DESC", &[&ids]).await.map_err(|e| dberr(&e))?;
             for r in &rows {
                 let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
                 let (pts, reb, ast) = (g(1), r.get::<_, i32>(2) as f64, g(3));
+                let tens = [pts, reb, ast, g(5), g(6)].iter().filter(|x| **x >= 10.0).count();
                 let m: HashMap<&'static str, f64> = [("pts", pts), ("reb", reb), ("ast", ast), ("fg3m", g(4)), ("stl", g(5)), ("blk", g(6)), ("tov", g(7)),
-                    ("pra", pts + reb + ast), ("min", r.get::<_, Option<f64>>(8).unwrap_or(0.0))].into();
+                    ("pra", pts + reb + ast), ("min", r.get::<_, Option<f64>>(8).unwrap_or(0.0)),
+                    ("pr", pts + reb), ("pa", pts + ast), ("ra", reb + ast), ("stocks", g(5) + g(6)), ("fgm", g(10)), ("fga", g(11)), ("fg3a", g(12)),
+                    ("ftm", g(13)), ("fta", g(14)), ("oreb", g(15)), ("dreb", g(16)),
+                    ("double_double", (tens >= 2) as i32 as f64), ("triple_double", (tens >= 3) as i32 as f64)].into();
                 out.entry(r.get(0)).or_default().push((m, r.get(9)));
             }
         }
@@ -388,7 +416,7 @@ async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]
             }
         }
         "nfl" => {
-            let cols: Vec<(&'static str, &'static str)> = ["pass_yds", "rush_yds", "rec_yds", "receptions"].iter()
+            let cols: Vec<(&'static str, &'static str)> = NFL_PROPS.iter()
                 .filter_map(|k| crate::player_backtest::stat_def("nfl", k).map(|d| (*k, d.column))).collect();
             let rows = db.query("SELECT player_id, stats, COALESCE(opponent,'') FROM ( \
                 SELECT *, row_number() OVER (PARTITION BY player_id ORDER BY season DESC, game_date DESC NULLS LAST, week DESC) rn FROM player_game_logs \
@@ -680,7 +708,14 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     }
     let mut quotes: HashMap<(Key, String), Vec<Quote>> = HashMap::new(); // (selection, side) -> quotes
     for ((key, book, side), (line, price, link, obs, open, ps, name)) in &sides {
-        let Some((oline, oprice, ..)) = sides.get(&(key.clone(), book.clone(), other(side).to_string())) else { continue };
+        let partner = sides.get(&(key.clone(), book.clone(), other(side).to_string())).map(|x| (x.0, x.1));
+        let (oline, oprice) = match partner {
+            Some(x) => x,
+            // a yes-only double-double / triple-double / anytime-TD price: pair it with its complement
+            None if side == "over" && crate::lines::yes_no_market(&key.1) && *line == Some(0.5) => (*line, complement_price(*price)),
+            None => continue,
+        };
+        let (oline, oprice) = (&oline, &oprice);
         let same = match segments::base_market(&key.1) { "moneyline" => true, "spread" => matches!((line, oline), (Some(a), Some(b)) if (a + b).abs() < 1e-9), _ => line == oline };
         if !same { continue; }
         quotes.entry((key.clone(), side.clone())).or_default().push(Quote { book: book.clone(), a_line: *line, a_price: *price, b_price: *oprice, a_link: link.clone(),
@@ -1040,10 +1075,14 @@ pub(crate) async fn prop_actuals(db: &tokio_postgres::Client, sport: &str, game:
         "nba" => {
             let done = db.query_opt("SELECT 1 FROM nba_games_espn WHERE espn_id=$1 AND completed", &[&game]).await.map_err(|e| dberr(&e))?.is_some();
             if !done { return Ok(None); }
-            for r in db.query("SELECT player_id, pts, COALESCE(oreb,0)+COALESCE(dreb,0), ast, fg3m, stl, blk, tov FROM nba_box_espn WHERE espn_id=$1 AND NOT dnp AND COALESCE(min,0) > 0", &[&game]).await.map_err(|e| dberr(&e))? {
+            for r in db.query("SELECT player_id, pts, COALESCE(oreb,0)+COALESCE(dreb,0), ast, fg3m, stl, blk, tov, fgm, fga, fg3a, ftm, fta, oreb, dreb FROM nba_box_espn WHERE espn_id=$1 AND NOT dnp AND COALESCE(min,0) > 0", &[&game]).await.map_err(|e| dberr(&e))? {
                 let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
                 let reb = r.get::<_, i32>(2) as f64;
-                out.insert(r.get(0), [("pts", g(1)), ("reb", reb), ("ast", g(3)), ("fg3m", g(4)), ("stl", g(5)), ("blk", g(6)), ("tov", g(7)), ("pra", g(1) + reb + g(3))].into());
+                let tens = [g(1), reb, g(3), g(5), g(6)].iter().filter(|x| **x >= 10.0).count();
+                out.insert(r.get(0), [("pts", g(1)), ("reb", reb), ("ast", g(3)), ("fg3m", g(4)), ("stl", g(5)), ("blk", g(6)), ("tov", g(7)), ("pra", g(1) + reb + g(3)),
+                    ("pr", g(1) + reb), ("pa", g(1) + g(3)), ("ra", reb + g(3)), ("stocks", g(5) + g(6)), ("fgm", g(8)), ("fga", g(9)), ("fg3a", g(10)),
+                    ("ftm", g(11)), ("fta", g(12)), ("oreb", g(13)), ("dreb", g(14)),
+                    ("double_double", (tens >= 2) as i32 as f64), ("triple_double", (tens >= 3) as i32 as f64)].into());
             }
         }
         "nhl" => {
@@ -1059,7 +1098,7 @@ pub(crate) async fn prop_actuals(db: &tokio_postgres::Client, sport: &str, game:
             let Some(o) = crate::learning::game_outcomes(db, "nfl", game).await? else { return Ok(None) };
             for (id, m) in o.players {
                 let mut x: HashMap<&'static str, f64> = HashMap::new();
-                for k in ["pass_yds", "rush_yds", "rec_yds", "receptions"] { if let Some(v) = m.get(k) { x.insert(k, *v); } }
+                for k in NFL_PROPS.iter().chain(["fgm", "kick_pts"].iter()) { if let Some(v) = m.get(*k) { x.insert(*k, *v); } }
                 out.insert(id, x);
             }
         }
@@ -1488,6 +1527,17 @@ mod tests {
         assert!((price(&p, false, "total_1h", "game", "over", Some(1.5)).unwrap().win - 0.6).abs() < 1e-12);
         assert!((price(&p, true, "team_total_away_1h", "game", "over", Some(0.5)).unwrap().win - 0.2).abs() < 1e-12);
         assert!(price(&json!({}), false, "total_1h", "game", "over", Some(1.5)).is_none());
+    }
+
+    #[test]
+    fn yes_only_props_price_conservatively_and_label() {
+        let c = complement_price(120);
+        assert!((novig(120, c) - implied(120)).abs() < 0.01, "the pair's no-vig price is the yes price's raw implied");
+        assert_eq!(pick_label("nba", "double_double", "over", Some(0.5), "DET", "BOS"), "Double-Double Yes");
+        assert_eq!(pick_label("nfl", "tds", "over", Some(0.5), "KC", "BUF"), "Anytime TD Yes");
+        assert_eq!(pick_label("nfl", "tds", "over", Some(1.5), "KC", "BUF"), "Yes 2+ TDs");
+        assert_eq!(pick_label("nfl", "rush_rec_yds", "under", Some(88.5), "KC", "BUF"), "Under 88.5 Rush + Rec Yards");
+        assert_eq!(result_of("double_double", "over", Some(0.5), 1.0), "win");
     }
 
     #[test]

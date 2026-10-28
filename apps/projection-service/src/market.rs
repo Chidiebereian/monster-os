@@ -40,6 +40,12 @@ pub(crate) fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
         ("nba", "pr") => Some("points+rebounds"),
         ("nba", "pa") => Some("points+assists"),
         ("nba", "ra") => Some("rebounds+assists"),
+        ("nba", "stocks") => Some("blocks+steals"),
+        ("nba", "fgm") => Some("fieldGoalsMade"),
+        ("nba", "fga") => Some("fieldGoalsAttempted"),
+        ("nba", "fg3a") => Some("threePointersAttempted"),
+        ("nba", "ftm") => Some("freeThrowsMade"),
+        ("nba", "fta") => Some("freeThrowsAttempted"),
         // NFL
         ("nfl", "pass_yds") => Some("passing_yards"),
         ("nfl", "pass_td") => Some("passing_touchdowns"),
@@ -53,6 +59,8 @@ pub(crate) fn sgo_stat(sport: &str, key: &str) -> Option<&'static str> {
         ("nfl", "receptions") => Some("receiving_receptions"),
         ("nfl", "targets") => Some("receiving_targets"),
         ("nfl", "rec_td") => Some("receiving_touchdowns"),
+        ("nfl", "rush_rec_yds") => Some("receiving_yards+rushing_yards"),
+        ("nfl", "pass_rush_yds") => Some("passing_yards+rushing_yards"),
         // NHL (shots = shots on goal; saves/GA are goalie markets)
         ("nhl", "shots") => Some("shots_onGoal"),
         ("nhl", "assists") => Some("assists"),
@@ -312,8 +320,14 @@ pub(crate) fn recorded_market(sport: &str, key: &str) -> Option<&'static str> {
     Some(match (sport, key) {
         ("nba", "points") => "pts", ("nba", "rebounds") => "reb", ("nba", "assists") => "ast", ("nba", "threes") => "fg3m",
         ("nba", "steals") => "stl", ("nba", "blocks") => "blk", ("nba", "turnovers") => "tov", ("nba", "pra") => "pra",
+        ("nba", "pr") => "pr", ("nba", "pa") => "pa", ("nba", "ra") => "ra", ("nba", "stocks") => "stocks", ("nba", "fgm") => "fgm",
+        ("nba", "fga") => "fga", ("nba", "fg3a") => "fg3a", ("nba", "ftm") => "ftm", ("nba", "fta") => "fta", ("nba", "oreb") => "oreb",
+        ("nba", "dreb") => "dreb", ("nba", "double_double") => "double_double", ("nba", "triple_double") => "triple_double",
         ("nhl", "shots") => "sog", ("nhl", "goals") => "goals", ("nhl", "assists") => "assists", ("nhl", "points") => "points", ("nhl", "saves") => "saves",
         ("nfl", "pass_yds") => "pass_yds", ("nfl", "rush_yds") => "rush_yds", ("nfl", "rec_yds") => "rec_yds", ("nfl", "receptions") => "receptions",
+        ("nfl", "pass_td") => "pass_td", ("nfl", "pass_att") => "pass_att", ("nfl", "completions") => "completions", ("nfl", "interceptions") => "interceptions",
+        ("nfl", "carries") => "carries", ("nfl", "targets") => "targets", ("nfl", "rush_td") => "rush_td", ("nfl", "rec_td") => "rec_td",
+        ("nfl", "rush_rec_yds") => "rush_rec_yds", ("nfl", "pass_rush_yds") => "pass_rush_yds", ("nfl", "tds") => "tds",
         _ => return None,
     })
 }

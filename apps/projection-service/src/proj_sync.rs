@@ -193,14 +193,27 @@ async fn nba(state: &State) -> Result<Value, String> {
     let logs = db.execute("INSERT INTO player_game_logs (sport, player_id, season, week, game_date, team, opponent, stats) \
         SELECT 'nba', x.player_id, x.season - 1, x.espn_id, x.game_date, x.team, x.opp, jsonb_build_object( \
           'pts', x.p, 'reb', x.r, 'ast', x.a, 'threes', x.t, 'stl', x.s, 'blk', x.b, 'tov', x.tv, 'minutes', x.mn, 'min_played', x.mn, \
-          'pra', x.p + x.r + x.a, 'pr', x.p + x.r, 'pa', x.p + x.a, 'ra', x.r + x.a) \
+          'pra', x.p + x.r + x.a, 'pr', x.p + x.r, 'pa', x.p + x.a, 'ra', x.r + x.a, 'stocks', x.s + x.b, \
+          'fgm', x.fgm, 'fga', x.fga, 'fg3a', x.fg3a, 'ftm', x.ftm, 'fta', x.fta, 'oreb', x.oreb, 'dreb', x.dreb, \
+          'dd', ((x.p >= 10)::int + (x.r >= 10)::int + (x.a >= 10)::int + (x.s >= 10)::int + (x.b >= 10)::int >= 2)::int, \
+          'td', ((x.p >= 10)::int + (x.r >= 10)::int + (x.a >= 10)::int + (x.s >= 10)::int + (x.b >= 10)::int >= 3)::int) \
         FROM (SELECT b.player_id, g.season, b.espn_id, g.game_date, b.team, CASE WHEN b.team = g.home THEN g.away ELSE g.home END opp, \
                 COALESCE(b.pts,0) p, COALESCE(b.oreb,0) + COALESCE(b.dreb,0) r, COALESCE(b.ast,0) a, COALESCE(b.fg3m,0) t, COALESCE(b.stl,0) s, \
-                COALESCE(b.blk,0) b, COALESCE(b.tov,0) tv, b.min mn \
+                COALESCE(b.blk,0) b, COALESCE(b.tov,0) tv, b.min mn, COALESCE(b.fgm,0) fgm, COALESCE(b.fga,0) fga, COALESCE(b.fg3a,0) fg3a, \
+                COALESCE(b.ftm,0) ftm, COALESCE(b.fta,0) fta, COALESCE(b.oreb,0) oreb, COALESCE(b.dreb,0) dreb \
               FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
               WHERE g.completed AND g.season_type = 2 AND NOT b.dnp AND COALESCE(b.min, 0) >= 1 AND g.game_date >= $1) x \
         ON CONFLICT (sport, player_id, season, week) DO UPDATE SET game_date=EXCLUDED.game_date, team=EXCLUDED.team, opponent=EXCLUDED.opponent, stats=EXCLUDED.stats",
         &[&from]).await.map_err(|e| dberr(&e))?;
+
+    // logs written before the full prop menu: add its columns from the box scores
+    db.execute("UPDATE player_game_logs l SET stats = l.stats || jsonb_build_object( \
+          'stocks', COALESCE(b.stl,0) + COALESCE(b.blk,0), 'fgm', COALESCE(b.fgm,0), 'fga', COALESCE(b.fga,0), 'fg3a', COALESCE(b.fg3a,0), \
+          'ftm', COALESCE(b.ftm,0), 'fta', COALESCE(b.fta,0), 'oreb', COALESCE(b.oreb,0), 'dreb', COALESCE(b.dreb,0), \
+          'dd', (t.n >= 2)::int, 'td', (t.n >= 3)::int) \
+        FROM nba_box_espn b, LATERAL (SELECT (COALESCE(b.pts,0) >= 10)::int + (COALESCE(b.oreb,0) + COALESCE(b.dreb,0) >= 10)::int + (COALESCE(b.ast,0) >= 10)::int \
+                                            + (COALESCE(b.stl,0) >= 10)::int + (COALESCE(b.blk,0) >= 10)::int AS n) t \
+        WHERE l.sport = 'nba' AND l.week = b.espn_id AND l.player_id = b.player_id AND NOT (l.stats ? 'fgm')", &[]).await.map_err(|e| dberr(&e))?;
 
     // 3. players: name, position and team from the latest box score (preseason included)
     db.execute("INSERT INTO sports_players (sport, player_id, display_name, position, team, first_season, last_season, games) \
@@ -309,6 +322,12 @@ async fn nfl(state: &State) -> Result<Value, String> {
     let ingest = local_post(state, "/ingest/nfl?sources=current&fit=false").await;
     if !ingest["ok"].as_bool().unwrap_or(false) { return Err(format!("nflverse weekly ingest: {ingest}")); }
     recount(db, "nfl").await?;
+    db.execute("UPDATE player_game_logs SET stats = stats || jsonb_build_object( \
+          'rush_rec_yds', COALESCE((stats->>'rushing_yards')::float8, 0) + COALESCE((stats->>'receiving_yards')::float8, 0), \
+          'pass_rush_yds', COALESCE((stats->>'passing_yards')::float8, 0) + COALESCE((stats->>'rushing_yards')::float8, 0), \
+          'tds', COALESCE((stats->>'rushing_tds')::float8, 0) + COALESCE((stats->>'receiving_tds')::float8, 0), \
+          'touches', COALESCE((stats->>'carries')::float8, 0) + COALESCE((stats->>'targets')::float8, 0)) \
+        WHERE sport = 'nfl' AND NOT (stats ? 'tds')", &[]).await.map_err(|e| dberr(&e))?;
     // weekly rosters: each team's latest roster week (teams on a bye are a week behind),
     // and a player listed by two teams (traded) belongs to the more recent listing
     let rows = db.query("WITH cur AS (SELECT * FROM nfl_roster_weekly WHERE season = (SELECT max(season) FROM nfl_roster_weekly)), \

@@ -600,10 +600,17 @@ impl Hist {
 }
 
 /// Prop stats tracked per player.
-pub const PROPS: [&str; 9] = ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pra", "min"];
-fn prop_values(s: &[i32; NST]) -> [i32; 9] {
+/// Every NBA player prop the books post (the first nine keep their historical
+/// order; forecasts index into it). `double_double` / `triple_double` are 0/1.
+pub const PROPS: [&str; 22] = ["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pra", "min",
+    "pr", "pa", "ra", "stocks", "fgm", "fga", "fg3a", "ftm", "fta", "oreb", "dreb", "double_double", "triple_double"];
+fn prop_values(s: &[i32; NST]) -> [i32; 22] {
     let reb = s[OREB] + s[DREB];
-    [s[PTS], reb, s[AST], s[F3M], s[STL], s[BLK], s[TOV], s[PTS] + reb + s[AST], (s[SEC] as f64 / 60.0).round() as i32]
+    // double-digit categories: points, rebounds, assists, steals, blocks
+    let tens = [s[PTS], reb, s[AST], s[STL], s[BLK]].iter().filter(|x| **x >= 10).count();
+    [s[PTS], reb, s[AST], s[F3M], s[STL], s[BLK], s[TOV], s[PTS] + reb + s[AST], (s[SEC] as f64 / 60.0).round() as i32,
+     s[PTS] + reb, s[PTS] + s[AST], reb + s[AST], s[STL] + s[BLK], s[FGM], s[FGA], s[F3A], s[FTM], s[FTA], s[OREB], s[DREB],
+     (tens >= 2) as i32, (tens >= 3) as i32]
 }
 
 pub struct Ensemble {
@@ -705,6 +712,19 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn prop_values_cover_combos_and_double_doubles() {
+        let mut st = [0; NST];
+        st[PTS] = 24; st[OREB] = 3; st[DREB] = 8; st[AST] = 9; st[STL] = 2; st[BLK] = 1; st[FGM] = 9; st[FGA] = 18; st[F3A] = 6; st[FTM] = 4; st[FTA] = 5;
+        let v = prop_values(&st);
+        let get = |k: &str| v[PROPS.iter().position(|p| *p == k).unwrap()];
+        assert_eq!((get("reb"), get("pr"), get("pa"), get("ra"), get("stocks")), (11, 35, 33, 20, 3));
+        assert_eq!((get("fgm"), get("fga"), get("fg3a"), get("ftm"), get("fta"), get("oreb"), get("dreb")), (9, 18, 6, 4, 5, 3, 8));
+        assert_eq!((get("double_double"), get("triple_double")), (1, 0), "24 pts + 11 reb, 9 ast is one short");
+        st[AST] = 10;
+        assert_eq!(prop_values(&st)[PROPS.iter().position(|p| *p == "triple_double").unwrap()], 1);
+    }
 
     pub fn toy() -> GameInput {
         let lg = League { season: 2026, fg2: 0.54, fg3: 0.36, ft: 0.78, tov_share: 0.12, trip_share: 0.10, three_share: 0.40,

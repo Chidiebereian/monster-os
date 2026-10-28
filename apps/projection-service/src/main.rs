@@ -118,6 +118,9 @@ pub(crate) const NFL_STATS: &[StatDef] = &[
     StatDef { key: "receptions",   label: "Receptions",       column: "receptions",     opportunity: "targets",  family: Family::Count,      unit: "rec" },
     StatDef { key: "targets",      label: "Targets",          column: "targets",        opportunity: "targets",  family: Family::Count,      unit: "tgt" },
     StatDef { key: "rec_td",       label: "Receiving TDs",    column: "receiving_tds",  opportunity: "targets",  family: Family::Count,      unit: "TDs" },
+    StatDef { key: "rush_rec_yds", label: "Rush + Rec Yards", column: "rush_rec_yds",   opportunity: "touches",  family: Family::Continuous, unit: "yds" },
+    StatDef { key: "pass_rush_yds",label: "Pass + Rush Yards",column: "pass_rush_yds",  opportunity: "attempts", family: Family::Continuous, unit: "yds" },
+    StatDef { key: "tds",          label: "Touchdowns",       column: "tds",            opportunity: "touches",  family: Family::Count,      unit: "TDs" },
 ];
 
 fn stat_def(key: &str) -> Option<&'static StatDef> {
@@ -362,6 +365,14 @@ async fn ingest_nfl(state: web::Data<State>, q: web::Query<IngestQuery>) -> impl
             for (&c, &i) in &col_idx {
                 vals.insert(c, getf(&r, i));
             }
+            // combination props (not columns in the nflverse files)
+            let v = |k: &str| vals.get(k).copied().unwrap_or(0.0);
+            let (rr, pr, tds, touches) = (v("rushing_yards") + v("receiving_yards"), v("passing_yards") + v("rushing_yards"),
+                v("rushing_tds") + v("receiving_tds"), v("carries") + v("targets"));
+            vals.insert("rush_rec_yds", rr);
+            vals.insert("pass_rush_yds", pr);
+            vals.insert("tds", tds);
+            vals.insert("touches", touches);
             let season: i32 = r.get(i_season).and_then(|s| s.parse().ok()).unwrap_or(0);
             let week = r.get(i_week).unwrap_or("").to_string();
             let week_sort = season as f64 * 100.0 + week.parse::<f64>().unwrap_or(0.0);

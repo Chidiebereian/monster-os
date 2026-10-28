@@ -809,10 +809,24 @@ pub async fn slate(db: &tokio_postgres::Client, date: NaiveDate) -> Result<Vec<S
             label: format!("{} @ {}", r.get::<_, String>(3), r.get::<_, String>(4)) }).collect())
 }
 
-/// Prop forecasts at the player's own average, in the simulator's prop order
-/// (nba_sim::prop_values: pts, reb, ast, fg3m, stl, blk, tov, pra).
-const PROP_MARKETS: [(&str, &str); 8] = [("pts_over_avg", "pts"), ("reb_over_avg", "reb"), ("ast_over_avg", "ast"), ("fg3m_over_avg", "fg3m"),
-    ("stl_over_avg", "stl"), ("blk_over_avg", "blk"), ("tov_over_avg", "tov"), ("pra_over_avg", "pra")];
+/// Prop forecasts at the player's own average line, one per simulator prop
+/// (nba_sim::PROPS) the books post. Double- and triple-doubles are yes/no
+/// (line 0.5). `min` is a diagnostic, not a market.
+const PROP_MARKETS: [(&str, &str); 21] = [("pts_over_avg", "pts"), ("reb_over_avg", "reb"), ("ast_over_avg", "ast"), ("fg3m_over_avg", "fg3m"),
+    ("stl_over_avg", "stl"), ("blk_over_avg", "blk"), ("tov_over_avg", "tov"), ("pra_over_avg", "pra"),
+    ("pr_over_avg", "pr"), ("pa_over_avg", "pa"), ("ra_over_avg", "ra"), ("stocks_over_avg", "stocks"), ("fgm_over_avg", "fgm"), ("fga_over_avg", "fga"),
+    ("fg3a_over_avg", "fg3a"), ("ftm_over_avg", "ftm"), ("fta_over_avg", "fta"), ("oreb_over_avg", "oreb"), ("dreb_over_avg", "dreb"),
+    ("double_double_yes", "double_double"), ("triple_double_yes", "triple_double")];
+
+/// A box-score row's value of every prop stat.
+fn box_props(g: &dyn Fn(&str) -> f64) -> HashMap<&'static str, f64> {
+    let reb = g("oreb") + g("dreb");
+    let tens = [g("pts"), reb, g("ast"), g("stl"), g("blk")].iter().filter(|x| **x >= 10.0).count();
+    [("pts", g("pts")), ("reb", reb), ("ast", g("ast")), ("fg3m", g("fg3m")), ("stl", g("stl")), ("blk", g("blk")), ("tov", g("tov")),
+     ("pra", g("pts") + reb + g("ast")), ("pr", g("pts") + reb), ("pa", g("pts") + g("ast")), ("ra", reb + g("ast")), ("stocks", g("stl") + g("blk")),
+     ("fgm", g("fgm")), ("fga", g("fga")), ("fg3a", g("fg3a")), ("ftm", g("ftm")), ("fta", g("fta")), ("oreb", g("oreb")), ("dreb", g("dreb")),
+     ("double_double", (tens >= 2) as i32 as f64), ("triple_double", (tens >= 3) as i32 as f64)].into()
+}
 
 /// Scoreable forecasts. Market baselines use the line stored for the game; player baselines use only games before it.
 async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput, e: &sim::Ensemble) -> Result<Vec<Forecast>, String> {
@@ -831,26 +845,34 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
     let full_over = |home: bool, l: f64| { let (o, u, _, _) = e.score[home as usize].line(l); o / (o + u).max(1e-9) };
     out.extend(crate::segments::forecasts("nba", gref.spread.map(|s| -s), gref.over_under, &e.h1, &full_over));
     let pids: Vec<String> = game.teams.iter().flat_map(|t| t.players.iter().map(|p| p.id.clone())).collect();
-    let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m, b.stl, b.blk, b.tov FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
+    let hist = db.query("SELECT b.player_id, b.pts, b.oreb, b.dreb, b.ast, b.fg3m, b.stl, b.blk, b.tov, b.fgm, b.fga, b.fg3a, b.ftm, b.fta FROM nba_box_espn b JOIN nba_games_espn g USING (espn_id) \
                          WHERE b.player_id = ANY($1) AND g.game_date < $2 AND g.game_date >= $2 - 450 AND NOT b.dnp AND COALESCE(b.min,0) > 0",
                         &[&pids, &gref.date]).await.map_err(|e| dberr(&e))?;
-    let mut past: HashMap<String, [Vec<f64>; 8]> = HashMap::new();
+    const COLS: [&str; 13] = ["pts", "oreb", "dreb", "ast", "fg3m", "stl", "blk", "tov", "fgm", "fga", "fg3a", "ftm", "fta"];
+    let mut past: HashMap<String, HashMap<&'static str, Vec<f64>>> = HashMap::new();
     for r in &hist {
-        let g = |i: usize| r.get::<_, Option<i32>>(i).unwrap_or(0) as f64;
+        let g = |c: &str| COLS.iter().position(|x| *x == c).map(|i| r.get::<_, Option<i32>>(i + 1).unwrap_or(0) as f64).unwrap_or(0.0);
         let v = past.entry(r.get(0)).or_default();
-        let reb = g(2) + g(3);
-        for (k, x) in [g(1), reb, g(4), g(5), g(6), g(7), g(8), g(1) + reb + g(4)].into_iter().enumerate() { v[k].push(x); }
+        for (k, x) in box_props(&g) { v.entry(k).or_default().push(x); }
     }
     for t in 0..2 {
         for (i, p) in game.teams[t].players.iter().enumerate() {
             let Some(ph) = past.get(&p.id) else { continue };
-            if ph[0].len() < 5 || e.active_n[t][i] == 0 { continue; }
-            for (k, (market, stat)) in PROP_MARKETS.iter().enumerate() {
-                let avg = ph[k].iter().sum::<f64>() / ph[k].len() as f64;
+            if ph.get("pts").map(|v| v.len()).unwrap_or(0) < 5 || e.active_n[t][i] == 0 { continue; }
+            for (market, stat) in PROP_MARKETS.iter() {
+                let (Some(k), Some(vals)) = (sim::PROPS.iter().position(|s| s == stat), ph.get(stat)) else { continue };
+                let avg = vals.iter().sum::<f64>() / vals.len() as f64;
                 // markets books rarely post for this player
-                if (k == 3 && avg < 0.8) || ((4..=6).contains(&k) && avg < 0.3) { continue; }
-                let line = avg.floor() + 0.5;
-                out.push(Forecast::player(market, "player's own prior frequency", &p.id, &p.name, stat, line, e.player[t][i][k].line(line).0, freq_over(&ph[k], line)));
+                let thin = match *stat {
+                    "fg3m" | "fg3a" | "ftm" | "fta" | "oreb" => avg < 0.8,
+                    "stl" | "blk" | "tov" | "stocks" => avg < 0.3,
+                    "double_double" => avg < 0.08,
+                    "triple_double" => avg < 0.03,
+                    _ => false,
+                };
+                if thin { continue; }
+                let line = if stat.ends_with("_double") { 0.5 } else { avg.floor() + 0.5 };
+                out.push(Forecast::player(market, "player's own prior frequency", &p.id, &p.name, stat, line, e.player[t][i][k].line(line).0, freq_over(vals, line)));
             }
         }
     }
@@ -861,7 +883,7 @@ async fn forecasts(db: &tokio_postgres::Client, gref: &GameRef, game: &GameInput
 pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Outcomes>, String> {
     let Some(g) = db.query_opt("SELECT home_score, away_score FROM nba_games_espn WHERE espn_id = $1 AND completed", &[&id]).await.map_err(|e| dberr(&e))? else { return Ok(None) };
     let (Some(hs), Some(as_)) = (g.get::<_, Option<i32>>(0), g.get::<_, Option<i32>>(1)) else { return Ok(None) };
-    let act = db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min, stl, blk FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[&id]).await.map_err(|e| dberr(&e))?;
+    let act = db.query("SELECT team, player_id, pts, oreb, dreb, ast, fg3m, fga, fta, tov, min, stl, blk, fgm, fg3a, ftm FROM nba_box_espn WHERE espn_id = $1 AND NOT dnp", &[&id]).await.map_err(|e| dberr(&e))?;
     if act.is_empty() { return Ok(None); }
     let mut o = Outcomes::default();
     o.game.insert("home_margin", (hs - as_) as f64);
@@ -874,6 +896,12 @@ pub async fn outcomes(db: &tokio_postgres::Client, id: &str) -> Result<Option<Ou
         let m = o.players.entry(r.get(1)).or_default();
         m.insert("pts", g(2)); m.insert("reb", g(3) + g(4)); m.insert("ast", g(5)); m.insert("fg3m", g(6));
         m.insert("stl", g(11)); m.insert("blk", g(12)); m.insert("tov", g(9)); m.insert("pra", g(2) + g(3) + g(4) + g(5));
+        let reb = g(3) + g(4);
+        m.insert("pr", g(2) + reb); m.insert("pa", g(2) + g(5)); m.insert("ra", reb + g(5)); m.insert("stocks", g(11) + g(12));
+        m.insert("oreb", g(3)); m.insert("dreb", g(4)); m.insert("fga", g(7)); m.insert("fta", g(8));
+        m.insert("fgm", g(13)); m.insert("fg3a", g(14)); m.insert("ftm", g(15));
+        let tens = [g(2), reb, g(5), g(11), g(12)].iter().filter(|x| **x >= 10.0).count();
+        m.insert("double_double", (tens >= 2) as i32 as f64); m.insert("triple_double", (tens >= 3) as i32 as f64);
         m.insert("min", r.get::<_, Option<f64>>(10).unwrap_or(0.0));
     }
     o.game.insert("possessions", pa);

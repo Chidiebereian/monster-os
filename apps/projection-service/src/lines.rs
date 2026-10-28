@@ -190,6 +190,17 @@ pub(crate) fn espn_prop_market(sport: &str, type_name: &str) -> Option<&'static 
         ("nba", "total blocks") => "blk",
         ("nba", "total turnovers") => "tov",
         ("nba", "total points, rebounds, and assists") => "pra",
+        ("nba", "total points and rebounds") => "pr",
+        ("nba", "total points and assists") => "pa",
+        ("nba", "total assists and rebounds" | "total rebounds and assists") => "ra",
+        ("nba", "total steals and blocks" | "total blocks and steals") => "stocks",
+        ("nba", "total field goals made") => "fgm",
+        ("nba", "total field goals attempted") => "fga",
+        ("nba", "total 3-point field goals attempted") => "fg3a",
+        ("nba", "total free throws made") => "ftm",
+        ("nba", "total free throws attempted") => "fta",
+        ("nba", "total offensive rebounds") => "oreb",
+        ("nba", "total defensive rebounds") => "dreb",
         ("nhl", "total shots on goal") => "sog",
         ("nhl", "total points") => "points",
         ("nhl", "total assists") => "assists",
@@ -200,6 +211,16 @@ pub(crate) fn espn_prop_market(sport: &str, type_name: &str) -> Option<&'static 
         ("nfl", "total rushing yards") => "rush_yds",
         ("nfl", "total receiving yards") => "rec_yds",
         ("nfl", "total receptions") => "receptions",
+        ("nfl", "total passing touchdowns") => "pass_td",
+        ("nfl", "total passing attempts" | "total pass attempts") => "pass_att",
+        ("nfl", "total passing completions" | "total pass completions" | "total completions") => "completions",
+        ("nfl", "total interceptions thrown" | "total interceptions" | "total passing interceptions") => "interceptions",
+        ("nfl", "total rushing attempts" | "total rush attempts" | "total carries") => "carries",
+        ("nfl", "total rushing and receiving yards" | "total rushing + receiving yards") => "rush_rec_yds",
+        ("nfl", "total passing and rushing yards" | "total passing + rushing yards") => "pass_rush_yds",
+        ("nfl", "total kicking points") => "kick_pts",
+        ("nfl", "total field goals made") => "fgm",
+        ("nfl", "total touchdowns" | "total touchdowns scored") => "tds",
         _ => return None,
     })
 }
@@ -461,6 +482,43 @@ async fn oddsapi(state: &State, sport: &str, games: &[Upcoming], names: &HashMap
 // SportsGameOdds (multi-book game lines + props)
 // ---------------------------------------------------------------------------
 
+/// Our simulator stat -> SportsGameOdds statIDs to look for (combos are '+'
+/// joins; the order is not documented, so both are tried).
+pub(crate) fn sgo_stat_ids(sport: &str, stat: &str) -> Vec<&'static str> {
+    match (sport, stat) {
+        ("nba", "pr") => vec!["points+rebounds"],
+        ("nba", "pa") => vec!["points+assists"],
+        ("nba", "ra") => vec!["rebounds+assists", "assists+rebounds"],
+        ("nba", "stocks") => vec!["blocks+steals", "steals+blocks"],
+        ("nba", "fgm") => vec!["fieldGoalsMade"],
+        ("nba", "fga") => vec!["fieldGoalsAttempted"],
+        ("nba", "fg3a") => vec!["threePointersAttempted"],
+        ("nba", "ftm") => vec!["freeThrowsMade"],
+        ("nba", "fta") => vec!["freeThrowsAttempted"],
+        ("nba", "oreb") => vec!["offensiveRebounds", "rebounds_offensive"],
+        ("nba", "dreb") => vec!["defensiveRebounds", "rebounds_defensive"],
+        ("nba", "double_double") => vec!["doubleDouble"],
+        ("nba", "triple_double") => vec!["tripleDouble"],
+        ("nfl", "pass_td") => vec!["passing_touchdowns"],
+        ("nfl", "pass_att") => vec!["passing_attempts"],
+        ("nfl", "completions") => vec!["passing_completions"],
+        ("nfl", "interceptions") => vec!["passing_interceptions"],
+        ("nfl", "carries") => vec!["rushing_attempts"],
+        ("nfl", "targets") => vec!["receiving_targets"],
+        ("nfl", "rush_td") => vec!["rushing_touchdowns"],
+        ("nfl", "rec_td") => vec!["receiving_touchdowns"],
+        ("nfl", "rush_rec_yds") => vec!["receiving_yards+rushing_yards", "rushing_yards+receiving_yards"],
+        ("nfl", "pass_rush_yds") => vec!["passing_yards+rushing_yards", "rushing_yards+passing_yards"],
+        ("nfl", "tds") => vec!["touchdowns"],
+        ("nfl", "kick_pts") => vec!["kicking_totalPoints"],
+        ("nfl", "fgm") => vec!["fieldGoals_made"],
+        _ => sgo_stat(sport, stat).into_iter().collect(),
+    }
+}
+
+/// Yes/no player markets: settle as over/under 0.5 (yes = over).
+pub(crate) fn yes_no_market(stat: &str) -> bool { matches!(stat, "double_double" | "triple_double" | "tds") }
+
 /// Our simulator stat -> SportsGameOdds statID.
 pub(crate) fn sgo_stat(sport: &str, stat: &str) -> Option<&'static str> {
     Some(match (sport, stat) {
@@ -474,9 +532,11 @@ pub(crate) fn sgo_stat(sport: &str, stat: &str) -> Option<&'static str> {
 }
 
 const SGO_PROP_STATS: [(&str, &[&str]); 3] = [
-    ("nba", &["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pra"]),
+    ("nba", &["pts", "reb", "ast", "fg3m", "stl", "blk", "tov", "pra", "pr", "pa", "ra", "stocks", "fgm", "fga", "fg3a", "ftm", "fta",
+              "oreb", "dreb", "double_double", "triple_double"]),
     ("nhl", &["sog", "points", "assists", "goals", "saves", "blocks"]),
-    ("nfl", &["pass_yds", "rush_yds", "rec_yds", "receptions"]),
+    ("nfl", &["pass_yds", "rush_yds", "rec_yds", "receptions", "pass_td", "pass_att", "completions", "interceptions", "carries",
+              "targets", "rush_td", "rec_td", "rush_rec_yds", "pass_rush_yds", "tds", "kick_pts", "fgm"]),
 ];
 
 /// Every game market name (static, for `Line::market`).
@@ -510,14 +570,43 @@ pub(crate) fn parse_sgo(sport: &str, events: &[Value], games: &[Upcoming]) -> Ve
                 let name = p["name"].as_str().unwrap_or("").to_string();
                 let Some(ours) = g.roster.resolve(None, &name) else { continue };
                 for &st in stats {
-                    let Some(sid) = sgo_stat(sport, st) else { continue };
-                    sels.push((st, "over", format!("{sid}-{pid}-game-ou-over"), format!("{sid}-{pid}-game-ou-under"), "overUnder", ours.clone(), Some(name.clone()), Some(pid.clone())));
+                    for sid in sgo_stat_ids(sport, st) {
+                        sels.push((st, "over", format!("{sid}-{pid}-game-ou-over"), format!("{sid}-{pid}-game-ou-under"), "overUnder", ours.clone(), Some(name.clone()), Some(pid.clone())));
+                        // yes/no markets (double-double, triple-double, anytime TD): yes = over 0.5
+                        if yes_no_market(st) {
+                            sels.push((st, "over", format!("{sid}-{pid}-game-yn-yes"), format!("{sid}-{pid}-game-yn-no"), "yesno", ours.clone(), Some(name.clone()), Some(pid.clone())));
+                        }
+                    }
                 }
             }
         }
+        let empty = serde_json::Map::new();
         for (market, side, a_id, b_id, field, subject, name, prov) in sels {
-            let (Some(a), Some(b)) = (odds.get(&a_id), odds.get(&b_id)) else { continue };
-            let (Some(ab), Some(bb)) = (a["byBookmaker"].as_object(), b["byBookmaker"].as_object()) else { continue };
+            if market.is_empty() { continue; }
+            // yes/no props are often posted yes-only: keep those (a one-sided price, see picks)
+            let yn = field == "yesno";
+            let Some(a) = odds.get(&a_id) else { continue };
+            let b = odds.get(&b_id);
+            if b.is_none() && !yn { continue; }
+            let Some(ab) = a["byBookmaker"].as_object() else { continue };
+            let bb = b.and_then(|b| b["byBookmaker"].as_object()).unwrap_or(&empty);
+            if yn {
+                let kind = if subject == "game" { "game" } else { "prop" };
+                for (book, av) in ab {
+                    if av["available"] == false { continue; }
+                    let Some(ap) = american(&av["odds"]) else { continue };
+                    let link = first([av["deeplink"].as_str(), av["deepLink"].as_str(), av["link"].as_str()]).map(str::to_string);
+                    let mk = |s: &'static str, price: i32, link: Option<String>| Line {
+                        source: "sgo", game_id: g.game_id.clone(), event_ref: eid.clone(), starts_at: start, kind, market, subject: subject.clone(),
+                        subject_name: name.clone(), provider_subject: prov.clone(), side: s, line: Some(0.5), price, book: book_key(book), link, open_line: None, open_price: None,
+                    };
+                    out.push(mk("over", ap, link));
+                    if let Some(bv) = bb.get(book) {
+                        if bv["available"] != false { if let Some(bp) = american(&bv["odds"]) { out.push(mk("under", bp, None)); } }
+                    }
+                }
+                continue;
+            }
             let other: &'static str = match side { "home" => "away", _ => "under" };
             let kind = if subject == "game" { "game" } else { "prop" };
             for (book, av) in ab {
@@ -730,6 +819,23 @@ mod tests {
         assert_eq!(ls.len(), 6);
         assert!(ls.iter().any(|l| l.market == "spread" && l.side == "home" && l.line == Some(3.5)));
         assert_eq!(ls.iter().find(|l| l.side == "over").unwrap().link.as_deref(), Some("https://fd/x"));
+    }
+
+    #[test]
+    fn sgo_keeps_yes_only_double_doubles_and_combo_props() {
+        let g = up("g1", "DET", "BOS", json!({ "home": "DET", "away": "BOS", "players": { "home": [{ "id": "55", "name": "Cade Cunningham" }], "away": [] } }));
+        let ev = json!([{ "eventID": "E", "status": { "startsAt": (Utc::now() + Duration::hours(3)).to_rfc3339() },
+            "teams": { "home": { "names": { "short": "DET" } }, "away": { "names": { "short": "BOS" } } },
+            "players": { "CADE_CUNNINGHAM_1_NBA": { "name": "Cade Cunningham" } },
+            "odds": {
+                "doubleDouble-CADE_CUNNINGHAM_1_NBA-game-yn-yes": { "byBookmaker": { "fanduel": { "odds": "+120" } } },
+                "points+rebounds-CADE_CUNNINGHAM_1_NBA-game-ou-over": { "byBookmaker": { "fanduel": { "odds": "-110", "overUnder": "32.5" } } },
+                "points+rebounds-CADE_CUNNINGHAM_1_NBA-game-ou-under": { "byBookmaker": { "fanduel": { "odds": "-110", "overUnder": "32.5" } } } } }]);
+        let ls = parse_sgo("nba", ev.as_array().unwrap(), &[g]);
+        let dd: Vec<_> = ls.iter().filter(|l| l.market == "double_double").collect();
+        assert_eq!(dd.len(), 1, "yes-only: one side, line 0.5");
+        assert_eq!((dd[0].side, dd[0].line, dd[0].price), ("over", Some(0.5), 120));
+        assert_eq!(ls.iter().filter(|l| l.market == "pr").count(), 2);
     }
 
     #[test]

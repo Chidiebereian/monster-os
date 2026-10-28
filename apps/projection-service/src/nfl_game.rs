@@ -1745,16 +1745,19 @@ fn ensemble_json(game: &GameInput, e: &sim::Ensemble, gref: &GameRef, meta: &Val
         let is_qb = game.teams.iter().any(|t| t.off.qb == i || t.off.backup_qb.as_ref().map(|b| b.p == i).unwrap_or(false));
         let is_k = game.teams.iter().any(|t| t.off.kicker == Some(i));
         let keys: Vec<usize> = if is_qb {
-            vec![sim::PASS_YDS, sim::PASS_ATT, sim::CMP, sim::PASS_TD, sim::INT, sim::RUSH_YDS, sim::RUSH_ATT]
+            vec![sim::PASS_YDS, sim::PASS_ATT, sim::CMP, sim::PASS_TD, sim::INT, sim::RUSH_YDS, sim::RUSH_ATT, sim::RUSH_TD, sim::PASS_RUSH_YDS, sim::TDS]
         } else if is_k {
-            vec![sim::FGM, sim::XPM]
+            vec![sim::FGM, sim::XPM, sim::KICK_PTS]
         } else {
-            vec![sim::REC_YDS, sim::REC, sim::TGT, sim::RUSH_YDS, sim::RUSH_ATT, sim::REC_TD, sim::RUSH_TD]
+            vec![sim::REC_YDS, sim::REC, sim::TGT, sim::RUSH_YDS, sim::RUSH_ATT, sim::REC_TD, sim::RUSH_TD, sim::RUSH_REC_YDS, sim::TDS]
         };
         if e.active_n[i] == 0 { continue; }
         for k in keys {
             if h[k].mean().abs() < 0.05 && !matches!(k, sim::REC | sim::REC_YDS) { continue; }
-            stats.insert(sim::STAT_KEYS[k].into(), hist_json(&h[k], &[fair_line(&h[k])]));
+            let name = if k < sim::NSTAT { sim::STAT_KEYS[k] } else { sim::COMBOS[k - sim::NSTAT] };
+            // touchdowns are priced at 0.5 (anytime) and 1.5 (2+)
+            let lines = if k == sim::TDS { vec![0.5, 1.5] } else { vec![fair_line(&h[k])] };
+            stats.insert(name.into(), hist_json(&h[k], &lines));
         }
         let act = e.active_n[i] as f64;
         if act <= 0.0 { continue; }
@@ -1968,6 +1971,60 @@ fn actual_stats(plays: &[P]) -> HashMap<String, [f64; 5]> {
     m
 }
 
+/// Every prop stat of every player in one game's play-by-play, keyed as the
+/// simulator keys them (nfl_sim::STAT_KEYS + COMBOS) plus `any_td` (0/1).
+/// Offensive touchdowns only (a return or fumble-recovery TD is not counted).
+pub(crate) fn full_stats(plays: &[P]) -> HashMap<String, HashMap<&'static str, f64>> {
+    let mut m: HashMap<String, HashMap<&'static str, f64>> = HashMap::new();
+    let mut add = |id: &str, k: &'static str, v: f64| { *m.entry(id.to_string()).or_default().entry(k).or_default() += v; };
+    for p in plays {
+        let own_td = p.td && p.td_team == p.posteam;
+        if p.attempt() {
+            if let Some((id, _)) = &p.passer {
+                add(id, "pass_att", 1.0);
+                if p.int { add(id, "interceptions", 1.0); }
+                if p.complete && !p.int {
+                    add(id, "completions", 1.0);
+                    add(id, "pass_yds", p.yards as f64);
+                    if own_td { add(id, "pass_td", 1.0); }
+                }
+            }
+            if let Some((id, _)) = &p.receiver {
+                add(id, "targets", 1.0);
+                if p.complete && !p.int {
+                    add(id, "receptions", 1.0);
+                    add(id, "rec_yds", p.yards as f64);
+                    if own_td { add(id, "rec_td", 1.0); }
+                }
+            }
+        }
+        if p.scrimmage() && p.ptype == "run" {
+            if let Some((id, _)) = &p.rusher {
+                add(id, "carries", 1.0);
+                add(id, "rush_yds", p.yards as f64);
+                if own_td { add(id, "rush_td", 1.0); }
+            }
+        }
+        if let Some((id, _)) = &p.kicker {
+            if p.fg_result.as_deref() == Some("made") { add(id, "fgm", 1.0); }
+            if p.xp_result.as_deref() == Some("good") { add(id, "xpm", 1.0); }
+        }
+    }
+    for s in m.values_mut() {
+        // a stat the player did not record is a zero, not a missing value (0 INT / 0 TD games settle too)
+        for k in ["pass_att", "completions", "pass_yds", "pass_td", "interceptions", "targets", "receptions", "rec_yds", "rec_td",
+                  "carries", "rush_yds", "rush_td", "fgm", "xpm"] { s.entry(k).or_insert(0.0); }
+        let g = |k: &str| s.get(k).copied().unwrap_or(0.0);
+        let (rr, pr, tds, kp) = (g("rush_yds") + g("rec_yds"), g("pass_yds") + g("rush_yds"), g("rush_td") + g("rec_td"), 3.0 * g("fgm") + g("xpm"));
+        s.insert("rush_rec_yds", rr);
+        s.insert("pass_rush_yds", pr);
+        s.insert("tds", tds);
+        s.insert("any_td", (tds > 0.0) as i32 as f64);
+        s.insert("kick_pts", kp);
+    }
+    m
+}
+
 /// GET /backtest/nfl/sim?season=2025&games=120&n=2000 — walk-forward: each game
 /// is simulated with parameters from the previous season and player/team inputs
 /// strictly before its date, then scored against what happened.
@@ -2091,6 +2148,30 @@ fn erf(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn full_stats_settle_every_prop() {
+        let pl = |id: &str| Some((id.to_string(), id.to_string()));
+        let base = || P { ptype: "pass".into(), down: Some(1), posteam: Some("KC".into()), ..Default::default() };
+        let td = Some("KC".to_string());
+        let plays = vec![
+            P { passer: pl("qb"), receiver: pl("wr"), complete: true, yards: 30, td: true, td_team: td.clone(), ..base() },
+            P { passer: pl("qb"), receiver: pl("wr"), complete: false, yards: 0, ..base() },
+            P { passer: pl("qb"), receiver: pl("te"), int: true, ..base() },
+            P { passer: pl("qb"), sack: true, yards: -7, ..base() },
+            P { ptype: "run".into(), rusher: pl("rb"), yards: 12, ..base() },
+            P { ptype: "run".into(), rusher: pl("qb"), yards: 5, scramble: true, td: true, td_team: td.clone(), ..base() },
+            P { ptype: "field_goal".into(), down: Some(4), kicker: pl("k"), fg_result: Some("made".into()), ..base() },
+            P { ptype: "extra_point".into(), down: None, kicker: pl("k"), xp_result: Some("good".into()), ..base() },
+        ];
+        let s = full_stats(&plays);
+        let g = |id: &str, k: &str| s[id].get(k).copied().unwrap_or(0.0);
+        assert_eq!((g("qb", "pass_att"), g("qb", "completions"), g("qb", "pass_yds"), g("qb", "pass_td"), g("qb", "interceptions")), (3.0, 1.0, 30.0, 1.0, 1.0));
+        assert_eq!((g("qb", "carries"), g("qb", "rush_yds"), g("qb", "pass_rush_yds"), g("qb", "tds")), (1.0, 5.0, 35.0, 1.0));
+        assert_eq!((g("wr", "targets"), g("wr", "receptions"), g("wr", "rec_td"), g("wr", "rush_rec_yds"), g("wr", "any_td")), (2.0, 1.0, 1.0, 30.0, 1.0));
+        assert_eq!((g("te", "targets"), g("te", "receptions"), s["te"].get("rec_td").copied()), (1.0, 0.0, Some(0.0)), "zeros are recorded");
+        assert_eq!((g("k", "fgm"), g("k", "xpm"), g("k", "kick_pts")), (1.0, 1.0, 4.0));
+    }
+
     const SAMPLE: &str = "game_id,play_id,season,week,season_type,game_date,home_team,away_team,posteam,defteam,qtr,quarter_seconds_remaining,yardline_100,down,ydstogo,score_differential,play_type,yards_gained,sack,qb_scramble,interception,complete_pass,fumble_lost,touchdown,td_team,safety,out_of_bounds,penalty,two_point_attempt,field_goal_result,extra_point_result,two_point_conv_result,kick_distance,air_yards,pass_location,run_location,passer_player_id,passer_player_name,rusher_player_id,rusher_player_name,receiver_player_id,receiver_player_name,kicker_player_id,kicker_player_name,penalty_team,penalty_yards,first_down_penalty
 2026_01_A_B,1,2026,1,REG,2026-09-10,B,A,NA,NA,1,900,NA,NA,0,NA,,NA,0,0,0,0,0,0,NA,0,0,0,0,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,0
 2026_01_A_B,39,2026,1,REG,2026-09-10,B,A,A,B,1,900,35,NA,0,0,kickoff,0,0,0,0,0,0,0,NA,0,0,0,0,NA,NA,NA,60,NA,NA,NA,NA,NA,NA,NA,NA,NA,K1,K.One,NA,NA,0
@@ -2172,14 +2253,16 @@ async fn forecasts_avg(db: &tokio_postgres::Client, gref: &GameRef, game: &GameI
     // team totals and the 1st half (segments.rs); nflverse spread_line is the expected home margin
     let full_over = |home: bool, l: f64| { let (o, u, _, _) = e.score[home as usize].line(l); o / (o + u).max(1e-9) };
     out.extend(crate::segments::forecasts("nfl", gref.spread_line, gref.total_line, &e.h1, &full_over));
-    let prior = load_plays(db, "game_date < $1 AND season >= $2 AND (passer_id = ANY($3) OR rusher_id = ANY($3) OR receiver_id = ANY($3))",
+    let prior = load_plays(db, "game_date < $1 AND season >= $2 AND (passer_id = ANY($3) OR rusher_id = ANY($3) OR receiver_id = ANY($3) OR kicker_id = ANY($3))",
         &[&gref.date, &(gref.season - 1), &game.players.iter().map(|p| p.id.clone()).collect::<Vec<_>>()]).await?;
     let mut hist: HashMap<String, Vec<[f64; 5]>> = HashMap::new();
+    let mut full: HashMap<String, Vec<HashMap<&'static str, f64>>> = HashMap::new();
     {
         let mut by_game: HashMap<&str, Vec<P>> = HashMap::new();
         for p in &prior { by_game.entry(p.game_id.as_str()).or_default().push(p.clone()); }
         for (_, ps) in by_game {
             for (id, s) in actual_stats(&ps) { hist.entry(id).or_default().push(s); }
+            for (id, s) in full_stats(&ps) { full.entry(id).or_default().push(s); }
         }
     }
     let mut avgs = HashMap::new();
@@ -2207,6 +2290,31 @@ async fn forecasts_avg(db: &tokio_postgres::Client, gref: &GameRef, game: &GameI
             let td_freq = (past.iter().filter(|s| s[4] > 0.0).count() as f64 + 1.0) / (past.len() as f64 + 2.0);
             out.push(Forecast::player("anytime_td", "player's own prior TD-game frequency", &pl.id, &pl.name, "any_td", 0.5, e.anytime_td[i] as f64 / nn, td_freq));
         }
+        // the rest of the prop menu, on the full play-by-play box score
+        let Some(fp) = full.get(&pl.id) else { continue };
+        let fv = |k: &str| fp.iter().map(|s| s.get(k).copied().unwrap_or(0.0)).collect::<Vec<f64>>();
+        let favg = |k: &str| { let v = fv(k); v.iter().sum::<f64>() / v.len().max(1) as f64 };
+        let mut more = |market: &'static str, stat: &'static str, line: f64| {
+            let Some(si) = sim::stat_index(stat) else { return };
+            out.push(Forecast::player(market, B, &pl.id, &pl.name, stat, line, h[si].line(line).0, crate::learning::freq_over(&fv(stat), line)));
+        };
+        let hook = |x: f64| x.floor() + 0.5;
+        if is_qb {
+            more("pass_att_over_avg", "pass_att", hook(favg("pass_att")));
+            more("completions_over_avg", "completions", hook(favg("completions")));
+            more("pass_td_over_avg", "pass_td", hook(favg("pass_td")));
+            more("interceptions_over_0_5", "interceptions", 0.5);
+            more("pass_rush_yds_over_avg", "pass_rush_yds", hook(favg("pass_rush_yds")));
+            if favg("rush_yds") >= 10.0 { more("qb_rush_yds_over_avg", "rush_yds", hook(favg("rush_yds"))); }
+        } else if favg("fgm") + favg("xpm") >= 1.0 {
+            more("kick_pts_over_avg", "kick_pts", hook(favg("kick_pts")));
+            more("fgm_over_avg", "fgm", hook(favg("fgm")));
+        } else {
+            if favg("carries") >= 5.0 { more("carries_over_avg", "carries", hook(favg("carries"))); }
+            if favg("targets") >= 3.0 { more("targets_over_avg", "targets", hook(favg("targets"))); }
+            if favg("rush_rec_yds") >= 20.0 { more("rush_rec_yds_over_avg", "rush_rec_yds", hook(favg("rush_rec_yds"))); }
+            if favg("tds") >= 0.3 { more("tds_over_1_5", "tds", 1.5); }
+        }
     }
     Ok((out, avgs))
 }
@@ -2216,9 +2324,9 @@ fn outcomes_from(hs: i32, as_: i32, plays: &[P]) -> Outcomes {
     let mut o = Outcomes::default();
     o.game.insert("home_margin", (hs - as_) as f64);
     o.game.insert("total", (hs + as_) as f64);
-    for (id, a) in actual_stats(plays) {
+    for (id, a) in full_stats(plays) {
         let m = o.players.entry(id).or_default();
-        for (k, name) in ["pass_yds", "rush_yds", "rec_yds", "receptions", "any_td"].into_iter().enumerate() { m.insert(name, a[k]); }
+        for (k, v) in a { m.insert(k, v); }
     }
     o
 }

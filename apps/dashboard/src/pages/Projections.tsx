@@ -31,6 +31,9 @@ const PROJ_SPORTS: SportDef[] = [
       nflStat("receptions", "Receptions", "rec"),
       nflStat("targets", "Targets", "tgt"),
       nflStat("rec_td", "Receiving TDs", "TDs"),
+      nflStat("rush_rec_yds", "Rush + Rec Yards", "yds"),
+      nflStat("pass_rush_yds", "Pass + Rush Yards", "yds"),
+      nflStat("tds", "Touchdowns", "TDs"),
     ],
   },
   {
@@ -65,6 +68,11 @@ const PROJ_SPORTS: SportDef[] = [
       { key: "pr", label: "Pts+Reb", unit: "P+R", model: "nba-pr-v1" },
       { key: "pa", label: "Pts+Ast", unit: "P+A", model: "nba-pa-v1" },
       { key: "ra", label: "Reb+Ast", unit: "R+A", model: "nba-ra-v1" },
+      ...[
+        ["stocks", "Stl+Blk", "S+B"], ["fgm", "FG Made", "FGM"], ["fga", "FG Attempts", "FGA"], ["fg3a", "3PT Attempts", "3PA"],
+        ["ftm", "FT Made", "FTM"], ["fta", "FT Attempts", "FTA"], ["oreb", "Off Rebounds", "OREB"], ["dreb", "Def Rebounds", "DREB"],
+        ["double_double", "Double-Double", "DD"], ["triple_double", "Triple-Double", "TD"],
+      ].map(([key, label, unit]) => ({ key, label, unit, model: `nba-${key}-v1` })),
     ],
   },
   {
