@@ -2144,6 +2144,34 @@ fn erf(x: f64) -> f64 {
     s * y
 }
 
+
+/// Parlay Builder: every simulated game, reduced to the score columns and the
+/// requested (gsis id, stat or combo) columns.
+pub async fn parlay_samples(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, seed: u64, want: &[(String, String)]) -> Result<crate::parlay::Samples, String> {
+    let db = &state.db;
+    let gref = game_ref(db, id).await?;
+    let mut o = opts_from(None, None).tuned(cfg);
+    o.lineup_mode = LineupMode::parse(Some(lineup));
+    let Built { game, .. } = build(db, &gref, &o).await?;
+    let (mut idx, mut found, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+    for w in want {
+        let k = sim::stat_index(&w.1);
+        let pos = game.players.iter().position(|p| p.id == w.0);
+        match (k, pos) { (Some(k), Some(i)) => { idx.push((i, k)); found.push(w.clone()); } _ => missing.push(w.clone()) }
+    }
+    let t0 = Instant::now();
+    let rows = web::block(move || sim::sample(&game, n, crate::parlay::DRAWS, seed, &|r: &sim::GameResult| {
+        let mut v: Vec<i16> = [r.score[0], r.score[1], r.seg[0], r.seg[1]].iter().map(|x| *x as i16).collect();
+        for &(i, k) in &idx {
+            if !r.active.get(i).copied().unwrap_or(true) { v.push(crate::parlay::VOID); continue; }
+            let s = &r.stats[i];
+            v.push((if k < sim::NSTAT { s[k] } else { sim::combo_values(s)[k - sim::NSTAT] }).clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16);
+        }
+        v
+    })).await.map_err(|e| e.to_string())?;
+    Ok(crate::parlay::Samples::from_rows(rows, found, missing, t0.elapsed().as_millis() as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

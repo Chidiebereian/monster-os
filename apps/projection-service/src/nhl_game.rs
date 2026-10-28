@@ -781,3 +781,34 @@ pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u
     let start: Option<chrono::DateTime<chrono::Utc>> = state.db.query_opt("SELECT start_time FROM nhl_games_api WHERE game_id = $1", &[&gid]).await.map_err(|e| dberr(&e))?.and_then(|r| r.get(0));
     Ok(Prediction { payload: payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64), forecasts, date: gref.date, start, engine: MODEL_VERSION, n: e.n as usize })
 }
+
+/// Parlay Builder: every simulated game, reduced to the score columns and the
+/// requested (player id, prop) columns. Goalie saves are the team's saves.
+pub async fn parlay_samples(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, seed: u64, want: &[(String, String)]) -> Result<crate::parlay::Samples, String> {
+    let gid: i64 = id.parse().map_err(|_| "NHL game id must be numeric")?;
+    let gref = game_ref(&state.db, gid).await?;
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), away_goalie: None, home_goalie: None, tune: Tuning::from_cfg(cfg) };
+    let Built { game, .. } = build(state, &gref, &o).await?;
+    // (team, skater index or usize::MAX for the goalie, stat)
+    let (mut idx, mut found, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+    for w in want {
+        let Ok(pid) = w.0.parse::<i64>() else { missing.push(w.clone()); continue };
+        let stat = match w.1.as_str() { "sog" => Some(0), "goals" => Some(1), "assists" => Some(2), "points" => Some(3), "blocks" => Some(4), "saves" => Some(5), _ => None };
+        let pos = (0..2).find_map(|t| {
+            if w.1 == "saves" { (game.teams[t].goalie.id == pid).then_some((t, usize::MAX)) } else { game.teams[t].skaters.iter().position(|s| s.id == pid).map(|i| (t, i)) }
+        });
+        match (stat, pos) { (Some(k), Some((t, i))) => { idx.push((t, i, k)); found.push(w.clone()); } _ => missing.push(w.clone()) }
+    }
+    let t0 = Instant::now();
+    let rows = web::block(move || sim::sample(&game, n, crate::parlay::DRAWS, seed, &|r: &sim::GameResult| {
+        let mut v: Vec<i16> = [r.score[0], r.score[1], r.seg[0], r.seg[1]].iter().map(|x| *x as i16).collect();
+        for &(t, i, k) in &idx {
+            if i == usize::MAX { v.push(r.saves[t] as i16); continue; }
+            if !r.active[t][i] { v.push(crate::parlay::VOID); continue; }
+            let st = &r.stats[t][i];
+            v.push(match k { 0 => st[sim::SOG], 1 => st[sim::GOALS], 2 => st[sim::ASSISTS], 3 => st[sim::GOALS] + st[sim::ASSISTS], _ => st[sim::BLOCKS] } as i16);
+        }
+        v
+    })).await.map_err(|e| e.to_string())?;
+    Ok(crate::parlay::Samples::from_rows(rows, found, missing, t0.elapsed().as_millis() as u64))
+}

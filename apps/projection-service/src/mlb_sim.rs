@@ -823,6 +823,22 @@ impl SimOutput {
     }
 }
 
+/// Every valid simulated game, in order, mapped by `f` (Parlay Builder). Same
+/// draws and seeds as `simulate`.
+pub fn sample<T>(g: &GameInput, n: usize, draws: usize, seed: u64, f: &dyn Fn(&GameResult) -> T) -> Vec<T> {
+    let draws = draws.clamp(1, n.max(1));
+    let mut out = Vec::with_capacity(n);
+    for d in 0..draws {
+        let mut rng = Rng::new(derive_seed(seed, &["draw", &d.to_string()]));
+        let tables = build_tables(g, &mut rng);
+        let share = n / draws + usize::from(d < n % draws);
+        for _ in 0..share {
+            if let Some(r) = sim_game(g, &tables, &mut rng) { out.push(f(&r)); }
+        }
+    }
+    out
+}
+
 /// Run `n` simulations in `draws` parameter batches. Each batch redraws every
 /// player's outcome rates from their posterior (parameter uncertainty), builds
 /// the matchup tables, then simulates its share of games.

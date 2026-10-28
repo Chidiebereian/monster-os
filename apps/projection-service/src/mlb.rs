@@ -2039,6 +2039,24 @@ pub async fn params(state: web::Data<State>) -> impl Responder {
     }
 }
 
+
+/// Parlay Builder: every valid simulated game, reduced to the run columns
+/// (full game and first five innings). MLB player props have no line feed yet,
+/// so prop columns are reported missing.
+pub async fn parlay_samples(state: &State, pk: &str, lineup: &str, cfg: &Value, n: usize, seed: u64, want: &[(String, String)]) -> Result<crate::parlay::Samples, String> {
+    let t = Tuning::from_cfg(cfg);
+    let mut ov = Overrides::scenario(None, None, Vec::new(), Some(lineup));
+    ov.batter_halflife = t.batter_halflife;
+    ov.pitcher_halflife = t.pitcher_halflife;
+    ov.hook = Hook { starts: t.hook_starts.round() as usize, prior: t.hook_prior };
+    let game = prepare(state, pk, &ov).await.map_err(|(_, e)| e)?.game;
+    let t0 = Instant::now();
+    let rows = web::block(move || mlb_sim::sample(&game, n, crate::parlay::DRAWS, seed, &|r: &mlb_sim::GameResult| {
+        vec![r.runs[0] as i16, r.runs[1] as i16, r.f5[0] as i16, r.f5[1] as i16]
+    })).await.map_err(|e| e.to_string())?;
+    Ok(crate::parlay::Samples::from_rows(rows, Vec::new(), want.to_vec(), t0.elapsed().as_millis() as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -950,6 +950,28 @@ pub async fn predict(state: &State, id: &str, lineup: &str, cfg: &Value, seed: u
     Ok(Prediction { payload: payload(&gref, &game, &e, meta, seed, t.elapsed().as_millis() as u64), forecasts, date: gref.date, start, engine: MODEL_VERSION, n: e.n as usize })
 }
 
+
+/// Parlay Builder: every simulated game of the champion engine, reduced to the
+/// game score columns and the requested (player id, prop) columns.
+pub async fn parlay_samples(state: &State, id: &str, lineup: &str, cfg: &Value, n: usize, seed: u64, want: &[(String, String)]) -> Result<crate::parlay::Samples, String> {
+    let gref = game_ref(&state.db, id).await?;
+    let o = Opts { mode: LineupMode::parse(Some(lineup)), out: HashSet::new(), force_in: HashSet::new(), tune: Tuning::from_cfg(cfg) };
+    let Built { game, .. } = build(state, &gref, &o).await?;
+    let (mut idx, mut found, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+    for w in want {
+        let k = sim::PROPS.iter().position(|p| *p == w.1);
+        let pos = (0..2).find_map(|t| game.teams[t].players.iter().position(|p| p.id == w.0).map(|i| (t, i)));
+        match (k, pos) { (Some(k), Some((t, i))) => { idx.push((t, i, k)); found.push(w.clone()); } _ => missing.push(w.clone()) }
+    }
+    let t0 = Instant::now();
+    let rows = web::block(move || sim::sample(&game, n, crate::parlay::DRAWS, seed, &|r: &sim::GameResult| {
+        let mut v: Vec<i16> = [r.score[0], r.score[1], r.seg[0], r.seg[1]].iter().map(|x| *x as i16).collect();
+        for &(t, i, k) in &idx { v.push(if r.active[t][i] { sim::prop_values(&r.stats[t][i])[k] as i16 } else { crate::parlay::VOID }); }
+        v
+    })).await.map_err(|e| e.to_string())?;
+    Ok(crate::parlay::Samples::from_rows(rows, found, missing, t0.elapsed().as_millis() as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

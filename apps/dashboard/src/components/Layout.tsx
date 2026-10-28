@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv, Brain, Sparkles } from "lucide-react";
+import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv, Brain, Sparkles, Layers } from "lucide-react";
 import clsx from "clsx";
 import { SPORTS, useSettings } from "../store/settings";
 
@@ -7,6 +7,7 @@ const NAV = [
   { to: "/odds", label: "Odds Screen", icon: Activity },
   { to: "/ev", label: "+EV Finder", icon: TrendingUp },
   { to: "/picks", label: "AI Picks", icon: Sparkles },
+  { to: "/parlays", label: "Parlay Builder", icon: Layers },
   { to: "/projections", label: "Projections", icon: BarChart3 },
   { to: "/cheatsheets", label: "Cheat Sheets", icon: ClipboardList },
   { to: "/hit-rates", label: "Hit Rates", icon: Target },

@@ -35,6 +35,8 @@ mod autopilot;
 mod team_engine;
 mod lines;
 mod picks;
+mod parlay;
+mod parlay_store;
 mod sharp;
 mod evidence;
 mod blend;
@@ -720,6 +722,21 @@ async fn main() -> std::io::Result<()> {
             .route("/learning/autopilot", web::get().to(autopilot::status))
             .route("/learning/autopilot", web::post().to(autopilot::status))
             .route("/learning/autopilot/run", web::post().to(autopilot::run_now))
+            .route("/parlays/slate", web::get().to(parlay::slate_http))
+            .route("/parlays/legs", web::get().to(parlay::legs_http))
+            .route("/parlays/generate", web::get().to(parlay::generate_http))
+            .route("/parlays/evaluate", web::post().to(parlay::evaluate_http))
+            .route("/parlays/status", web::get().to(parlay::status_http))
+            .route("/parlays/cancel", web::post().to(parlay::cancel_http))
+            .route("/parlays/run", web::post().to(parlay_store::run_http))
+            .route("/parlays/record", web::get().to(parlay_store::record_http))
+            .route("/parlays/validation", web::get().to(parlay_store::validation_http))
+            .route("/parlays/learn", web::post().to(parlay_store::learn_http))
+            .route("/parlays/model/rollback", web::post().to(parlay_store::rollback_http))
+            .route("/parlays/tickets", web::get().to(parlay_store::list_http))
+            .route("/parlays/tickets", web::post().to(parlay_store::save_http))
+            .route("/parlays/tickets/{id}", web::get().to(parlay_store::get_http))
+            .route("/parlays/tickets/{id}/unsave", web::post().to(parlay_store::unsave_http))
             .route("/picks", web::get().to(picks::list))
             .route("/picks/run", web::post().to(picks::run_http))
             .route("/picks/record", web::get().to(picks::record))

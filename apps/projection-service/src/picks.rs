@@ -113,7 +113,7 @@ impl Priced {
 }
 
 /// Find a player's entry (skaters, then goalies) in a simulator payload.
-fn player_entry<'a>(payload: &'a Value, subject: &str) -> Option<(&'a Value, String)> {
+pub(crate) fn player_entry<'a>(payload: &'a Value, subject: &str) -> Option<(&'a Value, String)> {
     for side in ["home", "away"] {
         let team = payload[side].as_str().unwrap_or("").to_string();
         for p in payload["players"][side].as_array().into_iter().flatten() {
@@ -294,7 +294,7 @@ pub(crate) fn prop_tier(ev: &HashMap<(String, String), Vec<Evidence>>, engine: &
 }
 
 /// Evidence rows per (engine, market) that apply to the engine's CURRENT code version.
-async fn evidence(db: &tokio_postgres::Client, engines: &HashMap<String, (String, String)>) -> Result<HashMap<(String, String), Vec<Evidence>>, String> {
+pub(crate) async fn evidence(db: &tokio_postgres::Client, engines: &HashMap<String, (String, String)>) -> Result<HashMap<(String, String), Vec<Evidence>>, String> {
     let rows = db.query("SELECT engine, market, source, comparison, n, seasons, better, worse, metric, se, detail FROM pick_evidence", &[]).await.map_err(|e| dberr(&e))?;
     let mut out: HashMap<(String, String), Vec<Evidence>> = HashMap::new();
     for r in &rows {
@@ -310,7 +310,7 @@ async fn evidence(db: &tokio_postgres::Client, engines: &HashMap<String, (String
 }
 
 /// engine key -> (registry version, engine code version) of each champion.
-async fn champions(db: &tokio_postgres::Client) -> Result<HashMap<String, (String, String)>, String> {
+pub(crate) async fn champions(db: &tokio_postgres::Client) -> Result<HashMap<String, (String, String)>, String> {
     Ok(db.query("SELECT sport, version, engine FROM model_registry WHERE status='champion'", &[]).await.map_err(|e| dberr(&e))?
         .iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect())
 }
@@ -381,7 +381,7 @@ fn engine_label(engine: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Recent values of each stat, newest first, for players (props).
-async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]) -> Result<HashMap<String, Vec<(HashMap<&'static str, f64>, String)>>, String> {
+pub(crate) async fn player_history(db: &tokio_postgres::Client, sport: &str, ids: &[String]) -> Result<HashMap<String, Vec<(HashMap<&'static str, f64>, String)>>, String> {
     let mut out: HashMap<String, Vec<(HashMap<&'static str, f64>, String)>> = HashMap::new();
     if ids.is_empty() { return Ok(out); }
     match sport {
@@ -671,7 +671,7 @@ struct Quote { book: String, a_line: Option<f64>, a_price: i32, b_price: i32, a_
 
 struct Ledger { id: i64, version: String, lineup: String, payload: Value }
 
-fn other(side: &str) -> &'static str { match side { "over" => "under", "under" => "over", "home" => "away", _ => "home" } }
+pub(crate) fn other(side: &str) -> &'static str { match side { "over" => "under", "under" => "over", "home" => "away", _ => "home" } }
 
 async fn latest_ledger(db: &tokio_postgres::Client, engine: &str, version: &str, ids: &[String]) -> Result<HashMap<String, Ledger>, String> {
     let rows = db.query("SELECT DISTINCT ON (game_id) game_id, id, model_version, lineup_mode, payload FROM prediction_ledger \

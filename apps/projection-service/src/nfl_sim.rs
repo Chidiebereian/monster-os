@@ -1291,7 +1291,7 @@ pub const RUSH_REC_YDS: usize = NSTAT;
 pub const PASS_RUSH_YDS: usize = NSTAT + 1;
 pub const TDS: usize = NSTAT + 2;
 pub const KICK_PTS: usize = NSTAT + 3;
-fn combo_values(s: &[i32; NSTAT]) -> [i32; 4] {
+pub(crate) fn combo_values(s: &[i32; NSTAT]) -> [i32; 4] {
     [s[RUSH_YDS] + s[REC_YDS], s[PASS_YDS] + s[RUSH_YDS], s[RUSH_TD] + s[REC_TD], 3 * s[FGM] + s[XPM]]
 }
 /// A stat key (box score or combo) -> its histogram index.
@@ -1363,6 +1363,35 @@ impl Ensemble {
         for (a, b) in self.active_n.iter_mut().zip(&o.active_n) { *a += b; }
     }
 }
+/// Every simulated game, in order, mapped by `f` (Parlay Builder: legs are
+/// graded against the same simulated games). Same batches and seeds as
+/// `simulate`, so the games are the ones its ensemble summarizes.
+pub fn sample<T: Send>(g: &GameInput, n: usize, draws: usize, seed: u64, f: &(dyn Fn(&GameResult) -> T + Sync)) -> Vec<T> {
+    let draws = draws.clamp(1, n.max(1));
+    let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(2).clamp(1, 4);
+    let per = n / draws;
+    let extra = n % draws;
+    let batches: Vec<(usize, usize)> = (0..draws).map(|b| (b, per + (b < extra) as usize)).collect();
+    let mut parts: Vec<(usize, Vec<T>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads).map(|t| {
+            let mine: Vec<(usize, usize)> = batches.iter().filter(|(b, _)| b % threads == t).cloned().collect();
+            sc.spawn(move || {
+                let mut out = Vec::new();
+                for (b, m) in mine {
+                    let mut prng = Rng::new(derive_seed(seed, &["params", &b.to_string()]));
+                    let gi = perturb(g, &mut prng);
+                    let mut rng = Rng::new(derive_seed(seed, &["games", &b.to_string()]));
+                    out.push((b, (0..m).map(|_| f(&play_game(&gi, &mut rng, None))).collect::<Vec<T>>()));
+                }
+                out
+            })
+        }).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("sim thread")).collect()
+    });
+    parts.sort_by_key(|(b, _)| *b);
+    parts.into_iter().flat_map(|(_, v)| v).collect()
+}
+
 
 /// Monte Carlo ensemble: `n` games in `draws` parameter batches (each batch
 /// redraws every rate/share from its posterior). Batches are independent and

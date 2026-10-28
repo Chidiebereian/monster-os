@@ -117,6 +117,21 @@ pub fn spawn(state: web::Data<State>) {
                 if let Err(e) = &v { println!("autopilot segments {sport}: {e}"); }
                 mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
             }
+            // Parlay Builder (parlay.rs, parlay_store.rs): simulate today's and tomorrow's
+            // slates, store the auto boards, refresh open tickets' prices and grade
+            // finished ones every 30 minutes; the dependence weight is re-tested daily
+            for sport in crate::parlay::SPORTS {
+                let job = format!("parlays:{sport}");
+                if paused(&s2.db).await || !due(&s2.db, &job, 30).await { continue; }
+                let v = crate::parlay_store::run(&s2, sport).await;
+                if !v["ok"].as_bool().unwrap_or(false) { println!("autopilot parlays {sport}: {}", v); }
+                mark(&s2.db, &job, v["ok"].as_bool().unwrap_or(false), &v).await;
+            }
+            if !paused(&s2.db).await && due(&s2.db, "parlays:learn", 1440).await {
+                let v = crate::parlay_store::learn(&s2).await;
+                if let Ok(x) = &v { println!("autopilot parlay model: {}", x["outcome"]); }
+                mark(&s2.db, "parlays:learn", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             // AI Picks evidence first: an engine whose code changed re-earns its grade caps
             if !paused(&s2.db).await {
                 if let Some(engine) = crate::evidence::due(&s2).await {
@@ -505,6 +520,7 @@ pub async fn status(state: web::Data<State>, q: web::Query<PauseQuery>, req: act
             "freeze": format!("champion + shadows: projected lineup within {PROJECTED_HOURS} h of the start, confirmed lineup within {CONFIRMED_MINUTES} min (NFL: the days before; confirmed the day before)"),
             "tune": format!("one proposal per engine per day, {:02}:00–{:02}:00 UTC; search season + holdout of the latest {TUNE_GAMES} games, {TUNE_N} sims x {TUNE_DRAWS} draws", TUNE_WINDOW_UTC.start, TUNE_WINDOW_UTC.end),
             "promote": "a shadow is promoted after enough paired live games with no market worse by 2 SE; the old champion stays as a shadow and is restored if the new one falls 2 SE behind",
+            "parlays": "Parlay Builder every 30 min per sport (background loop): simulate today's and tomorrow's slates with the champion engines, store the best tickets per market and leg count, refresh open tickets' prices, grade finished ones; daily test of the dependence weight (promoted only on a significant out-of-sample gain)",
             "picks": "AI Picks every 20 min per sport: ESPN lines each run, The Odds API at most every 6 h and SportsGameOdds every 4 h within daily budgets; reprice from the champions' frozen forecasts; settle finished games every tick",
             "nba_impact": "NBA player impact ratings (ridge adjusted plus-minus) fitted as of the first of each in-season month; checked every 6 h",
             "evidence": "when a champion's engine code has no backtest evidence, re-run five seasons of walk-forward backtests (one engine at a time) so AI Picks grade caps follow the code",

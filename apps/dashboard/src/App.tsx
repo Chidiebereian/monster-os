@@ -17,6 +17,7 @@ import { BroadcastSim } from "./pages/BroadcastSim";
 import { MonsterGpt } from "./pages/MonsterGpt";
 import { ModelIntelligence } from "./pages/ModelIntelligence";
 import { AiPicks } from "./pages/AiPicks";
+import { ParlayBuilder } from "./pages/ParlayBuilder";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
@@ -43,6 +44,7 @@ export default function App() {
             <Route path="/wallets/:addr" element={<WalletProfile />} />
             <Route path="/backtest" element={<Backtest />} />
             <Route path="/picks" element={<AiPicks />} />
+            <Route path="/parlays" element={<ParlayBuilder />} />
             <Route path="/models" element={<ModelIntelligence />} />
             <Route path="/monster-gpt" element={<MonsterGpt />} />
             <Route path="*" element={<Navigate to="/odds" replace />} />

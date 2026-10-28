@@ -540,6 +540,35 @@ impl Ensemble {
         self.full.merge(&o.full);
     }
 }
+/// Every simulated game, in order, mapped by `f` (Parlay Builder: legs are
+/// graded against the same simulated games). Same batches and seeds as
+/// `simulate`, so the games are the ones its ensemble summarizes.
+pub fn sample<T: Send>(g: &GameInput, n: usize, draws: usize, seed: u64, f: &(dyn Fn(&GameResult) -> T + Sync)) -> Vec<T> {
+    let draws = draws.clamp(1, n.max(1));
+    let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(2).clamp(1, 4);
+    let per = n / draws;
+    let extra = n % draws;
+    let batches: Vec<(usize, usize)> = (0..draws).map(|b| (b, per + (b < extra) as usize)).collect();
+    let mut parts: Vec<(usize, Vec<T>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads).map(|t| {
+            let mine: Vec<(usize, usize)> = batches.iter().filter(|(b, _)| b % threads == t).cloned().collect();
+            sc.spawn(move || {
+                let mut out = Vec::new();
+                for (b, m) in mine {
+                    let mut prng = Rng::new(derive_seed(seed, &["params", &b.to_string()]));
+                    let gi = perturb(g, &mut prng);
+                    let mut rng = Rng::new(derive_seed(seed, &["games", &b.to_string()]));
+                    out.push((b, (0..m).map(|_| f(&play_game(&gi, &mut rng, None))).collect::<Vec<T>>()));
+                }
+                out
+            })
+        }).collect();
+        hs.into_iter().flat_map(|h| h.join().expect("sim thread")).collect()
+    });
+    parts.sort_by_key(|(b, _)| *b);
+    parts.into_iter().flat_map(|(_, v)| v).collect()
+}
+
 
 pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
     let draws = draws.clamp(1, n.max(1));
