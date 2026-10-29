@@ -709,7 +709,9 @@ struct Outcome {
     reason: Option<String>,
 }
 
-async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mutex<HashMap<String, String>>) -> Result<usize, String> {
+/// `mirror`: the trades are the leader's existing open positions, bought into
+/// once at creation. They don't move the cursor and don't raise alerts.
+async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mutex<HashMap<String, String>>, mirror: bool) -> Result<usize, String> {
     let new: Vec<&LeaderTrade> = trades.iter().filter(|t| t.ts >= bot.cursor_ts).collect();
     if new.is_empty() {
         return Ok(0);
@@ -794,7 +796,12 @@ async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mu
                             spent_total += usd;
                             *spent_market.entry(market_key.clone()).or_default() += usd;
                             hold.entry(t.asset.clone()).or_default().our_shares += shares;
-                            let note = if fill.is_none() { Some("no live book: filled at leader's price".to_string()) } else { None };
+                            let note = match (mirror, fill.is_none()) {
+                                (true, true) => Some("mirrored existing position; no live book: filled at leader's price".to_string()),
+                                (true, false) => Some("mirrored existing position".to_string()),
+                                (false, true) => Some("no live book: filled at leader's price".to_string()),
+                                (false, false) => None,
+                            };
                             Outcome { action: "copied", price: Some(px), shares: Some(shares), usdc: Some(usd), reason: note }
                         }
                         Err(reason) => Outcome { action: "skipped", price: fill, shares: None, usdc: None, reason: Some(reason) },
@@ -819,13 +826,16 @@ async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mu
         let ts = Utc.timestamp_opt(t.ts, 0).single().unwrap_or_else(Utc::now);
         inserted += state.db.execute(
             "INSERT INTO copy_bot_events (bot_id, trade_ts, tx, asset, condition_id, side, title, slug, event_slug, icon,
-                 outcome, category, trader_price, trader_shares, trader_usdc, action, copy_price, copy_shares, copy_usdc, reason)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                 outcome, category, trader_price, trader_shares, trader_usdc, action, copy_price, copy_shares, copy_usdc, reason, seen)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
              ON CONFLICT (bot_id, tx, asset, side) DO NOTHING",
             &[&bot.id, &ts, &t.tx, &t.asset, &t.condition_id, &t.side, &t.title, &t.slug, &t.event_slug, &t.icon,
               &t.outcome, &category, &t.price, &t.shares, &t.usdc, &outcome.action, &outcome.price, &outcome.shares,
-              &outcome.usdc, &outcome.reason],
+              &outcome.usdc, &outcome.reason, &mirror],
         ).await.map_err(|e| e.to_string())? as usize;
+    }
+    if mirror {
+        return Ok(inserted);
     }
     state.db.execute(
         "UPDATE copy_bots SET cursor_ts=GREATEST(cursor_ts,$2), last_trade_at=to_timestamp($2) WHERE id=$1",
@@ -909,7 +919,7 @@ async fn cycle(state: &State) -> Result<Value, String> {
         let fetched = get_json(state, &url).await.map(|v| merge_trades(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]), since));
         for b in group {
             let res = match &fetched {
-                Ok(trades) => process_bot(state, b, trades, &cats).await,
+                Ok(trades) => process_bot(state, b, trades, &cats, false).await,
                 Err(e) => Err(e.clone()),
             };
             let res = match res {
@@ -980,6 +990,50 @@ pub struct NewBot {
     wallet: String,
     #[serde(default)]
     config: BotConfig,
+    /// Also buy into the leader's currently open positions at today's price.
+    #[serde(default)]
+    mirror_existing: bool,
+}
+
+/// Most open positions mirrored at creation (largest by value first).
+const MIRROR_MAX: usize = 50;
+
+/// The leader's open (unresolved) positions as synthetic BUY trades sized at
+/// their current value, so they flow through the normal sizing and filters.
+pub fn positions_as_trades(rows: &[Value], bot_id: i64, now: i64) -> Vec<LeaderTrade> {
+    let mut out: Vec<LeaderTrade> = rows.iter().filter_map(|p| {
+        let asset = text(p, "asset")?;
+        let shares = num(p, "size")?;
+        let price = num(p, "curPrice")?;
+        if p["redeemable"].as_bool() == Some(true) || !(0.01..=0.99).contains(&price) || shares <= 0.0 {
+            return None;
+        }
+        let usdc = num(p, "currentValue").unwrap_or(shares * price);
+        (usdc >= 1.0).then(|| LeaderTrade {
+            ts: now,
+            tx: format!("mirror:{bot_id}"),
+            asset,
+            condition_id: text(p, "conditionId"),
+            side: "BUY".into(),
+            price,
+            shares,
+            usdc,
+            title: text(p, "title"),
+            slug: text(p, "slug"),
+            event_slug: text(p, "eventSlug"),
+            icon: text(p, "icon"),
+            outcome: text(p, "outcome"),
+        })
+    }).collect();
+    out.sort_by(|a, b| b.usdc.total_cmp(&a.usdc));
+    out.truncate(MIRROR_MAX);
+    out
+}
+
+async fn mirror_positions(state: &State, bot: &Bot) -> Result<usize, String> {
+    let v = get_json(state, &format!("{}/positions?user={}&sizeThreshold=1&limit=500", state.pm_url, bot.wallet)).await?;
+    let trades = positions_as_trades(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]), bot.id, Utc::now().timestamp().max(bot.cursor_ts));
+    process_bot(state, bot, &trades, &Mutex::new(HashMap::new()), true).await
 }
 
 pub async fn create(state: web::Data<State>, body: web::Json<NewBot>) -> HttpResponse {
@@ -1010,10 +1064,24 @@ pub async fn create(state: web::Data<State>, body: web::Json<NewBot>) -> HttpRes
                   VALUES ($1,$2,$3,$4,$5,$6) RETURNING {BOT_COLS}"),
         &[&strategy, &wallet, &name, &image, &cfg, &cursor],
     ).await {
-        Ok(r) => match bot_with_summary(&state, &r).await {
-            Ok(v) => HttpResponse::Created().json(v),
-            Err(e) => internal(e),
-        },
+        Ok(r) => {
+            let mut mirror_err = None;
+            if body.mirror_existing {
+                if let Err(e) = mirror_positions(&state, &bot_from_row(&r)).await {
+                    eprintln!("whale-tracker: mirror positions: {e}");
+                    mirror_err = Some(e);
+                }
+            }
+            match bot_with_summary(&state, &r).await {
+                Ok(mut v) => {
+                    if let Some(e) = mirror_err {
+                        v["mirror_error"] = json!(e);
+                    }
+                    HttpResponse::Created().json(v)
+                }
+                Err(e) => internal(e),
+            }
+        }
         Err(e) => internal(e),
     }
 }
@@ -1264,6 +1332,20 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].shares, 20.0);
         assert!((t[0].price - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mirror_keeps_only_open_positions_largest_first() {
+        let rows = vec![
+            json!({"asset": "a", "size": 100.0, "curPrice": 0.5, "currentValue": 50.0, "redeemable": false}),
+            json!({"asset": "b", "size": 1000.0, "curPrice": 0.4, "currentValue": 400.0}),
+            json!({"asset": "won", "size": 10.0, "curPrice": 1.0, "currentValue": 10.0, "redeemable": true}),
+            json!({"asset": "dead", "size": 10.0, "curPrice": 0.0, "currentValue": 0.0}),
+            json!({"asset": "dust", "size": 1.0, "curPrice": 0.5, "currentValue": 0.5}),
+        ];
+        let t = positions_as_trades(&rows, 7, 100);
+        assert_eq!(t.iter().map(|t| t.asset.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert_eq!((t[0].tx.as_str(), t[0].side.as_str(), t[0].usdc, t[0].ts), ("mirror:7", "BUY", 400.0, 100));
     }
 
     #[test]

@@ -105,8 +105,8 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 export const bots = {
   list: () => call<{ rows: Bot[] }>("/bots"),
   get: (id: number) => call<BotDetail>(`/bots/${id}`),
-  create: (b: { strategy: string; wallet: string; config: BotConfig }) =>
-    call<Bot>("/bots", { method: "POST", body: JSON.stringify(b) }),
+  create: (b: { strategy: string; wallet: string; config: BotConfig; mirror_existing?: boolean }) =>
+    call<Bot & { mirror_error?: string }>("/bots", { method: "POST", body: JSON.stringify(b) }),
   update: (id: number, b: { strategy?: string; status?: "active" | "paused"; config?: BotConfig }) =>
     call<Bot>(`/bots/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   remove: (id: number) => call<void>(`/bots/${id}`, { method: "DELETE" }),

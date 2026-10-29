@@ -148,6 +148,8 @@ export function CopyBotModal({ bot, wallet: presetWallet, onClose }: { bot?: Bot
   const [strategy, setStrategy] = useState(bot?.strategy ?? "");
   const [cfg, setCfg] = useState<BotConfig>({ ...DEFAULT_CONFIG, ...(bot?.config ?? {}) });
   const [advanced, setAdvanced] = useState(false);
+  const [mirror, setMirror] = useState(false);
+  const [mirrorErr, setMirrorErr] = useState<string | null>(null);
   const [catOpen, setCatOpen] = useState(false);
   const set = <K extends keyof BotConfig>(k: K, v: BotConfig[K]) => setCfg((c) => ({ ...c, [k]: v }));
 
@@ -167,8 +169,12 @@ export function CopyBotModal({ bot, wallet: presetWallet, onClose }: { bot?: Bot
   const save = useMutation({
     mutationFn: () => editing
       ? bots.update(bot!.id, { strategy: strategy.trim(), config: cfg })
-      : bots.create({ strategy: strategy.trim(), wallet, config: cfg }),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["bots"] }); qc.invalidateQueries({ queryKey: ["bot"] }); onClose(); },
+      : bots.create({ strategy: strategy.trim(), wallet, config: cfg, mirror_existing: mirror }),
+    onSuccess: (b) => {
+      qc.invalidateQueries({ queryKey: ["bots"] }); qc.invalidateQueries({ queryKey: ["bot"] });
+      const err = b && "mirror_error" in b ? b.mirror_error : undefined;
+      if (err) setMirrorErr(`Bot created, but copying existing positions failed: ${err}`); else onClose();
+    },
   });
 
   const resetAdvanced = () => setCfg((c) => ({
@@ -212,6 +218,19 @@ export function CopyBotModal({ bot, wallet: presetWallet, onClose }: { bot?: Bot
             <Label help={"Standard: copy after the leader's trade is confirmed on Polymarket (we poll their activity every ~15 s).\n\nPriority (mempool, seconds earlier) isn't available: it needs a Polygon mempool feed."}>Copy signal</Label>
             <Seg value="standard" onChange={() => {}} options={[{ key: "standard", label: "Standard (confirmed trades)" }]} />
           </div>
+
+          {!editing && (
+            <label className="flex items-start gap-2.5 rounded-lg border border-glass px-3 py-2.5 cursor-pointer hover:bg-white/[0.03]">
+              <input type="checkbox" checked={mirror} onChange={(e) => setMirror(e.target.checked)} className="accent-violet-500 mt-0.5" />
+              <span className="text-sm">
+                <span className="text-gray-200">Also copy their current open positions</span>
+                <span className="block text-[11px] text-gray-500">
+                  Off by default: the bot only copies trades made after it starts. When on, it buys into the trader's open positions now
+                  (largest 50) at today's ask, sized and filtered by the settings below. You pay today's price, not theirs.
+                </span>
+              </span>
+            </label>
+          )}
 
           <div className="space-y-2">
             <Label help={"Percentage: match a % of the leader's trade size\n\nRange: a % with min/max dollar limits\n\nFixed: the same dollar amount every copy\n\nPortfolio %: mirror their allocation. If a trade is 1% of their open-position value, spend 1% of your bankroll."}>Buy Mode</Label>
@@ -327,13 +346,14 @@ export function CopyBotModal({ bot, wallet: presetWallet, onClose }: { bot?: Bot
             )}
           </div>
 
+          {mirrorErr && <div className="text-sm text-amber">{mirrorErr}</div>}
           {save.error && <div className="text-sm text-crimson-light">{(save.error as Error).message}</div>}
         </div>
 
         <div className="flex items-center gap-2 px-5 py-3 border-t border-glass">
           <span className="text-[11px] text-gray-500 flex-1">Paper trading: copies are simulated at the live order book. No orders are placed.</span>
           <button onClick={onClose} className="px-4 py-2 text-sm rounded-md border border-glass hover:bg-white/5">Cancel</button>
-          <button disabled={!wallet || !strategy.trim() || save.isPending} onClick={() => save.mutate()}
+          <button disabled={!wallet || !strategy.trim() || save.isPending || !!mirrorErr} onClick={() => save.mutate()}
             className="px-4 py-2 text-sm rounded-md bg-violet text-white font-medium hover:bg-violet/90 disabled:opacity-40 inline-flex items-center gap-2">
             {save.isPending && <Loader2 size={13} className="animate-spin" />}{editing ? "Save" : "Start Copying"}
           </button>
