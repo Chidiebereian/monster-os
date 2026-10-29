@@ -2,6 +2,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { Activity, TrendingUp, BarChart3, Scale, Waves, Radar, Users, Bot, Dog, Gauge, ClipboardList, Target, Dices, Tv, Brain, Sparkles, Layers } from "lucide-react";
 import clsx from "clsx";
 import { SPORTS, useSettings } from "../store/settings";
+import { BotAlerts } from "./BotAlerts";
 
 const NAV = [
   { to: "/odds", label: "Odds Screen", icon: Activity },
@@ -78,9 +79,12 @@ export function Layout() {
               className="w-24 bg-surface border border-glass rounded-md px-2 py-1 text-sm text-gray-100 focus:outline-none focus:border-violet/50"
             />
           </label>
-          <div className="ml-auto hidden sm:flex items-center gap-2 text-xs text-gray-500">
-            <span className="h-2 w-2 rounded-full bg-emerald animate-pulse" />
-            gateway · :8090
+          <div className="ml-auto flex items-center gap-3">
+            <div className="hidden sm:flex items-center gap-2 text-xs text-gray-500">
+              <span className="h-2 w-2 rounded-full bg-emerald animate-pulse" />
+              gateway · :8090
+            </div>
+            <BotAlerts />
           </div>
         </header>
         {/* small screens: the sidebar collapses into a scrollable nav row */}

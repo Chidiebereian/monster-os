@@ -47,7 +47,7 @@ const MAX_CANDIDATES: i64 = 600;
 const MIN_POSITION_USD: f64 = 100.0;
 const POLL_PER_CYCLE: i64 = 400;
 
-fn clob_url() -> &'static str {
+pub(crate) fn clob_url() -> &'static str {
     static U: OnceLock<String> = OnceLock::new();
     U.get_or_init(|| {
         std::env::var("POLYMARKET_CLOB_URL")
@@ -338,7 +338,7 @@ async fn poll_wallet(state: &State, wallet: &str) -> Result<usize, String> {
     Ok(inserted)
 }
 
-async fn event_category(state: &State, slug: &str, cache: &Mutex<HashMap<String, String>>) -> String {
+pub(crate) async fn event_category(state: &State, slug: &str, cache: &Mutex<HashMap<String, String>>) -> String {
     if let Some(c) = cache.lock().unwrap().get(slug) {
         return c.clone();
     }
@@ -383,7 +383,7 @@ async fn get_standing(state: &State, wallet: &str, cat: &str) -> Option<(Option<
     Some((rank, pnl, vol))
 }
 
-async fn book(state: &State, asset: &str) -> Option<Value> {
+pub(crate) async fn book(state: &State, asset: &str) -> Option<Value> {
     let resp = state.http.get(format!("{}/book?token_id={asset}", clob_url())).send().await.ok()?;
     if !resp.status().is_success() {
         return None; // 404 "No orderbook exists": market closed / resolved

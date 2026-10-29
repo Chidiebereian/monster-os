@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
-import { ArrowLeft, Copy, ExternalLink, Loader2, RefreshCw, Search } from "lucide-react";
+import { ArrowLeft, Bot, Copy, ExternalLink, Loader2, RefreshCw, Search } from "lucide-react";
+import { CopyBotModal } from "../components/CopyBotModal";
 import { Card, Msg, Pills } from "../components/ui";
 import { Avatar, CAT_COLORS, CategoryDonut, Money, PnlChart, catLabel } from "../components/pm";
 import { formatPct, formatUsd } from "../lib/odds";
@@ -50,6 +51,7 @@ export function WalletProfile() {
 
 function Header({ s, trades, onRefresh, refreshing }: { s: WalletStats; trades: number | null; onRefresh: () => void; refreshing: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [copying, setCopying] = useState(false);
   const copy = () => {
     navigator.clipboard?.writeText(s.wallet).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); });
   };
@@ -75,6 +77,10 @@ function Header({ s, trades, onRefresh, refreshing }: { s: WalletStats; trades: 
             <button onClick={onRefresh} className="text-[11px] inline-flex items-center gap-1 border border-glass rounded px-2 py-0.5 text-gray-300 hover:bg-white/5">
               <RefreshCw size={10} className={clsx(refreshing && "animate-spin")} /> Refresh
             </button>
+            <button onClick={() => setCopying(true)} className="text-[11px] inline-flex items-center gap-1 rounded px-2 py-0.5 bg-violet text-white hover:bg-violet/90">
+              <Bot size={11} /> Copy Trade
+            </button>
+            {copying && <CopyBotModal wallet={s.wallet} onClose={() => setCopying(false)} />}
           </div>
         </div>
       </div>

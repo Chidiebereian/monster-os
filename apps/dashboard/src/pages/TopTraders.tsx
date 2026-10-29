@@ -10,6 +10,7 @@ import {
   PM_CATEGORIES, PM_WINDOWS, cents, displayName, pm, shortAddr, timeAgo, walletAge,
   type BoardRow, type Mover, type TradeCard, type WalletStats,
 } from "../lib/pm";
+import { CopyBots } from "./CopyBots";
 
 // Top Traders: Polymarket wallets ranked by real results (Polymarket's own
 // leaderboard), with the record behind each rank. Discover = quick scan;
@@ -23,11 +24,11 @@ export function TopTraders() {
         <h1 className="text-lg font-semibold">Top Traders</h1>
         <span className="text-sm text-gray-500">Polymarket wallets ranked by real results</span>
         <div className="ml-auto">
-          <Pills options={[{ key: "discover", label: "Discover" }, { key: "leaderboard", label: "Leaderboard" }]}
+          <Pills options={[{ key: "discover", label: "Discover" }, { key: "leaderboard", label: "Leaderboard" }, { key: "bots", label: "Bots" }]}
             value={tab} onChange={(t) => setParams({ tab: t })} />
         </div>
       </div>
-      {tab === "leaderboard" ? <Leaderboard /> : <Discover />}
+      {tab === "leaderboard" ? <Leaderboard /> : tab === "bots" ? <CopyBots /> : <Discover />}
     </div>
   );
 }

@@ -8,6 +8,7 @@
 //!      >= min_cash USD), dedupe against what's already stored, insert the
 //!      new ones, and upsert the trader profile. Returns per-wallet counts.
 //! GET  /trades?wallet=&limit=   Read back stored trades (what copy-trading sees).
+//! /bots/*  Copy-trading bots (paper): see bots.rs.
 //!
 //! Config: DATABASE_URL, CLICKHOUSE_URL/USER/PASSWORD, POLYMARKET_DATA_URL
 //! (default https://data-api.polymarket.com). Kalshi is not covered: it does
@@ -15,6 +16,7 @@
 
 #![recursion_limit = "256"]
 
+mod bots;
 mod pm;
 mod signals;
 
@@ -868,6 +870,7 @@ async fn main() -> std::io::Result<()> {
 
     println!("whale-tracker listening on 0.0.0.0:{port} (polymarket {}, clickhouse {})", state.pm_url, state.ch_url);
     signals::spawn_loop(state.clone());
+    bots::spawn_loop(state.clone());
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
@@ -893,6 +896,14 @@ async fn main() -> std::io::Result<()> {
             .route("/pm/signals/chart", web::get().to(signals::chart))
             .route("/pm/signals/status", web::get().to(signals::status))
             .route("/pm/signals/run", web::post().to(signals::run_http))
+            .route("/bots", web::get().to(bots::list))
+            .route("/bots", web::post().to(bots::create))
+            .route("/bots/alerts", web::get().to(bots::alerts))
+            .route("/bots/alerts/seen", web::post().to(bots::mark_seen))
+            .route("/bots/run", web::post().to(bots::run_http))
+            .route("/bots/{id}", web::get().to(bots::detail))
+            .route("/bots/{id}", web::patch().to(bots::update))
+            .route("/bots/{id}", web::delete().to(bots::remove))
     })
     .bind(("0.0.0.0", port))?
     .run()
