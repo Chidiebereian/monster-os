@@ -1,7 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Bot, Send, User, Sparkles } from "lucide-react";
 import clsx from "clsx";
 import { api } from "../lib/api";
+import { GptLocks } from "../components/GptLocks";
 
 // Module (MonsterGPT): conversational research assistant over monster-gpt /ask.
 // The LLM explains and interprets; it never produces raw predictions — the
@@ -14,9 +16,10 @@ interface Msg {
 }
 
 const PILLS = [
-  "Is there value on the Yankees ML? NYY in MLB",
+  "What are the best bets today?",
+  "Break down tonight's biggest NBA game: model edge, injuries and props",
+  "Which NFL defense is softest against the run this week?",
   "Explain no-vig fair odds in one paragraph",
-  "What model does MonsterOS use for MLB run totals?",
   "How should I size a bet with a 6% edge?",
 ];
 
@@ -25,15 +28,36 @@ export function MonsterGpt() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const [params, setParams] = useSearchParams();
 
-  async function send(q: string) {
+  // Arriving from a matchup page: ?q=...&sport=&game= sends the question with that game's brief.
+  useEffect(() => {
+    const q = params.get("q");
+    if (!q) return;
+    const sport = params.get("sport");
+    const game = params.get("game");
+    setParams({}, { replace: true });
+    (async () => {
+      let context: unknown;
+      if (sport && game) {
+        try {
+          const r = await fetch(`/api/projection-service/hub/${sport}/game/${game}/brief`);
+          if (r.ok) context = { game: await r.json() };
+        } catch { /* ask without it */ }
+      }
+      send(q, context);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function send(q: string, context?: unknown) {
     const question = q.trim();
     if (!question || busy) return;
     setInput("");
     setMessages((m) => [...m, { role: "user", text: question }]);
     setBusy(true);
     try {
-      const res = await api.ask(question);
+      const res = await api.ask(question, context);
       setMessages((m) => [...m, { role: "assistant", text: res.answer, retrieved: res.retrieved, model: res.model }]);
     } catch (e) {
       setMessages((m) => [...m, { role: "assistant", text: `Error: ${(e as Error).message}` }]);
@@ -53,8 +77,12 @@ export function MonsterGpt() {
 
       <div ref={scroller} className="flex-1 overflow-auto space-y-4 pr-1">
         {messages.length === 0 && (
-          <div className="text-gray-500 text-sm space-y-3">
-            <p>Ask about value, edges, models, or market flow. Answers are grounded in retrieved evidence.</p>
+          <div className="text-gray-500 text-sm space-y-4">
+            <div>
+              <h2 className="text-2xl font-semibold text-gray-100">What Are We Betting On Today?</h2>
+              <p>AI-powered insights from our models, live lines and today's matchups. Name a game or team and MonsterGPT pulls its model forecast, lines, injuries and matchup ranks.</p>
+            </div>
+            <GptLocks onAsk={(q) => send(q)} />
             <div className="flex flex-wrap gap-2">
               {PILLS.map((p) => (
                 <button key={p} onClick={() => send(p)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-glass text-xs text-gray-300 hover:bg-white/5">

@@ -58,6 +58,8 @@ pub(crate) fn canon(sport: &str, code: &str) -> String {
         ("nba", "GS") => "GSW", ("nba", "NO") => "NOP", ("nba", "NY") => "NYK", ("nba", "SA") => "SAS",
         ("nba", "PHO") => "PHX", ("nba", "UTAH") => "UTA", ("nba", "WSH") => "WAS", ("nba", "BRK" | "BKLYN") => "BKN",
         ("nba", "CHO") => "CHA",
+        ("mlb", "CHW") => "CWS", ("mlb", "ARI") => "AZ", ("mlb", "WAS" | "WSN") => "WSH", ("mlb", "OAK") => "ATH",
+        ("mlb", "KCR") => "KC", ("mlb", "SDP") => "SD", ("mlb", "SFG") => "SF", ("mlb", "TBR") => "TB",
         ("nfl", "LAR") => "LA", ("nfl", "JAC") => "JAX", ("nfl", "WSH") => "WAS", ("nfl", "LVR") => "LV",
         ("nfl", "ARZ") => "ARI", ("nfl", "BLT") => "BAL", ("nfl", "CLV") => "CLE", ("nfl", "HST") => "HOU",
         _ => return c,

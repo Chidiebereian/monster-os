@@ -30,6 +30,8 @@ use serde_json::{json, Value};
 use tokio_postgres::{types::Json, NoTls};
 
 mod hitrates;
+mod game_hub;
+mod nfl_hub;
 mod learning;
 mod autopilot;
 mod team_engine;
@@ -777,6 +779,12 @@ async fn main() -> std::io::Result<()> {
             .route("/teams/nba", web::get().to(nba_teams::list_ratings))
             .route("/games/nba", web::get().to(nba_teams::list_games))
             .route("/matchup/nba", web::get().to(nba_teams::matchup))
+            .route("/hub/refresh", web::post().to(game_hub::refresh_http))
+            .route("/ingest/nfl/hub", web::post().to(nfl_hub::ingest_http))
+            .route("/hub/{sport}/schedule", web::get().to(game_hub::schedule))
+            .route("/hub/brief", web::get().to(game_hub::find_brief))
+            .route("/hub/{sport}/game/{id}", web::get().to(game_hub::game))
+            .route("/hub/{sport}/game/{id}/brief", web::get().to(game_hub::game_brief))
     })
     .bind(("0.0.0.0", port))?
     .run()

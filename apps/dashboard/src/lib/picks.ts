@@ -94,7 +94,7 @@ export interface EdgesResponse {
 
 export interface PickFilters {
   sport?: string; kind?: string; side?: string; grades?: string; market?: string; game?: string; book?: string;
-  min_edge?: number; min_prob?: number; sort?: string; q?: string; include_hidden?: boolean; status?: string;
+  min_edge?: number; min_prob?: number; sort?: string; q?: string; include_hidden?: boolean; status?: string; limit?: number;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {

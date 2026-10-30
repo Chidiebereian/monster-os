@@ -108,6 +108,14 @@ pub fn spawn(state: web::Data<State>) {
                 if let Err(e) = &v { println!("autopilot projections sync {sport}: {e}"); }
                 mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
             }
+            // Games page / matchup hub (game_hub.rs, nfl_hub.rs): NFL EPA + FTN charting +
+            // schedule every 3 h, and today's schedules pre-warmed for every sport
+            if !paused(&s2.db).await && due(&s2.db, "hub:refresh", 180).await {
+                let v = crate::game_hub::refresh(&s2).await;
+                let ok = v["nfl"]["error"].is_null();
+                if !ok { println!("autopilot hub refresh: {}", v["nfl"]["error"]); }
+                mark(&s2.db, "hub:refresh", ok, &v).await;
+            }
             // 1st-half / 1st-period / first-5 scores of finished games (segments.rs):
             // settles the 1st-half markets; backfills on the first run
             for sport in crate::segments::SPORTS {
@@ -520,6 +528,7 @@ pub async fn status(state: web::Data<State>, q: web::Query<PauseQuery>, req: act
             "freeze": format!("champion + shadows: projected lineup within {PROJECTED_HOURS} h of the start, confirmed lineup within {CONFIRMED_MINUTES} min (NFL: the days before; confirmed the day before)"),
             "tune": format!("one proposal per engine per day, {:02}:00–{:02}:00 UTC; search season + holdout of the latest {TUNE_GAMES} games, {TUNE_N} sims x {TUNE_DRAWS} draws", TUNE_WINDOW_UTC.start, TUNE_WINDOW_UTC.end),
             "promote": "a shadow is promoted after enough paired live games with no market worse by 2 SE; the old champion stays as a shadow and is restored if the new one falls 2 SE behind",
+            "hub": "Games page every 3 h (background loop): NFL EPA/success/PROE + FTN charting + nflverse schedule for the current season, and today's schedules pre-warmed for every sport",
             "parlays": "Parlay Builder every 30 min per sport (background loop): simulate today's and tomorrow's slates with the champion engines, store the best tickets per market and leg count, refresh open tickets' prices, grade finished ones; daily test of the dependence weight (promoted only on a significant out-of-sample gain)",
             "picks": "AI Picks every 20 min per sport: ESPN lines each run, The Odds API at most every 6 h and SportsGameOdds every 4 h within daily budgets; reprice from the champions' frozen forecasts; settle finished games every tick",
             "nba_impact": "NBA player impact ratings (ridge adjusted plus-minus) fitted as of the first of each in-season month; checked every 6 h",

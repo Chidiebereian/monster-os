@@ -207,6 +207,13 @@ const STOPWORDS: &[&str] = &[
     "does", "how", "what", "why", "when", "which", "who", "vs",
 ];
 
+fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        _ => format!("%{b:02X}"),
+    }).collect()
+}
+
 fn tokenize(s: &str) -> Vec<String> {
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -326,7 +333,25 @@ struct Rag {
     enabled: bool,
     feature_store_url: String,
     model_registry_url: String,
+    /// projection-service: game briefs (Games hub) and AI picks.
+    projection_url: String,
     docs: DocIndex,
+}
+
+/// Questions asking for today's plays ("best bets", "locks", "picks"...).
+fn wants_picks(question: &str) -> bool {
+    let l = question.to_lowercase();
+    ["pick", "lock", "best bet", "bets today", "what should i bet", "parlay", "play today", "sharpest", "value today", "betting on today"]
+        .iter().any(|k| l.contains(k))
+}
+
+/// Compact pick rows for the prompt.
+fn compact_picks(v: &Value) -> Vec<Value> {
+    v["picks"].as_array().into_iter().flatten().take(10).map(|p| json!({
+        "game": p["game_label"], "sport": p["sport"], "pick": p["label"], "subject": p["subject_name"], "market": p["market"],
+        "price": p["price"], "book": p["book_title"], "grade": p["grade"], "tier": p["tier"],
+        "model_probability": p["p_model"], "market_probability": p["p_market"], "edge": p["edge"], "starts_at": p["starts_at"],
+    })).collect()
 }
 
 impl Rag {
@@ -362,6 +387,31 @@ impl Rag {
                         if !models.is_empty() {
                             out.insert("active_models".into(), json!(models));
                         }
+                    }
+                }
+            }
+        }
+
+        // Games hub: briefs for games the question names (team names or codes),
+        // and the top AI picks when the question asks for plays.
+        let sport_q = sport.as_deref().map(|s| format!("&sport={}", s.to_lowercase())).unwrap_or_default();
+        let url = format!("{}/hub/brief?q={}{sport_q}", self.projection_url, urlencode(question));
+        if let Ok(resp) = http.get(&url).timeout(std::time::Duration::from_secs(25)).send().await {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    if v["games"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        out.insert("games".into(), v["games"].clone());
+                    }
+                }
+            }
+        }
+        if wants_picks(question) {
+            let url = format!("{}/picks?limit=10&sort=edge{sport_q}", self.projection_url);
+            if let Ok(resp) = http.get(&url).timeout(std::time::Duration::from_secs(15)).send().await {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<Value>().await {
+                        let rows = compact_picks(&v);
+                        if !rows.is_empty() { out.insert("ai_picks_today".into(), json!(rows)); }
                     }
                 }
             }
@@ -569,6 +619,10 @@ async fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| "http://localhost:8084".into())
             .trim_end_matches('/')
             .to_string(),
+        projection_url: env_opt("PROJECTION_SERVICE_URL")
+            .unwrap_or_else(|| "http://localhost:8121".into())
+            .trim_end_matches('/')
+            .to_string(),
         docs,
     };
     let llm = web::Data::new(Llm {
@@ -673,6 +727,14 @@ mod tests {
         assert!(context_is_sensitive(&json!({ "pem": "-----BEGIN PRIVATE KEY-----" })));
         // Arrays are walked too.
         assert!(context_is_sensitive(&json!([{ "seed_phrase": "a b c" }])));
+    }
+
+    #[test]
+    fn picks_intent_and_urlencode() {
+        assert!(wants_picks("What are your best bets today?"));
+        assert!(wants_picks("Give me MonsterGPT locks"));
+        assert!(!wants_picks("Explain no-vig fair odds"));
+        assert_eq!(urlencode("BAL @ BUF?"), "BAL%20%40%20BUF%3F");
     }
 
     #[test]

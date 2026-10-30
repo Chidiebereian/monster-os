@@ -18,6 +18,8 @@ import { MonsterGpt } from "./pages/MonsterGpt";
 import { ModelIntelligence } from "./pages/ModelIntelligence";
 import { AiPicks } from "./pages/AiPicks";
 import { ParlayBuilder } from "./pages/ParlayBuilder";
+import { Games } from "./pages/Games";
+import { GameMatchup } from "./pages/GameMatchup";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
@@ -30,6 +32,8 @@ export default function App() {
         <Routes>
           <Route element={<Layout />}>
             <Route index element={<Navigate to="/odds" replace />} />
+            <Route path="/games" element={<Games />} />
+            <Route path="/games/:sport/:id" element={<GameMatchup />} />
             <Route path="/odds" element={<Odds />} />
             <Route path="/ev" element={<EVFinder />} />
             <Route path="/projections" element={<Projections />} />
