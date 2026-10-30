@@ -488,14 +488,16 @@ async fn game_inner(state: &State, sport: &str, id: &str) -> Result<Value, Strin
     // analytics
     let analysis = match sport {
         "nfl" => crate::nfl_hub::analysis(&state.db, nfl_key.as_ref().unwrap(), &proj_by_id).await.unwrap_or_else(|e| json!({ "error": e })),
-        _ => team_analysis(&state.db, sport, &home, &away, day).await.unwrap_or_else(|e| json!({ "error": e })),
+        _ => team_analysis(&state.db, sport, &home, &away, day, projections.as_ref()).await.unwrap_or_else(|e| json!({ "error": e })),
     };
 
-    Ok(json!({
+    let mut out = json!({
         "sport": sport, "event": e, "books": books, "edges": edges, "projections": projections, "picks": picks,
         "espn": { "injuries": injuries, "last_five": last_five, "ats": ats, "leaders": leaders, "predictor": predictor, "standings": standings },
         "analysis": analysis,
-    }))
+    });
+    out["report"] = report(&out);
+    Ok(out)
 }
 
 /// ESPN's pickcenter (DraftKings) as quotes, for games we haven't recorded lines for yet.
@@ -767,7 +769,10 @@ async fn mlb_table(db: &tokio_postgres::Client, before: NaiveDate) -> Result<(Ta
 
 fn rank_value(table: &Table, def: &Def, team: &str, off: bool) -> Value {
     let get = |t: &(HashMap<&'static str, f64>, HashMap<&'static str, f64>, i64)| if off { t.0.get(def.key) } else { t.1.get(def.key) }.copied();
-    let mut vals: Vec<(&String, f64)> = table.iter().filter_map(|(k, t)| get(t).filter(|v| v.is_finite()).map(|v| (k, v))).collect();
+    // drop exhibition / all-star sides that only show up a handful of times
+    let most = table.values().map(|t| t.2).max().unwrap_or(0);
+    let mut vals: Vec<(&String, f64)> = table.iter().filter(|(_, t)| t.2 * 4 >= most)
+        .filter_map(|(k, t)| get(t).filter(|v| v.is_finite()).map(|v| (k, v))).collect();
     let desc = match (def.dir, off) { (Dir::Usage, _) => true, (Dir::Up, true) | (Dir::Down, false) => true, _ => false };
     vals.sort_by(|a, b| if desc { b.1.total_cmp(&a.1) } else { a.1.total_cmp(&b.1) });
     let lg = if vals.is_empty() { 0.0 } else { vals.iter().map(|x| x.1).sum::<f64>() / vals.len() as f64 };
@@ -781,7 +786,7 @@ fn rank_value(table: &Table, def: &Def, team: &str, off: bool) -> Value {
     }
 }
 
-async fn team_analysis(db: &tokio_postgres::Client, sport: &str, home: &str, away: &str, day: Option<NaiveDate>) -> Result<Value, String> {
+async fn team_analysis(db: &tokio_postgres::Client, sport: &str, home: &str, away: &str, day: Option<NaiveDate>, proj: Option<&Value>) -> Result<Value, String> {
     let before = day.unwrap_or_else(|| et_date(Utc::now()));
     let ck = format!("{sport}:{before}");
     let cached = ranks_cache().lock().unwrap().get(&ck).filter(|(t, _)| t.elapsed() < Duration::from_secs(1800)).map(|x| x.1.clone());
@@ -801,8 +806,13 @@ async fn team_analysis(db: &tokio_postgres::Client, sport: &str, home: &str, awa
     let block = |team: &str, off: bool| -> Vec<Value> { ds.iter().map(|d| rank_value(&table, d, team, off)).collect() };
     let sort_rank = |mut v: Vec<Value>| { v.retain(|r| !r["rank"].is_null()); v.sort_by_key(|r| r["rank"].as_u64().unwrap_or(99)); v };
     let games = |t: &str| table.get(t).map(|x| x.2).unwrap_or(0);
+    let gap_table = &table;
     Ok(json!({
         "data_note": format!("Team ranks from our warehouse: {label}, games before this one."),
+        "season_label": label,
+        "stands_out": [stands_out_generic(sport, gap_table, away, home), stands_out_generic(sport, gap_table, home, away)],
+        "has_ball": [has_ball_generic(sport, gap_table, away, home), has_ball_generic(sport, gap_table, home, away)],
+        "player_matchups": proj.map(|p| player_matchups_generic(sport, gap_table, p, home, away)),
         "rankings": [ { "team": home, "faces": away, "games": games(home), "rows": sort_rank(block(home, false)) },
                       { "team": away, "faces": home, "games": games(away), "rows": sort_rank(block(away, false)) } ],
         "team_stats": { "rows": ds.iter().map(|d| json!({ "key": d.key, "label": d.label, "help": d.help,
@@ -814,6 +824,284 @@ async fn team_analysis(db: &tokio_postgres::Client, sport: &str, home: &str, awa
 fn intern(sport: &str, m: HashMap<String, f64>) -> HashMap<&'static str, f64> {
     let ds = defs(sport);
     m.into_iter().filter_map(|(k, v)| ds.iter().find(|d| d.key == k).map(|d| (d.key, v))).collect()
+}
+
+// ---------------------------------------------------------------------------
+// NBA / NHL / MLB: offense vs defense, what stands out, player matchups
+// ---------------------------------------------------------------------------
+
+fn def_of(sport: &str, key: &str) -> Option<&'static Def> { defs(sport).iter().find(|d| d.key == key) }
+
+/// Lower-case a label for mid-sentence use, keeping acronyms ("3PM", "OPS").
+fn lc(label: &str) -> String {
+    let w: Vec<&str> = label.split(' ').collect();
+    w.iter().map(|x| if x.chars().filter(|c| c.is_ascii_uppercase()).count() > 1 { x.to_string() } else { x.to_lowercase() }).collect::<Vec<_>>().join(" ")
+}
+
+fn fmt_val(def: &Def, v: f64) -> String {
+    match def.fmt { "pct" => format!("{:.1}%", v * 100.0), "d3" => format!("{v:.3}"), "d2" => format!("{v:.2}"), _ => format!("{v:.1}") }
+}
+
+/// (offense value, offense rank, defense-allowed value, defense rank, teams)
+fn cells(table: &Table, def: &Def, off: &str, dfn: &str) -> Option<(f64, u64, f64, u64, u64)> {
+    let o = rank_value(table, def, off, true);
+    let d = rank_value(table, def, dfn, false);
+    Some((o["value"].as_f64()?, o["rank"].as_u64()?, d["value"].as_f64()?, d["rank"].as_u64()?, o["of"].as_u64().unwrap_or(30)))
+}
+
+/// One-line read of a metric: what the offense does and what the defense allows.
+fn metric_note(sport: &str, table: &Table, key: &str, off: &str, dfn: &str) -> Option<String> {
+    let def = def_of(sport, key)?;
+    let (ov, or, dv, dr, n) = cells(table, def, off, dfn)?;
+    let label = lc(def.label);
+    let lean = if def.dir == Dir::Usage { String::new() } else if or + 5 <= dr {
+        format!(" Edge {off}: its offense ranks #{or} against a defense ranked #{dr} of {n}.")
+    } else if dr + 5 <= or { format!(" Edge {dfn}: its defense ranks #{dr} against an offense ranked #{or}.") } else { " Fairly even.".into() };
+    Some(format!("{off} sits at {} in {label} (#{or} of {n}); {dfn} allows {} (#{dr}).{lean}", fmt_val(def, ov), fmt_val(def, dv)))
+}
+
+fn side_rows(sport: &str, table: &Table, off: &str, dfn: &str, keys: &[&str]) -> Vec<Value> {
+    keys.iter().filter_map(|k| def_of(sport, k)).map(|d| json!({ "key": d.key, "label": d.label, "help": d.help,
+        "offense": rank_value(table, d, off, true), "defense": rank_value(table, d, dfn, false) })).collect()
+}
+
+type SectionDef = (&'static str, &'static [&'static str], &'static str, &'static str);
+
+/// (title, metric keys, lead metric for the note, matchup group to explore)
+fn sections(sport: &str) -> &'static [SectionDef] {
+    const NBA: &[SectionDef] = &[
+        ("Scoring efficiency", &["ortg", "pts", "efg", "fg3_pct", "ftr"], "ortg", "scoring"),
+        ("Possessions & ball security", &["pace", "tov_pct", "orb_pct", "stl", "reb"], "tov_pct", "rebounding"),
+        ("Shot profile & who scores", &["fg3a_rate", "fg3m", "pts_g", "pts_f", "pts_c", "ast_g"], "fg3m", "threes"),
+    ];
+    const NHL: &[SectionDef] = &[
+        ("Creating shots", &["sf", "sog_f", "sog_d"], "sf", "shots"),
+        ("Finishing", &["gf", "sh_pct", "pts_f", "pts_d"], "gf", "points"),
+        ("Special teams & physical play", &["ppg", "pim", "hits", "blocks"], "ppg", "points"),
+    ];
+    const MLB: &[SectionDef] = &[
+        ("Getting on base", &["avg", "obp", "bb_pct", "k_pct", "h"], "obp", "hitting"),
+        ("Power", &["slg", "ops", "hr", "r"], "slg", "hitting"),
+        ("On the bases", &["sb"], "sb", "pitching"),
+    ];
+    match sport { "nba" => NBA, "nhl" => NHL, "mlb" => MLB, _ => &[] }
+}
+
+fn has_ball_generic(sport: &str, table: &Table, off: &str, dfn: &str) -> Value {
+    let secs: Vec<Value> = sections(sport).iter().map(|(title, keys, lead, explore)| json!({
+        "title": title, "note": metric_note(sport, table, lead, off, dfn).unwrap_or_default(), "explore": explore,
+        "rows": side_rows(sport, table, off, dfn, keys) })).collect();
+    json!({ "offense": off, "defense": dfn, "sections": secs })
+}
+
+fn stands_out_generic(sport: &str, table: &Table, off: &str, dfn: &str) -> Value {
+    let keys: &[&str] = match sport {
+        "nba" => &["ortg", "efg", "tov_pct", "orb_pct", "fg3_pct", "ftr"],
+        "nhl" => &["gf", "sf", "sh_pct", "ppg"],
+        "mlb" => &["obp", "slg", "k_pct", "hr", "r"],
+        _ => &[],
+    };
+    let best = keys.iter().filter_map(|k| { let d = def_of(sport, k)?; let c = cells(table, d, off, dfn)?; Some((d, c)) })
+        .max_by_key(|(_, c)| (c.3 as i64 - c.1 as i64).abs());
+    match best {
+        Some((d, (ov, or, dv, dr, n))) => {
+            let g = dr as i64 - or as i64;
+            json!({ "team": off, "edge": g, "text": format!(
+                "{off} ranks #{or} of {n} in {} ({}); {dfn} ranks #{dr} in what it allows ({}). That's the biggest rank {} for {off}'s offense in this game.",
+                lc(d.label), fmt_val(d, ov), fmt_val(d, dv), if g >= 0 { "advantage" } else { "mismatch against it" }) })
+        }
+        None => json!({ "team": off, "edge": 0, "text": "Not enough games yet to compare." }),
+    }
+}
+
+struct Group { key: &'static str, label: &'static str, cols: &'static [(&'static str, &'static str)], who: fn(&str, &str) -> Option<(&'static str, bool)> }
+
+fn nba_pos(pos: &str, g: &'static str, f: &'static str, c: &'static str) -> &'static str { if pos.contains('C') { c } else if pos.contains('G') { g } else { f } }
+
+fn groups(sport: &str) -> Vec<Group> {
+    match sport {
+        "nba" => vec![
+            Group { key: "scoring", label: "Scoring", cols: &[("pts", "Pts"), ("pra", "PRA"), ("fga", "FGA"), ("fta", "FTA"), ("min", "Min")],
+                who: |pos, _| Some((nba_pos(pos, "pts_g", "pts_f", "pts_c"), false)) },
+            Group { key: "rebounding", label: "Rebounding & defense", cols: &[("reb", "Reb"), ("oreb", "OReb"), ("dreb", "DReb"), ("blk", "Blk"), ("stl", "Stl")],
+                who: |pos, _| Some((if pos.contains('C') { "reb_c" } else { "reb" }, false)) },
+            Group { key: "playmaking", label: "Playmaking", cols: &[("ast", "Ast"), ("pa", "P+A"), ("ra", "R+A"), ("tov", "TO")],
+                who: |pos, _| Some((if pos.contains('G') { "ast_g" } else { "ast" }, false)) },
+            Group { key: "threes", label: "Threes", cols: &[("fg3m", "3PM"), ("fg3a", "3PA")],
+                who: |pos, _| Some((if pos.contains('G') { "fg3m_g" } else { "fg3m" }, false)) },
+        ],
+        "nhl" => vec![
+            Group { key: "points", label: "Points", cols: &[("points", "Pts"), ("goals", "G"), ("assists", "A")],
+                who: |pos, _| if pos == "G" { None } else { Some((if pos == "D" { "pts_d" } else { "pts_f" }, false)) } },
+            Group { key: "shots", label: "Shots & blocks", cols: &[("sog", "SOG"), ("blocks", "Blk")],
+                who: |pos, _| if pos == "G" { None } else { Some((if pos == "D" { "sog_d" } else { "sog_f" }, false)) } },
+        ],
+        "mlb" => vec![
+            Group { key: "hitting", label: "Hitting", cols: &[("h", "H"), ("tb", "TB"), ("hr", "HR"), ("hrr", "H+R+RBI"), ("bb", "BB"), ("k", "K")],
+                who: |_, role| if role == "starter" { None } else { Some(("ops", false)) } },
+            Group { key: "pitching", label: "Starting pitchers", cols: &[("k", "K"), ("outs", "Outs"), ("er", "ER"), ("h", "H allowed"), ("bb", "BB")],
+                who: |_, role| if role == "starter" { Some(("k_pct", true)) } else { None } },
+        ],
+        _ => vec![],
+    }
+}
+
+/// Player groups: projected stats (with the main book line and the model's
+/// probability) next to how the opponent ranks at what it allows that player type.
+fn player_matchups_generic(sport: &str, table: &Table, proj: &Value, home: &str, away: &str) -> Value {
+    let out: Vec<Value> = groups(sport).iter().map(|g| {
+        let mut rows: Vec<(f64, Value)> = Vec::new();
+        for side in ["away", "home"] {
+            let (team, opp) = if side == "home" { (home, away) } else { (away, home) };
+            for p in proj[side].as_array().into_iter().flatten() {
+                let pos = p["pos"].as_str().unwrap_or("");
+                let role = p["role"].as_str().unwrap_or("");
+                let Some((key, opp_off)) = (g.who)(pos, role) else { continue };
+                // skip deep bench: NBA under 12 minutes, MLB under 3 PA
+                let st = &p["stats"];
+                if sport == "nba" && st["min"]["mean"].as_f64().unwrap_or(0.0) < 12.0 { continue; }
+                if sport == "mlb" && role != "starter" && st["pa"]["mean"].as_f64().unwrap_or(0.0) < 3.0 { continue; }
+                let mut cols = serde_json::Map::new();
+                for (k, _) in g.cols {
+                    let v = &st[*k];
+                    if v.is_null() { continue; }
+                    let over = v["books"].as_array().and_then(|b| b.iter().find(|q| q["side"] == "over")).cloned();
+                    cols.insert(k.to_string(), json!({ "mean": v["mean"], "line": over.as_ref().map(|q| q["line"].clone()),
+                        "price": over.as_ref().map(|q| q["price"].clone()), "book": over.as_ref().map(|q| q["book"].clone()),
+                        "p_over": over.as_ref().map(|q| q["p_model"].clone()) }));
+                }
+                if cols.is_empty() { continue; }
+                let sort = st[g.cols[0].0]["mean"].as_f64().unwrap_or(0.0);
+                let opp_allows = def_of(sport, key).map(|d| rank_value(table, d, opp, opp_off)).unwrap_or(Value::Null);
+                rows.push((sort, json!({ "id": p["id"], "name": p["name"], "pos": pos, "team": team, "opponent": opp, "stats": cols,
+                    "opp_allows": opp_allows, "opp_side": if opp_off { "offense" } else { "defense" } })));
+            }
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        json!({ "key": g.key, "label": g.label, "cols": g.cols.iter().map(|(k, l)| json!({ "key": k, "label": l })).collect::<Vec<_>>(),
+            "rows": rows.into_iter().map(|r| r.1).take(40).collect::<Vec<_>>() })
+    }).collect();
+    json!(out)
+}
+
+// ---------------------------------------------------------------------------
+// Game report: a written rundown of one game from the payload (every sport)
+// ---------------------------------------------------------------------------
+
+fn odds_s(p: i64) -> String { if p > 0 { format!("+{p}") } else { p.to_string() } }
+fn pct0(x: f64) -> String { format!("{:.0}%", x * 100.0) }
+
+pub fn report(g: &Value) -> Value {
+    let e = &g["event"];
+    let (h, a) = (e["home"]["abbr"].as_str().unwrap_or("HOME"), e["away"]["abbr"].as_str().unwrap_or("AWAY"));
+    let mut secs: Vec<Value> = Vec::new();
+    let mut push = |title: &str, paras: Vec<String>| {
+        let p: Vec<String> = paras.into_iter().filter(|x| !x.is_empty()).collect();
+        if !p.is_empty() { secs.push(json!({ "title": title, "paragraphs": p })); }
+    };
+
+    // the number
+    let m = &e["model"];
+    let mut num = Vec::new();
+    if let (Some(hs), Some(as_), Some(wh)) = (m["home_score"].as_f64(), m["away_score"].as_f64(), m["win_home"].as_f64()) {
+        let (fav, pf) = if wh >= 0.5 { (h, wh) } else { (a, 1.0 - wh) };
+        num.push(format!("Our {} simulation has {a} {as_:.1}, {h} {hs:.1} (total {:.1}). {fav} wins {} of simulated games.",
+            m["engine"].as_str().unwrap_or("model"), hs + as_, pct0(pf)));
+    } else {
+        num.push("No frozen model forecast for this game yet; the autopilot freezes one before it starts.".into());
+    }
+    let q = |mk: &str, sd: &str| -> Option<String> {
+        let b = &e["lines"][mk][sd];
+        let price = b["price"].as_i64()?;
+        let line = b["line"].as_f64().map(|l| if mk == "spread" && l > 0.0 { format!("+{l} ") } else { format!("{l} ") }).unwrap_or_default();
+        Some(format!("{line}{} ({})", odds_s(price), b["book"].as_str().unwrap_or("")))
+    };
+    let mut market = Vec::new();
+    if let (Some(x), Some(y)) = (q("moneyline", "away"), q("moneyline", "home")) { market.push(format!("moneyline {a} {x} / {h} {y}")); }
+    if let Some(x) = q("spread", "home") { market.push(format!("{h} {x}")); }
+    if let Some(x) = q("total", "over") { market.push(format!("total o{x}")); }
+    if !market.is_empty() { num.push(format!("Best prices: {}.", market.join("; "))); }
+    let edges: Vec<&Value> = g["edges"].as_array().into_iter().flatten().collect();
+    if let Some(best) = edges.iter().filter(|x| x["ev"].as_f64().unwrap_or(-1.0) > 0.0)
+        .max_by(|x, y| x["ev"].as_f64().unwrap_or(0.0).total_cmp(&y["ev"].as_f64().unwrap_or(0.0))) {
+        let side = match best["side"].as_str().unwrap_or("") { "home" => h.to_string(), "away" => a.to_string(), s => s.to_string() };
+        num.push(format!("Biggest model-vs-price gap: {} {side}{} at {} ({}), model {} vs {} implied. Game-line models rarely beat closing lines in our backtests, so treat this as a lead, not a bet.",
+            best["market"].as_str().unwrap_or(""), best["line"].as_f64().map(|l| format!(" {l}")).unwrap_or_default(),
+            odds_s(best["price"].as_i64().unwrap_or(0)), best["book"].as_str().unwrap_or(""),
+            pct0(best["p_model"].as_f64().unwrap_or(0.0)), pct0(best["p_implied"].as_f64().unwrap_or(0.0))));
+    } else if !edges.is_empty() {
+        num.push("The model doesn't beat the best available price on any main line.".into());
+    }
+    push("The number", num);
+
+    // matchup keys
+    let an = &g["analysis"];
+    let mut keys: Vec<String> = an["stands_out"].as_array().into_iter().flatten().filter_map(|x| x["text"].as_str().map(|s| s.to_string())).collect();
+    for hb in an["has_ball"].as_array().into_iter().flatten() {
+        if let Some(n) = hb["sections"][0]["note"].as_str() { keys.push(n.to_string()); }
+    }
+    push("Matchup keys", keys);
+
+    // injuries
+    let is_q = |i: &Value| i["status"].as_str().map(|s| { let l = s.to_lowercase(); l.contains("questionable") || l.contains("day-to-day") || l.contains("probable") }).unwrap_or(false);
+    let inj: Vec<String> = g["espn"]["injuries"].as_array().into_iter().flatten().filter_map(|t| {
+        let items = t["data"].as_array()?;
+        if items.is_empty() { return None; }
+        let out: Vec<String> = items.iter().filter(|i| !is_q(i)).take(5).map(|i| format!("{} ({})", i["name"].as_str().unwrap_or(""), i["pos"].as_str().unwrap_or(""))).collect();
+        let qs = items.iter().filter(|i| is_q(i)).count();
+        Some(format!("{}: {}{}", t["team"].as_str().unwrap_or(""),
+            if out.is_empty() { "no one ruled out".into() } else { format!("out/doubtful {}", out.join(", ")) },
+            if qs > 0 { format!("; {qs} more questionable or day-to-day") } else { String::new() }))
+    }).collect();
+    push("Injuries", if inj.is_empty() { vec!["No injuries listed by ESPN.".into()] } else { inj });
+
+    // form
+    let form: Vec<String> = g["espn"]["last_five"].as_array().into_iter().flatten().filter_map(|t| {
+        let rs: Vec<&str> = t["data"].as_array()?.iter().filter_map(|x| x["result"].as_str()).collect();
+        if rs.is_empty() { return None; }
+        let w = rs.iter().filter(|r| **r == "W").count();
+        let ats = g["espn"]["ats"].as_array().and_then(|v| v.iter().find(|x| x["team"] == t["team"]))
+            .and_then(|x| x["data"].as_array().and_then(|d| d.first()).map(|r| format!(", ATS {}", r["summary"].as_str().unwrap_or(""))));
+        Some(format!("{} is {w}-{} in its last {} ({}){}.", t["team"].as_str().unwrap_or(""), rs.len() - w, rs.len(), rs.join(""), ats.unwrap_or_default()))
+    }).collect();
+    push("Form", form);
+
+    // props to watch: where the model clears the price most
+    let mut props: Vec<(f64, String, String)> = Vec::new();
+    for side in ["away", "home"] {
+        for p in g["projections"][side].as_array().into_iter().flatten() {
+            for (k, st) in p["stats"].as_object().into_iter().flatten() {
+                for b in st["books"].as_array().into_iter().flatten() {
+                    let (Some(pm), Some(price), Some(line)) = (b["p_model"].as_f64(), b["price"].as_i64(), b["line"].as_f64()) else { continue };
+                    let imp = implied(price as i32);
+                    if pm - imp > 0.03 {
+                        let name = p["name"].as_str().unwrap_or("").to_string();
+                        props.push((pm - imp, name.clone(), format!("{name} {} {line} {k} at {} ({}): model {} vs {} implied, projection {:.1}.",
+                            b["side"].as_str().unwrap_or(""), odds_s(price), b["book"].as_str().unwrap_or(""),
+                            pct0(pm), pct0(imp), st["mean"].as_f64().unwrap_or(0.0))));
+                    }
+                }
+            }
+        }
+    }
+    props.sort_by(|x, y| y.0.total_cmp(&x.0));
+    let mut seen = std::collections::HashSet::new();
+    let watch: Vec<String> = props.into_iter().filter(|(_, k, _)| seen.insert(k.clone())).take(5).map(|x| x.2).collect();
+    if !watch.is_empty() {
+        let mut w = watch;
+        w.push("Prop gaps are raw model vs price; AI Picks applies the track-record grade caps before publishing anything.".into());
+        push("Props to watch", w);
+    }
+
+    // picks
+    let picks: Vec<&Value> = g["picks"].as_array().into_iter().flatten().filter(|p| p["tier"] != "hidden").collect();
+    if !picks.is_empty() {
+        let top: Vec<String> = picks.iter().take(3).map(|p| format!("{} {} {}{} {} ({}, edge {:+.1}%)", p["grade"].as_str().unwrap_or(""),
+            p["subject"].as_str().unwrap_or(""), p["side"].as_str().unwrap_or(""), p["line"].as_f64().map(|l| format!(" {l}")).unwrap_or_default(),
+            odds_s(p["price"].as_i64().unwrap_or(0)), p["book"].as_str().unwrap_or(""), p["edge"].as_f64().unwrap_or(0.0) * 100.0)).collect();
+        push("AI picks", vec![format!("{} published for this game. Top: {}.", picks.len(), top.join("; "))]);
+    }
+    json!({ "generated_at": Utc::now(), "sections": secs })
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1244,13 @@ pub async fn refresh_http(state: web::Data<State>) -> impl Responder { HttpRespo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn label_case_keeps_acronyms() {
+        assert_eq!(lc("3PM / game - guards"), "3PM / game - guards");
+        assert_eq!(lc("Offensive rating"), "offensive rating");
+        assert_eq!(lc("OPS"), "OPS");
+    }
+
     use super::*;
 
     #[test]

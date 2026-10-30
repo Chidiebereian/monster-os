@@ -77,7 +77,16 @@ export interface Analysis {
   game_info?: { referee: string | null; roof: string | null; surface: string | null; temp: number | null; wind: number | null; stadium: string | null;
     home_rest: number | null; away_rest: number | null; div_game: boolean | null; gametime: string | null } | null;
   matchups?: { receiving: PlayerMatchup[]; rushing: PlayerMatchup[]; qb: PlayerMatchup[]; touchdowns: PlayerMatchup[] };
+  /** NBA/NHL/MLB: projected players vs how the opponent ranks at what it allows */
+  player_matchups?: MatchupGroup[] | null;
+  season_label?: string;
 }
+export interface MatchupCell { mean: number | null; line: number | null; price: number | null; book: string | null; p_over: number | null }
+export interface MatchupGroup {
+  key: string; label: string; cols: { key: string; label: string }[];
+  rows: { id: string; name: string; pos: string; team: string; opponent: string; stats: Record<string, MatchupCell>; opp_allows: MetricVal | null; opp_side: "offense" | "defense" }[];
+}
+export interface GameReport { generated_at: string; sections: { title: string; paragraphs: string[] }[] }
 export interface BookQuote { market: string; side: string; line: number | null; price: number; book: string; link: string | null; open_line: number | null; open_price: number | null }
 export interface Edge { market: string; side: string; line: number | null; price: number; book: string; p_model: number; p_implied: number; edge: number; ev: number }
 export interface ProjStat {
@@ -102,6 +111,7 @@ export interface GameDetail {
     standings: { header: string | null; teams: { team: string | null; stats: Record<string, string> }[] }[] | null;
   };
   analysis: Analysis | null;
+  report?: GameReport;
 }
 
 async function get<T>(path: string): Promise<T> {

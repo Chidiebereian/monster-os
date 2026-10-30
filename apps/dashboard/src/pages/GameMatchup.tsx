@@ -11,7 +11,7 @@ import { Msg } from "../components/ui";
 import { Quote } from "./Games";
 import {
   hub, fmtOdds, fmtLine, fmtMetric, fmtVsLeague, bookName, usableLink, statLabel,
-  type GameDetail, type HubSport, type MetricVal, type HasBall, type PlayerMatchup, type ProjPlayer, type Ranking,
+  type GameDetail, type HubSport, type MetricVal, type HasBall, type PlayerMatchup, type ProjPlayer, type Ranking, type MatchupGroup,
 } from "../lib/hub";
 
 const pct = (x: number | null | undefined, d = 1) => (x == null ? "—" : `${(x * 100).toFixed(d)}%`);
@@ -29,13 +29,14 @@ export function GameMatchup() {
     { key: "rankings", label: "Rankings" },
     { key: "projections", label: "Projections" },
     { key: "picks", label: `Picks${d?.picks.length ? ` ${d.picks.length}` : ""}` },
-    ...(nfl ? [{ key: "matchups", label: "Matchups" }] : []),
+    ...(nfl || d?.analysis?.player_matchups?.length ? [{ key: "matchups", label: "Matchups" }] : []),
+    { key: "report", label: nfl ? "Weekly report" : "Game report" },
     { key: "lines", label: "Lines" },
     { key: "injuries", label: "Lineups & injuries" },
     ...(nfl ? [{ key: "coaching", label: "Coaching" }, { key: "situations", label: "Situations" }] : []),
     { key: "teamstats", label: "Team stats" },
     { key: "weather", label: "Weather" },
-  ], [nfl, d?.picks.length]);
+  ], [nfl, d?.picks.length, d?.analysis?.player_matchups?.length]);
   const tab = params.get("tab") ?? "overview";
   const setTab = (t: string, extra: Record<string, string> = {}) => { const p = new URLSearchParams(params); p.set("tab", t); for (const [k, v] of Object.entries(extra)) p.set(k, v); setParams(p, { replace: true }); };
 
@@ -63,7 +64,9 @@ export function GameMatchup() {
       {tab === "rankings" && <Rankings d={d} />}
       {tab === "projections" && <Projections d={d} />}
       {tab === "picks" && <Picks d={d} />}
-      {tab === "matchups" && <Matchups d={d} initial={params.get("m") ?? "receiving"} />}
+      {tab === "matchups" && (nfl ? <Matchups d={d} initial={params.get("m") ?? "receiving"} />
+        : <GroupMatchups d={d} initial={params.get("m") ?? d.analysis?.player_matchups?.[0]?.key ?? ""} />)}
+      {tab === "report" && <Report d={d} />}
       {tab === "lines" && <Lines d={d} />}
       {tab === "injuries" && <Injuries d={d} />}
       {tab === "coaching" && <Coaching d={d} />}
@@ -210,9 +213,10 @@ function Overview({ d, onExplore }: { d: GameDetail; onExplore: (k: string) => v
       )}
 
       {a.has_ball && (
-        <Section title="When each team has the ball" sub={`Season ${a.season} through week ${a.through_week} · what they do, what they face, and where to look next`}
+        <Section title={d.sport === "nfl" ? "When each team has the ball" : "Offense vs defense"}
+          sub={d.sport === "nfl" ? `Season ${a.season} through week ${a.through_week} · what they do, what they face, and where to look next` : `${a.season_label ?? "This season"} · what each offense does, what it faces, and where to look next`}
           right={<div className="flex items-center gap-2 text-[11px] text-gray-500">Lower<div className="w-20 h-1.5 rounded bg-gradient-to-r from-violet/10 to-violet/60" />Higher rank</div>}>
-          <div className="text-[11px] text-gray-500">EPA = how much a play changes the expected score. Higher is better on offense; lower allowed is better on defense. Shading follows league rank (#1 = best offense, stingiest defense); usage rows rank frequency, not quality.</div>
+          <div className="text-[11px] text-gray-500">{d.sport === "nfl" ? "EPA = how much a play changes the expected score. " : ""}Higher is better on offense; lower allowed is better on defense. Shading follows league rank (#1 = best offense, stingiest defense); usage rows rank frequency, not quality.</div>
           <div className="grid lg:grid-cols-2 gap-3">{a.has_ball.map((h) => <HasBallCard key={h.offense} h={h} d={d} onExplore={onExplore} />)}</div>
         </Section>
       )}
@@ -500,6 +504,89 @@ function Matchups({ d, initial }: { d: GameDetail; initial: string }) {
         </table>
       </div>
       <div className="text-[11px] text-gray-500">WR/CB and offensive-line matchups need coverage and blocking charts that no free 2026 feed publishes, so they aren't shown.</div>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Matchups (NBA / NHL / MLB players)
+
+const impliedP = (price: number) => (price < 0 ? -price / (-price + 100) : 100 / (price + 100));
+
+function GroupMatchups({ d, initial }: { d: GameDetail; initial: string }) {
+  const groups = d.analysis?.player_matchups ?? [];
+  const [k, setK] = useState(groups.some((g) => g.key === initial) ? initial : groups[0]?.key ?? "");
+  const [team, setTeam] = useState("all");
+  const [q, setQ] = useState("");
+  const g: MatchupGroup | undefined = groups.find((x) => x.key === k);
+  if (!g) return <Msg>No player matchups (needs a frozen model forecast for this game).</Msg>;
+  const rows = g.rows.filter((p) => (team === "all" || p.team === team) && (!q || p.name.toLowerCase().includes(q.toLowerCase())));
+  return (
+    <Section title={g.label} sub="The model's projection, the main book line with our probability of the over, and how the opponent ranks at what it allows this player type"
+      right={<div className="flex gap-2">
+        <select value={team} onChange={(e) => setTeam(e.target.value)} className="bg-surface border border-glass rounded-md px-2 py-1.5 text-sm">
+          <option value="all">All teams</option><option value={d.event.away.abbr}>{d.event.away.abbr}</option><option value={d.event.home.abbr}>{d.event.home.abbr}</option></select>
+        <div className="relative"><Search size={13} className="absolute left-2.5 top-2.5 text-gray-500" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search players..." className="w-48 bg-surface border border-glass rounded-md pl-8 pr-2 py-1.5 text-sm" /></div></div>}>
+      <div className="flex gap-1 flex-wrap">{groups.map((x) => (
+        <button key={x.key} onClick={() => setK(x.key)} className={clsx("px-3 py-1.5 rounded-md text-sm", k === x.key ? "bg-white/10 text-gray-100" : "text-gray-400 hover:bg-white/5")}>{x.label}</button>))}</div>
+      <div className="overflow-x-auto rounded-lg border border-glass">
+        <table className="w-full text-sm">
+          <thead className="text-[10px] uppercase tracking-wider text-gray-500 bg-surface"><tr>
+            <th className="text-left px-3 py-2">Player</th>{g.cols.map((c) => <th key={c.key} className="px-3 py-2 text-right">{c.label}</th>)}
+            <th className="px-3 py-2 text-center">Opponent</th></tr></thead>
+          <tbody>{rows.map((p) => {
+            const o = p.opp_allows;
+            const soft = o?.rank != null && o.rank > (o.of * 2) / 3;
+            const tough = o?.rank != null && o.rank <= o.of / 3;
+            return (
+              <tr key={`${p.team}-${p.id}`} className="border-t border-glass">
+                <td className="px-3 py-2"><div className="font-medium">{p.name}</div><div className="text-[11px] text-gray-500">{p.pos} · {p.team} · vs {p.opponent}</div></td>
+                {g.cols.map((c) => {
+                  const s = p.stats[c.key];
+                  if (!s || s.mean == null) return <td key={c.key} className="px-3 py-2 text-right text-gray-600">—</td>;
+                  const beats = s.p_over != null && s.price != null && s.p_over > impliedP(s.price);
+                  return (
+                    <td key={c.key} className="px-3 py-2 text-right">
+                      <div className="font-mono">{s.mean.toFixed(s.mean < 10 ? 2 : 1)}</div>
+                      {s.line != null && (
+                        <div className="text-[10px] text-gray-500" title={`${bookName(s.book ?? "")} over ${s.line} ${fmtOdds(s.price ?? 0)}`}>
+                          o{s.line} <span className={clsx(beats && "text-emerald-light")}>{s.p_over != null ? pct(s.p_over, 0) : ""}</span></div>)}
+                    </td>);
+                })}
+                <td className="px-3 py-2 text-center text-xs">
+                  {o ? (
+                    <>
+                      <div>{p.opp_side === "offense" ? `${p.opponent} ${o.label}` : `${o.label} allowed`}: <span className="font-mono">{fmtMetric(o)}</span></div>
+                      <div className={clsx("font-medium", soft ? "text-emerald-light" : tough ? "text-crimson-light" : "text-gray-400")}>#{o.rank ?? "—"} of {o.of}{soft ? " · soft" : tough ? " · tough" : ""}</div>
+                    </>) : "—"}
+                </td>
+              </tr>);
+          })}</tbody>
+        </table>
+      </div>
+      <div className="text-[11px] text-gray-500">Under each projection: the main book's over line and our probability of the over (green when it beats the price). Opponent rank: #1 = toughest matchup for this player type, higher = softer.</div>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Game / weekly report
+
+function Report({ d }: { d: GameDetail }) {
+  const r = d.report;
+  if (!r || !r.sections.length) return <Msg>No report for this game yet.</Msg>;
+  const e = d.event;
+  const ask = `Write a betting preview for ${e.away.name} at ${e.home.name}: where the model disagrees with the market, the matchup keys, injuries and the props worth a look.`;
+  return (
+    <Section title={d.sport === "nfl" ? "Weekly report" : "Game report"}
+      sub={`Written from the model, market, matchup ranks, injuries and form · updated ${new Date(r.generated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`}
+      right={<Link to={`/monster-gpt?${new URLSearchParams({ q: ask, sport: d.sport, game: e.id })}`} className="inline-flex items-center gap-1.5 rounded-md bg-violet/20 px-3 py-1.5 text-sm text-violet-light hover:bg-violet/30"><Bot size={14} />Deeper take from MonsterGPT</Link>}>
+      <div className="grid gap-3">{r.sections.map((s) => (
+        <div key={s.title} className="rounded-lg border border-glass bg-surface/60 p-4">
+          <div className="text-[10px] uppercase tracking-wider text-violet-light font-medium mb-2">{s.title}</div>
+          <div className="space-y-2">{s.paragraphs.map((p, i) => <p key={i} className="text-sm text-gray-200 leading-relaxed">{p}</p>)}</div>
+        </div>))}</div>
     </Section>
   );
 }
