@@ -785,6 +785,7 @@ async fn main() -> std::io::Result<()> {
             .route("/hub/brief", web::get().to(game_hub::find_brief))
             .route("/hub/{sport}/game/{id}", web::get().to(game_hub::game))
             .route("/hub/{sport}/game/{id}/brief", web::get().to(game_hub::game_brief))
+            .route("/hub/{sport}/game/{id}/live", web::get().to(game_hub::live))
     })
     .bind(("0.0.0.0", port))?
     .run()

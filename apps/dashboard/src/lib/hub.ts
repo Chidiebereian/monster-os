@@ -91,7 +91,9 @@ export interface BookQuote { market: string; side: string; line: number | null; 
 export interface Edge { market: string; side: string; line: number | null; price: number; book: string; p_model: number; p_implied: number; edge: number; ev: number }
 export interface ProjStat {
   mean: number | null; q10: number | null; q50: number | null; q90: number | null;
-  books?: { side: string; line: number | null; price: number; book: string; link: string | null; p_model: number | null }[];
+  /** p_model = blended like AI Picks; p_raw = the engine alone; flag "implausible" = gap past the max-edge sanity check */
+  books?: { side: string; line: number | null; price: number; book: string; link: string | null; p_model: number | null; p_raw?: number | null; p_market?: number | null; flag?: string | null }[];
+  recent?: { avg: number; games: number };
 }
 export interface ProjPlayer { id: string; name: string; pos: string | null; role: string | null; team: string; stats: Record<string, ProjStat> }
 export interface HubPick {
@@ -134,7 +136,32 @@ export const hub = {
     return get<Schedule>(`/hub/${sport}/schedule?${p}`);
   },
   game: (sport: HubSport, id: string) => get<GameDetail>(`/hub/${sport}/game/${id}`),
+  live: (sport: HubSport, id: string) => get<LiveGame>(`/hub/${sport}/game/${id}/live`),
 };
+
+// ---- live scoreboard ----
+export interface LivePlayer { id: string | null; name: string; key: string; team: string; group: string; stats: Record<string, number> }
+export interface LiveGame {
+  id: string; sport: HubSport; fetched_at: string;
+  status: { state: "pre" | "in" | "post" | null; detail: string | null; clock: string | null; period: number | null; completed: boolean };
+  teams: { side: "home" | "away"; id: string | null; abbr: string; logo: string | null; score: number | null; linescores: (number | null)[]; possession: boolean }[];
+  box: { team: string; logo: string | null; groups: { name: string; title: string | null; labels: string[]; totals: string[] | null;
+    rows: { id: string | null; name: string; short: string | null; pos: string | null; starter: boolean; dnp: boolean; reason: string | null; stats: string[] }[] }[] }[];
+  team_stats: { team: string; stats: { label: string; value: string | null }[] }[];
+  players: LivePlayer[];
+  plays: { id: string; period: number | null; period_label: string | null; clock: string | null; text: string; away: number | null; home: number | null; scoring: boolean; team_id: string | null }[];
+  win_prob: { home: number; series: number[] } | null;
+  situation: { down_distance: string | null; possession: string | null; last_play: string | null; balls: number | null; strikes: number | null; outs: number | null;
+    on_first: boolean; on_second: boolean; on_third: boolean } | null;
+}
+
+/** Same key as the backend: "Shea Theodore" / "S. Theodore" -> "s theodore". */
+export function nameKey(name: string): string {
+  const parts = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[.',-]/g, " ").split(/\s+/)
+    .filter((w) => w && !["jr", "sr", "ii", "iii", "iv", "v"].includes(w));
+  if (parts.length < 2) return parts[0] ?? "";
+  return `${parts[0][0]} ${parts[parts.length - 1]}`;
+}
 
 // ---- formatting ----
 export const fmtOdds = (p: number | null | undefined) => (p == null ? "—" : p > 0 ? `+${p}` : `${p}`);

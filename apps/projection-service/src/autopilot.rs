@@ -65,6 +65,7 @@ pub fn spawn(state: web::Data<State>) {
     }
     println!("projection-service: learning autopilot on (tick {TICK_SECS}s, tuner window {TUNE_WINDOW_UTC:?} UTC)");
     let s2 = state.clone();
+    let s3 = state.clone();
     actix_web::rt::spawn(async move {
         actix_web::rt::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
@@ -75,6 +76,18 @@ pub fn spawn(state: web::Data<State>) {
                 }
             }
             actix_web::rt::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+        }
+    });
+    // Live scoreboard (game_hub.rs): every minute, warm in-progress games' live
+    // data and the pages of games starting within 90 minutes
+    actix_web::rt::spawn(async move {
+        actix_web::rt::time::sleep(std::time::Duration::from_secs(90)).await;
+        loop {
+            if !paused(&s3.db).await {
+                let v = crate::game_hub::live_warm(&s3).await;
+                if due(&s3.db, "hub:live", 5).await { mark(&s3.db, "hub:live", true, &v).await; }
+            }
+            actix_web::rt::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
     actix_web::rt::spawn(async move {
@@ -528,6 +541,7 @@ pub async fn status(state: web::Data<State>, q: web::Query<PauseQuery>, req: act
             "freeze": format!("champion + shadows: projected lineup within {PROJECTED_HOURS} h of the start, confirmed lineup within {CONFIRMED_MINUTES} min (NFL: the days before; confirmed the day before)"),
             "tune": format!("one proposal per engine per day, {:02}:00–{:02}:00 UTC; search season + holdout of the latest {TUNE_GAMES} games, {TUNE_N} sims x {TUNE_DRAWS} draws", TUNE_WINDOW_UTC.start, TUNE_WINDOW_UTC.end),
             "promote": "a shadow is promoted after enough paired live games with no market worse by 2 SE; the old champion stays as a shadow and is restored if the new one falls 2 SE behind",
+            "hub_live": "Live scoreboard every minute (background loop): live box score, plays and win probability warmed for games in progress, and full game pages for games starting within 90 min (status recorded every 5 min)",
             "hub": "Games page every 3 h (background loop): NFL EPA/success/PROE + FTN charting + nflverse schedule for the current season, and today's schedules pre-warmed for every sport",
             "parlays": "Parlay Builder every 30 min per sport (background loop): simulate today's and tomorrow's slates with the champion engines, store the best tickets per market and leg count, refresh open tickets' prices, grade finished ones; daily test of the dependence weight (promoted only on a significant out-of-sample gain)",
             "picks": "AI Picks every 20 min per sport: ESPN lines each run, The Odds API at most every 6 h and SportsGameOdds every 4 h within daily budgets; reprice from the champions' frozen forecasts; settle finished games every tick",

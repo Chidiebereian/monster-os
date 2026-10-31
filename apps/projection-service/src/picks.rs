@@ -315,6 +315,53 @@ pub(crate) async fn champions(db: &tokio_postgres::Client) -> Result<HashMap<Str
         .iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect())
 }
 
+
+// ---------------------------------------------------------------------------
+// Prop pricer for the Games hub: the same blend and sanity check AI Picks uses
+// ---------------------------------------------------------------------------
+
+/// Turns the engine's raw prop probability into the number AI Picks would
+/// publish: blended toward the player's own history (naive baseline) and the
+/// market by the weights fitted on evidence, with the max-edge sanity check.
+pub(crate) struct PropPricer {
+    ev: HashMap<(String, String), Vec<Evidence>>,
+    default_w: f64,
+    pub max_edge: f64,
+    hist: HashMap<String, Vec<(HashMap<&'static str, f64>, String)>>,
+}
+
+impl PropPricer {
+    pub async fn load(db: &tokio_postgres::Client, sport: &str, ids: &[String]) -> Result<Self, String> {
+        let champs = champions(db).await?;
+        Ok(Self {
+            ev: evidence(db, &champs).await?,
+            default_w: lines::setting(db, "blend_default_w", 0.2).await,
+            max_edge: lines::setting(db, "max_edge", 0.25).await,
+            hist: player_history(db, sport, ids).await?,
+        })
+    }
+    fn values(&self, subject: &str, stat: &str) -> Vec<f64> {
+        self.hist.get(subject).map(|h| h.iter().filter_map(|(m, _)| m.get(stat).copied()).collect()).unwrap_or_default()
+    }
+    /// The player's own frequency over the line (needs 5+ games).
+    pub fn naive_over(&self, subject: &str, stat: &str, line: f64) -> Option<f64> {
+        let v = self.values(subject, stat);
+        if v.len() < 5 { return None; }
+        Some(blend::freq_over(&v, line))
+    }
+    /// Mean of the last 10 games (and how many there were).
+    pub fn recent(&self, subject: &str, stat: &str) -> Option<(f64, usize)> {
+        let v: Vec<f64> = self.values(subject, stat).into_iter().take(10).collect();
+        if v.is_empty() { return None; }
+        Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
+    }
+    /// Final P(side): model, blended toward naive (props) and the market.
+    pub fn blend(&self, engine: &str, market: &str, p_raw: f64, p_naive: Option<f64>, p_market: f64) -> f64 {
+        let w = blend::weights(self.ev.get(&(engine.to_string(), market.to_string())).map(|v| v.as_slice()).unwrap_or(&[]), self.default_w);
+        blend::apply(&w, p_raw, p_naive, p_market)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------

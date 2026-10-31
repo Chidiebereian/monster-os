@@ -26,7 +26,8 @@ export function Games() {
     for (const [k, v] of Object.entries(o)) { if (v == null) p.delete(k); else p.set(k, v); }
     setParams(p, { replace: true });
   };
-  const sched = useQuery({ queryKey: ["hub-schedule", sport, week, date], queryFn: () => hub.schedule(sport, { week, date }), refetchInterval: 60_000 });
+  const sched = useQuery({ queryKey: ["hub-schedule", sport, week, date], queryFn: () => hub.schedule(sport, { week, date }),
+    refetchInterval: (qq) => (qq.state.data?.games.some((g) => g.status.state === "in") ? 20_000 : 60_000) });
   const d = sched.data;
   useEffect(() => setDay("all"), [sport, week, date]);
 

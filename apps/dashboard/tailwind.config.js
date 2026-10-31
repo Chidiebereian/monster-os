@@ -10,7 +10,7 @@ export default {
         glass: "rgba(255,255,255,0.08)",
         emerald: { DEFAULT: "#10B981", light: "#34D399" },
         crimson: { DEFAULT: "#EF4444", light: "#F87171" },
-        violet: { DEFAULT: "#8B5CF6", indigo: "#6366F1" },
+        violet: { DEFAULT: "#8B5CF6", light: "#A78BFA", indigo: "#6366F1" },
         amber: { DEFAULT: "#F59E0B" },
       },
       fontFamily: {

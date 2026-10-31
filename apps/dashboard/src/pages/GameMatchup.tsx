@@ -8,6 +8,7 @@ import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import { ArrowLeft, Bot, CloudSun, ExternalLink, Home, Info, Loader2, Search, Wind } from "lucide-react";
 import { Msg } from "../components/ui";
+import { LiveGame } from "../components/LiveGame";
 import { Quote } from "./Games";
 import {
   hub, fmtOdds, fmtLine, fmtMetric, fmtVsLeague, bookName, usableLink, statLabel,
@@ -21,10 +22,13 @@ export function GameMatchup() {
   const { sport = "nfl", id = "" } = useParams<{ sport: HubSport; id: string }>();
   const [params, setParams] = useSearchParams();
   const nav = useNavigate();
-  const q = useQuery({ queryKey: ["hub-game", sport, id], queryFn: () => hub.game(sport as HubSport, id), refetchInterval: 120_000 });
+  const q = useQuery({ queryKey: ["hub-game", sport, id], queryFn: () => hub.game(sport as HubSport, id),
+    refetchInterval: (qq) => (qq.state.data?.event.status.state === "in" ? 30_000 : 120_000) });
   const d = q.data;
   const nfl = sport === "nfl";
+  const gameState = d?.event.status.state;
   const tabs = useMemo(() => [
+    ...(gameState && gameState !== "pre" ? [{ key: "live", label: gameState === "in" ? "● Live" : "Box score" }] : []),
     { key: "overview", label: "Overview" },
     { key: "rankings", label: "Rankings" },
     { key: "projections", label: "Projections" },
@@ -36,8 +40,8 @@ export function GameMatchup() {
     ...(nfl ? [{ key: "coaching", label: "Coaching" }, { key: "situations", label: "Situations" }] : []),
     { key: "teamstats", label: "Team stats" },
     { key: "weather", label: "Weather" },
-  ], [nfl, d?.picks.length, d?.analysis?.player_matchups?.length]);
-  const tab = params.get("tab") ?? "overview";
+  ], [nfl, d?.picks.length, d?.analysis?.player_matchups?.length, gameState]);
+  const tab = params.get("tab") ?? (gameState === "in" ? "live" : "overview");
   const setTab = (t: string, extra: Record<string, string> = {}) => { const p = new URLSearchParams(params); p.set("tab", t); for (const [k, v] of Object.entries(extra)) p.set(k, v); setParams(p, { replace: true }); };
 
   if (q.isLoading) return <Msg><Loader2 size={14} className="inline animate-spin mr-2" />Loading matchup…</Msg>;
@@ -60,6 +64,7 @@ export function GameMatchup() {
         ))}
       </div>
       {a.error && <Msg tone="error">Analytics: {a.error}</Msg>}
+      {tab === "live" && <LiveGame d={d} />}
       {tab === "overview" && <Overview d={d} onExplore={(k) => setTab("matchups", { m: k })} />}
       {tab === "rankings" && <Rankings d={d} />}
       {tab === "projections" && <Projections d={d} />}
@@ -405,12 +410,15 @@ function Projections({ d }: { d: GameDetail }) {
                         return (
                           <td key={k} className="px-3 py-2 text-right whitespace-nowrap cursor-pointer hover:bg-white/5" onClick={() => setOpen(open === key ? null : key)}>
                             <div className="font-mono text-violet-light">{s?.mean != null ? (s.mean < 1 && ["tds", "rec_td", "rush_td", "pass_td", "goals", "hr"].includes(k) ? `${(s.mean * 100).toFixed(0)}%*` : s.mean.toFixed(2)) : "—"}</div>
-                            {o && <div className="text-[11px] text-gray-400">O {o.line} <span className="font-mono">{fmtOdds(o.price)}</span>{o.p_model != null && <span className={clsx("ml-1", o.p_model > implied(o.price) ? "text-emerald-light" : "text-gray-500")}>{pct(o.p_model, 0)}</span>}</div>}
-                            {u && <div className="text-[11px] text-gray-400">U {u.line} <span className="font-mono">{fmtOdds(u.price)}</span>{u.p_model != null && <span className={clsx("ml-1", u.p_model > implied(u.price) ? "text-emerald-light" : "text-gray-500")}>{pct(u.p_model, 0)}</span>}</div>}
+                            {[o, u].map((b) => b && (
+                              <div key={b.side} className="text-[11px] text-gray-400">{b.side === "over" ? "O" : "U"} {b.line} <span className="font-mono">{fmtOdds(b.price)}</span>
+                                {b.flag === "implausible"
+                                  ? <span className="ml-1 text-amber-400" title={`Raw model ${pct(b.p_raw, 0)} vs market ${pct(b.p_market, 0)}: a gap this large is almost always a minutes, role or data problem, so it's set aside (AI Picks won't publish it).`}>set aside</span>
+                                  : b.p_model != null && <span className={clsx("ml-1", b.p_model > implied(b.price) ? "text-emerald-light" : "text-gray-500")}>{pct(b.p_model, 0)}</span>}</div>))}
                             {open === key && s?.books && (
                               <div className="mt-1 text-[10px] text-gray-500 text-left space-y-0.5">{s.books.map((b, i) => (
-                                <div key={i}>{bookName(b.book)} {b.side === "over" ? "O" : "U"} {b.line} {fmtOdds(b.price)} · model {pct(b.p_model, 0)}</div>))}
-                                <div>80% range {s.q10}-{s.q90}</div></div>)}
+                                <div key={i}>{bookName(b.book)} {b.side === "over" ? "O" : "U"} {b.line} {fmtOdds(b.price)} · blended {pct(b.p_model, 0)} · raw {pct(b.p_raw, 0)} · market {pct(b.p_market, 0)}{b.flag === "implausible" ? " · set aside" : ""}</div>))}
+                                <div>80% range {s.q10}-{s.q90}{s.recent ? ` · last ${s.recent.games} avg ${s.recent.avg}` : ""}</div></div>)}
                           </td>);
                       })}
                     </tr>

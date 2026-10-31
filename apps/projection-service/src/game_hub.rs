@@ -76,7 +76,12 @@ fn team_json(sport: &str, c: &Value) -> Value {
     json!({
         "id": s(&t["id"]), "abbr": canon(sport, &abbr), "espn_abbr": abbr, "name": s(&t["displayName"]), "short": s(&t["shortDisplayName"]),
         "logo": s(&t["logo"]).or_else(|| t["logos"].as_array().and_then(|l| l.first()).and_then(|l| s(&l["href"]))),
-        "color": s(&t["color"]), "record": record, "score": num(&c["score"]).or_else(|| num(&c["score"]["value"])),
+        "color": s(&t["color"]), "record": record,
+        "score": num(&c["score"]).or_else(|| num(&c["score"]["value"])).or_else(|| {
+            // the summary header drops `score` mid-game: add up the periods
+            let ls: Vec<f64> = c["linescores"].as_array()?.iter().filter_map(|l| num(&l["displayValue"]).or_else(|| num(&l["value"]))).collect();
+            if ls.is_empty() { None } else { Some(ls.iter().sum()) }
+        }),
         "home_away": s(&c["homeAway"]),
     })
 }
@@ -282,7 +287,7 @@ async fn schedule_inner(state: &State, sport: &str, q: &ScheduleQ) -> Result<Val
         meta["days"] = json!((-3..=6).map(|i| date + CDuration::days(i)).collect::<Vec<_>>());
         format!("https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard?dates={}&limit=100", date.format("%Y%m%d"))
     };
-    let sb = espn(state, &url, Duration::from_secs(120)).await?;
+    let sb = espn(state, &url, Duration::from_secs(30)).await?;
     let mut events: Vec<Value> = sb["events"].as_array().map(|a| a.iter().filter_map(|e| event_json(sport, e)).collect()).unwrap_or_default();
     if let Some(byes) = sb["week"]["teamsOnBye"].as_array() {
         meta["byes"] = json!(byes.iter().filter_map(|t| s(&t["abbreviation"])).map(|a| canon(sport, &a)).collect::<Vec<_>>());
@@ -421,6 +426,9 @@ async fn game_inner(state: &State, sport: &str, id: &str) -> Result<Value, Strin
 
     // projections (players in the frozen sim) with book props
     let props = prop_lines(&state.db, sport, &gid).await?;
+    let subj: Vec<String> = props.keys().map(|k| k.0.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    // the AI Picks blend + sanity check, so hub probabilities match what Picks would publish
+    let pricer = crate::picks::PropPricer::load(&state.db, sport, &subj).await.ok();
     let mut proj_by_id: HashMap<String, Value> = HashMap::new();
     let projections = led.as_ref().map(|l| {
         let mut out = json!({});
@@ -434,10 +442,26 @@ async fn game_inner(state: &State, sport: &str, id: &str) -> Result<Value, Strin
                         let mut row = json!({ "mean": mean_of(v).map(|x| (x * 100.0).round() / 100.0), "q10": v["q10"], "q50": v["q50"], "q90": v["q90"] });
                         if let Some(qs) = props.get(&(pid.clone(), k.clone())) {
                             row["books"] = json!(qs.iter().map(|q| {
-                                let pu = q.line.and_then(|ln| p_over_under(v, ln));
+                                let p_raw = q.line.and_then(|ln| p_over_under(v, ln))
+                                    .map(|(o, u)| { let t = (o + u).max(1e-9); if q.side == "over" { o / t } else { u / t } });
+                                // market: no-vig against the other side at the same book and line
+                                let p_market = match qs.iter().find(|x| x.book == q.book && x.side != q.side && x.line == q.line) {
+                                    Some(o) => { let (a, b) = (implied(q.price), implied(o.price)); a / (a + b) }
+                                    None => implied(q.price),
+                                };
+                                let (p_model, flag) = match (p_raw, &pricer, q.line) {
+                                    (Some(pr), Some(pz), Some(ln)) => {
+                                        let naive = pz.naive_over(&pid, k, ln).map(|o| if q.side == "over" { o } else { 1.0 - o });
+                                        (Some(pz.blend(sport, k, pr, naive, p_market)), (pr - p_market > pz.max_edge).then_some("implausible"))
+                                    }
+                                    (pr, _, _) => (pr, None),
+                                };
                                 json!({ "side": q.side, "line": q.line, "price": q.price, "book": q.book, "link": q.link,
-                                    "p_model": pu.map(|(o, u)| r3(if q.side == "over" { o } else { u })) })
+                                    "p_model": p_model.map(r3), "p_raw": p_raw.map(r3), "p_market": r3(p_market), "flag": flag })
                             }).collect::<Vec<_>>());
+                            if let Some((avg, n)) = pricer.as_ref().and_then(|pz| pz.recent(&pid, k)) {
+                                row["recent"] = json!({ "avg": r1(avg), "games": n });
+                            }
                         }
                         stats[k] = row;
                     }
@@ -1066,31 +1090,51 @@ pub fn report(g: &Value) -> Value {
     }).collect();
     push("Form", form);
 
-    // props to watch: where the model clears the price most
+    // props to watch: the blended probability (same as AI Picks) against the
+    // no-vig market, positive EV at the quoted price; implausible gaps set aside
     let mut props: Vec<(f64, String, String)> = Vec::new();
+    let mut aside: Vec<(f64, String, String)> = Vec::new();
     for side in ["away", "home"] {
         for p in g["projections"][side].as_array().into_iter().flatten() {
+            let name = p["name"].as_str().unwrap_or("").to_string();
             for (k, st) in p["stats"].as_object().into_iter().flatten() {
                 for b in st["books"].as_array().into_iter().flatten() {
                     let (Some(pm), Some(price), Some(line)) = (b["p_model"].as_f64(), b["price"].as_i64(), b["line"].as_f64()) else { continue };
-                    let imp = implied(price as i32);
-                    if pm - imp > 0.03 {
-                        let name = p["name"].as_str().unwrap_or("").to_string();
-                        props.push((pm - imp, name.clone(), format!("{name} {} {line} {k} at {} ({}): model {} vs {} implied, projection {:.1}.",
-                            b["side"].as_str().unwrap_or(""), odds_s(price), b["book"].as_str().unwrap_or(""),
-                            pct0(pm), pct0(imp), st["mean"].as_f64().unwrap_or(0.0))));
+                    let mk = b["p_market"].as_f64().unwrap_or_else(|| implied(price as i32));
+                    let proj = st["mean"].as_f64().unwrap_or(0.0);
+                    let recent = st["recent"]["avg"].as_f64().map(|a| match st["recent"]["games"].as_u64().unwrap_or(0) {
+                        1 => format!(", only 1 recent game ({a:.1})"), n => format!(", last-{n} avg {a:.1}") }).unwrap_or_default();
+                    let sd = b["side"].as_str().unwrap_or("");
+                    if b["flag"] == "implausible" {
+                        let raw = b["p_raw"].as_f64().unwrap_or(pm);
+                        aside.push((raw - mk, name.clone(), format!("{name} {sd} {line} {}: raw model {} vs market {} (projection {proj:.1}{recent})",
+                            crate::picks::stat_label(k).to_lowercase(), pct0(raw), pct0(mk))));
+                        continue;
+                    }
+                    let ev = pm * payout(price as i32) - (1.0 - pm);
+                    if pm - mk > 0.02 && ev > 0.0 {
+                        props.push((pm - mk, name.clone(), format!("{name} {sd} {line} {} at {} ({}): {} vs {} market, projection {proj:.1}{recent}.",
+                            crate::picks::stat_label(k).to_lowercase(), odds_s(price), b["book"].as_str().unwrap_or(""), pct0(pm), pct0(mk))));
                     }
                 }
             }
         }
     }
-    props.sort_by(|x, y| y.0.total_cmp(&x.0));
-    let mut seen = std::collections::HashSet::new();
-    let watch: Vec<String> = props.into_iter().filter(|(_, k, _)| seen.insert(k.clone())).take(5).map(|x| x.2).collect();
-    if !watch.is_empty() {
-        let mut w = watch;
-        w.push("Prop gaps are raw model vs price; AI Picks applies the track-record grade caps before publishing anything.".into());
-        push("Props to watch", w);
+    let top = |mut v: Vec<(f64, String, String)>, n: usize| -> Vec<String> {
+        v.sort_by(|x, y| y.0.total_cmp(&x.0));
+        let mut seen = std::collections::HashSet::new();
+        v.into_iter().filter(|(_, k, _)| seen.insert(k.clone())).take(n).map(|x| x.2).collect()
+    };
+    let mut watch = top(props, 5);
+    let aside = top(aside, 3);
+    if !watch.is_empty() || !aside.is_empty() {
+        if watch.is_empty() { watch.push("No prop clears the price once the model is blended with the player's history and the market.".into()); }
+        else { watch.push("Probabilities are blended like AI Picks (model, the player's own history, the no-vig market), before its track-record grade caps.".into()); }
+        if !aside.is_empty() {
+            watch.push(format!("Set aside (model and market disagree by more than {} points, which is almost always a minutes, role or data problem rather than an edge): {}.",
+                25, aside.join("; ")));
+        }
+        push("Props to watch", watch);
     }
 
     // picks
@@ -1102,6 +1146,165 @@ pub fn report(g: &Value) -> Value {
         push("AI picks", vec![format!("{} published for this game. Top: {}.", picks.len(), top.join("; "))]);
     }
     json!({ "generated_at": Utc::now(), "sections": secs })
+}
+
+// ---------------------------------------------------------------------------
+// Live scoreboard: GET /hub/{sport}/game/{id}/live (ESPN, ~15 s cache)
+// ---------------------------------------------------------------------------
+
+/// "Shea Theodore" / "S. Theodore" / "Kenneth Walker III" -> "s theodore" / "k walker".
+pub fn name_key(name: &str) -> String {
+    let clean: String = name.chars().map(|c| match c {
+        'á' | 'à' | 'ä' | 'â' | 'ã' => 'a', 'é' | 'è' | 'ë' | 'ê' => 'e', 'í' | 'ì' | 'ï' | 'î' => 'i', 'ó' | 'ò' | 'ö' | 'ô' | 'õ' => 'o',
+        'ú' | 'ù' | 'ü' | 'û' => 'u', 'ñ' => 'n', 'ç' => 'c', 'Á' => 'a', 'É' => 'e', 'Í' => 'i', 'Ó' => 'o', 'Ú' => 'u',
+        '.' | '\'' | ',' => ' ', '-' => ' ', c => c,
+    }).collect::<String>().to_lowercase();
+    let parts: Vec<&str> = clean.split_whitespace().filter(|w| !matches!(*w, "jr" | "sr" | "ii" | "iii" | "iv" | "v")).collect();
+    match (parts.first(), parts.last()) {
+        (Some(f), Some(l)) if parts.len() > 1 => format!("{} {}", &f[..f.char_indices().nth(1).map(|x| x.0).unwrap_or(f.len())], l),
+        (Some(f), _) => f.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn split_pair(s: &str) -> Option<(f64, f64)> {
+    let (a, b) = s.split_once(['-', '/'])?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// ESPN box-score row -> our stat keys (the same keys as the projections).
+fn live_stats(sport: &str, group: &str, labels: &[String], vals: &[String]) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    let get = |l: &str| labels.iter().position(|x| x == l).and_then(|i| vals.get(i)).map(|s| s.as_str());
+    let n = |l: &str| get(l).and_then(|s| s.trim_start_matches('+').parse::<f64>().ok());
+    let mut put = |k: &str, v: Option<f64>| if let Some(v) = v { m.insert(k.into(), json!(v)); };
+    match sport {
+        "nba" => {
+            let (pts, reb, ast, stl, blk) = (n("PTS"), n("REB"), n("AST"), n("STL"), n("BLK"));
+            put("min", n("MIN")); put("pts", pts); put("reb", reb); put("ast", ast); put("stl", stl); put("blk", blk); put("tov", n("TO"));
+            put("oreb", n("OREB")); put("dreb", n("DREB"));
+            if let Some((a, b)) = get("FG").and_then(split_pair) { put("fgm", Some(a)); put("fga", Some(b)); }
+            if let Some((a, b)) = get("3PT").and_then(split_pair) { put("fg3m", Some(a)); put("fg3a", Some(b)); }
+            if let Some((a, b)) = get("FT").and_then(split_pair) { put("ftm", Some(a)); put("fta", Some(b)); }
+            if let (Some(p), Some(r), Some(a)) = (pts, reb, ast) { put("pra", Some(p + r + a)); put("pr", Some(p + r)); put("pa", Some(p + a)); put("ra", Some(r + a)); }
+            if let (Some(s), Some(b)) = (stl, blk) { put("stocks", Some(s + b)); }
+        }
+        "nhl" => {
+            if group == "goalies" { put("saves", n("SV")); put("goals_against", n("GA")); }
+            else {
+                let (g, a) = (n("G"), n("A"));
+                put("goals", g); put("assists", a); put("sog", n("SOG")); put("blocks", n("BS")); put("hits", n("HT"));
+                if let (Some(g), Some(a)) = (g, a) { put("points", Some(g + a)); }
+            }
+        }
+        "mlb" => {
+            if labels.iter().any(|l| l == "IP") {
+                // pitching: innings "5.2" = 17 outs
+                if let Some(ip) = get("IP") { let (w, f) = ip.split_once('.').unwrap_or((ip, "0")); if let (Ok(w), Ok(f)) = (w.parse::<f64>(), f.parse::<f64>()) { put("outs", Some(w * 3.0 + f)); } }
+                put("k", n("K")); put("h", n("H")); put("er", n("ER")); put("r", n("R")); put("bb", n("BB")); put("hr", n("HR"));
+            } else {
+                let (h, r, rbi) = (n("H"), n("R"), n("RBI"));
+                put("h", h); put("r", r); put("rbi", rbi); put("hr", n("HR")); put("bb", n("BB")); put("k", n("K")); put("ab", n("AB"));
+                if let (Some(h), Some(r), Some(b)) = (h, r, rbi) { put("hrr", Some(h + r + b)); }
+            }
+        }
+        "nfl" => match group {
+            "passing" => {
+                if let Some((c, a)) = get("C/ATT").and_then(split_pair) { put("completions", Some(c)); put("pass_att", Some(a)); }
+                put("pass_yds", n("YDS")); put("pass_td", n("TD")); put("interceptions", n("INT"));
+            }
+            "rushing" => { put("carries", n("CAR")); put("rush_yds", n("YDS")); put("rush_td", n("TD")); }
+            "receiving" => { put("receptions", n("REC")); put("rec_yds", n("YDS")); put("rec_td", n("TD")); put("targets", n("TGTS")); }
+            "kicking" => {
+                if let Some((a, _)) = get("FG").and_then(split_pair) { put("fgm", Some(a)); }
+                if let Some((a, _)) = get("XP").and_then(split_pair) { put("xpm", Some(a)); }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    m
+}
+
+pub async fn live(state: web::Data<State>, path: web::Path<(String, String)>) -> impl Responder {
+    let (sport, id) = path.into_inner();
+    match live_inner(&state, &sport, &id).await { Ok(v) => HttpResponse::Ok().json(v), Err(e) => err(e) }
+}
+
+async fn live_inner(state: &State, sport: &str, id: &str) -> Result<Value, String> {
+    let path = espn_path(sport).ok_or("unknown sport")?;
+    let sum = espn(state, &format!("https://site.api.espn.com/apis/site/v2/sports/{path}/summary?event={id}"), Duration::from_secs(15)).await?;
+    let comp = &sum["header"]["competitions"][0];
+    let st = &comp["status"];
+    let teams: Vec<Value> = comp["competitors"].as_array().into_iter().flatten().map(|c| {
+        let lines: Vec<Option<f64>> = c["linescores"].as_array().into_iter().flatten().map(|l| num(&l["displayValue"]).or_else(|| num(&l["value"]))).collect();
+        let score = num(&c["score"]).or_else(|| if lines.is_empty() { None } else { Some(lines.iter().flatten().sum()) });
+        json!({ "side": c["homeAway"], "id": s(&c["team"]["id"]), "abbr": canon(sport, &s(&c["team"]["abbreviation"]).unwrap_or_default()),
+            "logo": s(&c["team"]["logos"][0]["href"]).or_else(|| s(&c["team"]["logo"])), "score": score, "linescores": lines,
+            "possession": c["possession"].as_bool().unwrap_or(false) })
+    }).collect();
+
+    // box score: raw ESPN groups for display + our stat keys per player
+    let mut players: Vec<Value> = Vec::new();
+    let boxes: Vec<Value> = sum["boxscore"]["players"].as_array().into_iter().flatten().map(|t| {
+        let team = canon(sport, &s(&t["team"]["abbreviation"]).unwrap_or_default());
+        let groups: Vec<Value> = t["statistics"].as_array().into_iter().flatten().filter_map(|g| {
+            let labels: Vec<String> = g["labels"].as_array()?.iter().filter_map(|x| x.as_str().map(|x| x.to_string())).collect();
+            let gname = s(&g["name"]).or_else(|| s(&g["type"])).unwrap_or_else(|| if labels.iter().any(|l| l == "IP") { "pitching".into() } else { "batting".into() });
+            let rows: Vec<Value> = g["athletes"].as_array().into_iter().flatten().filter_map(|a| {
+                let vals: Vec<String> = a["stats"].as_array()?.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect();
+                let name = s(&a["athlete"]["displayName"])?;
+                let pid = s(&a["athlete"]["id"]);
+                if !vals.is_empty() {
+                    players.push(json!({ "id": pid, "name": name, "key": name_key(&name), "team": team, "group": gname,
+                        "stats": live_stats(sport, &gname, &labels, &vals) }));
+                }
+                Some(json!({ "id": pid, "name": name, "short": s(&a["athlete"]["shortName"]), "pos": s(&a["athlete"]["position"]["abbreviation"]),
+                    "starter": a["starter"].as_bool().unwrap_or(false), "dnp": a["didNotPlay"].as_bool().unwrap_or(false) || vals.is_empty(),
+                    "reason": s(&a["reason"]), "stats": vals }))
+            }).collect();
+            if rows.is_empty() { return None; }
+            let totals: Option<Vec<String>> = g["totals"].as_array().map(|v| v.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect());
+            Some(json!({ "name": gname, "title": s(&g["text"]).or_else(|| s(&g["displayName"])), "labels": labels, "rows": rows, "totals": totals }))
+        }).collect();
+        json!({ "team": team, "logo": s(&t["team"]["logo"]), "groups": groups })
+    }).collect();
+    let team_stats: Vec<Value> = sum["boxscore"]["teams"].as_array().into_iter().flatten().map(|t| json!({
+        "team": canon(sport, &s(&t["team"]["abbreviation"]).unwrap_or_default()),
+        "stats": t["statistics"].as_array().into_iter().flatten().filter_map(|x| Some(json!({ "label": s(&x["label"]).or_else(|| s(&x["name"]))?, "value": s(&x["displayValue"]) })))
+            .collect::<Vec<_>>() })).collect();
+
+    // plays, newest first (NFL keeps them inside drives; MLB drops pitch-by-pitch rows)
+    let mut raw: Vec<Value> = sum["plays"].as_array().cloned().unwrap_or_default();
+    if raw.is_empty() {
+        for d in sum["drives"]["previous"].as_array().into_iter().flatten() { raw.extend(d["plays"].as_array().cloned().unwrap_or_default()); }
+        if let Some(c) = sum["drives"]["current"]["plays"].as_array() { raw.extend(c.iter().cloned()); }
+    }
+    let plays: Vec<Value> = raw.iter().rev().filter(|p| {
+        let ty = p["type"]["type"].as_str().unwrap_or("");
+        !(sport == "mlb" && (p["summaryType"] == "P" || ty.contains("batterpitcher") || ty == "start-inning"))
+            && p["text"].as_str().map(|t| !t.is_empty()).unwrap_or(false)
+    }).take(40).map(|p| json!({
+        "id": p["id"], "period": p["period"]["number"], "period_label": s(&p["period"]["displayValue"]), "clock": s(&p["clock"]["displayValue"]),
+        "text": p["text"], "away": p["awayScore"], "home": p["homeScore"], "scoring": p["scoringPlay"].as_bool().unwrap_or(false),
+        "team_id": s(&p["team"]["id"]) })).collect();
+
+    // ESPN's live win probability (home), thinned to <= 120 points
+    let wp: Vec<f64> = sum["winprobability"].as_array().into_iter().flatten().filter_map(|x| x["homeWinPercentage"].as_f64()).collect();
+    let step = (wp.len() / 120).max(1);
+    let series: Vec<f64> = wp.iter().step_by(step).map(|x| r3(*x)).chain(wp.last().map(|x| r3(*x))).collect();
+
+    Ok(json!({
+        "id": id, "sport": sport, "fetched_at": Utc::now(),
+        "status": { "state": s(&st["type"]["state"]), "detail": s(&st["type"]["shortDetail"]).or_else(|| s(&st["type"]["detail"])),
+            "clock": s(&st["displayClock"]), "period": st["period"], "completed": st["type"]["completed"].as_bool().unwrap_or(false) },
+        "teams": teams, "box": boxes, "team_stats": team_stats, "players": players, "plays": plays,
+        "win_prob": if wp.is_empty() { Value::Null } else { json!({ "home": wp.last(), "series": series }) },
+        "situation": if sum["situation"].is_object() { json!({ "down_distance": s(&sum["situation"]["shortDownDistanceText"]).or_else(|| s(&sum["situation"]["downDistanceText"])),
+            "possession": s(&sum["situation"]["possession"]), "last_play": s(&sum["situation"]["lastPlay"]["text"]),
+            "balls": sum["situation"]["balls"], "strikes": sum["situation"]["strikes"], "outs": sum["situation"]["outs"],
+            "on_first": sum["situation"]["onFirst"].is_object(), "on_second": sum["situation"]["onSecond"].is_object(), "on_third": sum["situation"]["onThird"].is_object() }) } else { Value::Null },
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,10 +1443,51 @@ pub async fn refresh(state: &State) -> Value {
     json!({ "nfl": nfl.unwrap_or_else(|e| json!({ "error": e })), "schedules": warmed })
 }
 
+/// Every minute (autopilot): live data for games in progress, so the Live tab and
+/// scores are warm, and the full game page for games starting within 90 minutes.
+pub async fn live_warm(state: &State) -> Value {
+    let mut out = json!({});
+    for sport in SPORTS {
+        let q = ScheduleQ { season: None, week: None, date: None };
+        let Ok(sch) = schedule_inner(state, sport, &q).await else { continue };
+        let (mut live, mut soon) = (0, 0);
+        for g in sch["games"].as_array().into_iter().flatten() {
+            let Some(id) = g["id"].as_str() else { continue };
+            match g["status"]["state"].as_str() {
+                Some("in") => { if live_inner(state, sport, id).await.is_ok() { live += 1; } }
+                Some("pre") => {
+                    let mins = g["start"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| (t.with_timezone(&Utc) - Utc::now()).num_minutes()).unwrap_or(i64::MAX);
+                    if (0..=90).contains(&mins) && game_inner(state, sport, id).await.is_ok() { soon += 1; }
+                }
+                _ => {}
+            }
+        }
+        out[*sport] = json!({ "live": live, "starting_soon": soon });
+    }
+    out
+}
+
 pub async fn refresh_http(state: web::Data<State>) -> impl Responder { HttpResponse::Ok().json(refresh(&state).await) }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_name_keys_and_stats() {
+        assert_eq!(name_key("Shea Theodore"), "s theodore");
+        assert_eq!(name_key("S. Theodore"), "s theodore");
+        assert_eq!(name_key("Kenneth Walker III"), "k walker");
+        assert_eq!(name_key("Yandy D\u{ed}az"), "y diaz");
+        let l: Vec<String> = ["MIN", "PTS", "FG", "3PT", "REB", "AST", "STL", "BLK"].iter().map(|x| x.to_string()).collect();
+        let v: Vec<String> = ["30", "21", "8-15", "3-7", "9", "4", "1", "2"].iter().map(|x| x.to_string()).collect();
+        let m = live_stats("nba", "", &l, &v);
+        assert_eq!(m["pra"], json!(34.0));
+        assert_eq!(m["fg3m"], json!(3.0));
+        let l: Vec<String> = ["IP", "H", "K"].iter().map(|x| x.to_string()).collect();
+        let v: Vec<String> = ["5.2", "4", "7"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(live_stats("mlb", "pitching", &l, &v)["outs"], json!(17.0));
+    }
+
     #[test]
     fn label_case_keeps_acronyms() {
         assert_eq!(lc("3PM / game - guards"), "3PM / game - guards");
