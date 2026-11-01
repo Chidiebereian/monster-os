@@ -679,7 +679,10 @@ function ModelRow({ m, open, onToggle, ci }: { m: ScoreMarket; open: boolean; on
       <tr onClick={onToggle} className="border-t border-glass text-xs cursor-pointer hover:bg-white/[0.03]">
         <Td>{m.sport.toUpperCase()} · {m.market} <span className="text-gray-500">({m.kind})</span></Td>
         <Td className="text-gray-400">{m.engine.endsWith("_team") ? "team model" : "simulator"}</Td>
-        <Td className={statusTone[m.status]}>{STATUS_TEXT[m.status]}</Td>
+        <Td className={statusTone[m.status]}>
+          {STATUS_TEXT[m.status]}
+          {m.publication_hold && <span className="ml-1 rounded border border-crimson/40 px-1 text-[10px] text-crimson-light" title={m.publication_hold.reason}>on hold</span>}
+        </Td>
         <Td><span className={clsx("rounded border px-1.5 py-0.5 font-mono", gradeTone(m.model_quality))}>{m.model_quality}</span></Td>
         <Td className="font-mono">{m.lines?.n ?? 0}</Td>
         <Td className="font-mono">{pct(m.lines?.ece, 1)}</Td>

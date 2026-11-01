@@ -42,6 +42,39 @@ def test_calibration_error():
     assert abs(ex.ece(np.full(1000, 0.8), (np.arange(1000) % 10 < 6).astype(float)) - 0.2) < 1e-9
 
 
+def _snap(rows):
+    return pd.DataFrame(rows, columns=["game_id", "subject", "feature_set", "name", "value", "value_text", "available_at"]).assign(
+        available_at=lambda d: pd.to_datetime(d["available_at"], utc=True))
+
+
+def test_asof_ignores_snapshots_after_the_decision():
+    S = _snap([("g1", "p1", "availability", "p_active", 1.0, None, "2026-10-30T18:00Z"),
+               ("g1", "p1", "availability", "p_active", 0.0, None, "2026-10-30T23:00Z")])  # injury news after the decision
+    keys = pd.DataFrame({"row": [0], "game_id": ["g1"], "subject": ["p1"], "decision_at": pd.to_datetime(["2026-10-30T22:00Z"], utc=True)})
+    assert ex.asof(keys, S, ["p_active"]).loc[0, "p_active"] == 1.0
+
+
+def test_asof_takes_the_latest_snapshot_known_in_time_and_exact_ties_count():
+    S = _snap([("g1", "p1", "minutes", "exp_minutes", 20.0, None, "2026-10-30T12:00Z"),
+               ("g1", "p1", "minutes", "exp_minutes", 31.0, None, "2026-10-30T22:00Z")])
+    keys = pd.DataFrame({"row": [0, 1], "game_id": ["g1", "g1"], "subject": ["p1", "p1"],
+                         "decision_at": pd.to_datetime(["2026-10-30T22:00Z", "2026-10-30T21:59Z"], utc=True)})
+    r = ex.asof(keys, S, ["exp_minutes"])
+    assert r.loc[0, "exp_minutes"] == 31.0 and r.loc[1, "exp_minutes"] == 20.0
+
+
+def test_asof_never_borrows_another_game_or_player():
+    S = _snap([("g2", "p1", "availability", "p_active", 0.0, None, "2026-10-01T00:00Z"),
+               ("g1", "p2", "availability", "p_active", 0.0, None, "2026-10-01T00:00Z")])
+    keys = pd.DataFrame({"row": [0], "game_id": ["g1"], "subject": ["p1"], "decision_at": pd.to_datetime(["2026-10-30T22:00Z"], utc=True)})
+    r = ex.asof(keys, S, ["p_active"])
+    assert r.empty or "p_active" not in r or pd.isna(r.reindex([0]).loc[0, "p_active"])
+
+
+def test_only_observed_and_derived_features_are_usable():
+    assert set(ex.USABLE) == {"observed", "derived"}
+
+
 def test_game_clustered_interval_is_wider_than_naive():
     rng = np.random.default_rng(3)
     games = np.repeat(np.arange(50), 20)

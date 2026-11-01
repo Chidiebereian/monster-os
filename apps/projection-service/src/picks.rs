@@ -59,6 +59,12 @@ pub(crate) const NFL_PROPS: [&str; 15] = ["pass_yds", "rush_yds", "rec_yds", "re
     "carries", "targets", "rush_td", "rec_td", "rush_rec_yds", "pass_rush_yds", "tds"];
 pub const GRADES: [&str; 8] = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
 
+/// Public AI Picks leave out every engine x market under a publication hold
+/// (migration 0037, `publication_holds_active`), whatever its evidence tier.
+/// Picks are still built and settled underneath; internal callers pass
+/// `include_held=true`.
+pub(crate) const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM publication_holds_active h WHERE h.engine = ai_picks.engine AND h.market = ai_picks.market)";
+
 // ---------------------------------------------------------------------------
 // Distributions and pricing (pure)
 // ---------------------------------------------------------------------------
@@ -1312,6 +1318,7 @@ pub struct ListQ {
     sport: Option<String>, kind: Option<String>, side: Option<String>, grades: Option<String>, market: Option<String>, game: Option<String>,
     book: Option<String>, min_edge: Option<f64>, min_prob: Option<f64>, sort: Option<String>, q: Option<String>,
     #[serde(default)] include_hidden: bool, status: Option<String>, limit: Option<i64>, qualification: Option<String>,
+    #[serde(default)] include_held: bool,
 }
 
 const PICK_COLS: &str = "id, sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
@@ -1391,6 +1398,7 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     if let Some(m) = q.min_prob { f.add("p_model >= ?", Box::new(m)); }
     if let Some(s) = &q.q { if !s.trim().is_empty() { f.add("(subject_name ILIKE ? OR game_label ILIKE ?)", Box::new(format!("%{}%", s.trim()))); } }
     if !q.include_hidden { f.raw("tier IN ('proven','baseline')"); }
+    if !q.include_held { f.raw(NOT_HELD); }
     let (w, p) = (f.w, f.p);
     let order = match q.sort.as_deref().unwrap_or("grade") {
         "edge" => "edge DESC", "ev" => "ev DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
@@ -1424,7 +1432,9 @@ fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
         _ => v["ev"].as_f64().unwrap_or(0.0),
     };
     let feed_bad = st.contains_key(&(format!("q:{}", v["sport"].as_str().unwrap_or("")), format!("{}|{}", key.1, v["book"].as_str().unwrap_or(""))));
-    let suspended = v["status"] != "open" || v["playable_now"] == json!(false) || feed_bad;
+    let held = st.contains_key(&(format!("h:{}", key.0), key.1.clone()));
+    if held { v["publication_hold"] = json!(true); }
+    let suspended = v["status"] != "open" || v["playable_now"] == json!(false) || feed_bad || held;
     if feed_bad { v["feed_quarantined"] = json!(true); }
     v["model_quality"] = json!(quality);
     v["validation_status"] = json!(status);
@@ -1433,9 +1443,13 @@ fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
     v["qualification"] = json!(crate::validation::qualification(&status, ev_now, suspended, v["edge"].as_f64().unwrap_or(0.0)));
 }
 
-pub async fn get(state: web::Data<State>, path: web::Path<i64>) -> impl Responder {
+#[derive(Deserialize)]
+pub struct GetQ { #[serde(default)] include_held: bool }
+
+pub async fn get(state: web::Data<State>, path: web::Path<i64>, q: web::Query<GetQ>) -> impl Responder {
     let id = path.into_inner();
-    let row = match state.db.query_opt(&format!("SELECT {PICK_COLS}, facts FROM ai_picks WHERE id=$1"), &[&id]).await {
+    let held = if q.include_held { "TRUE" } else { NOT_HELD };
+    let row = match state.db.query_opt(&format!("SELECT {PICK_COLS}, facts FROM ai_picks WHERE id=$1 AND {held}"), &[&id]).await {
         Ok(Some(r)) => r, Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "no such pick" })), Err(e) => return internal(dberr(&e)),
     };
     let mut v = pick_json(&row, true);
@@ -1498,9 +1512,9 @@ pub struct MetaQ { sport: Option<String> }
 pub async fn meta(state: web::Data<State>, q: web::Query<MetaQ>) -> impl Responder {
     let db = &state.db;
     let sport = q.sport.clone().filter(|s| s != "all");
-    let opts = db.query("SELECT DISTINCT 'market', market, market FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) \
-        UNION SELECT DISTINCT 'game', game_id, game_label || ' · ' || to_char(starts_at AT TIME ZONE 'America/New_York', 'MM/DD HH12:MI AM') FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) \
-        UNION SELECT DISTINCT 'book', book, book FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1)", &[&sport]).await;
+    let opts = db.query(&format!("SELECT DISTINCT 'market', market, market FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD} \
+        UNION SELECT DISTINCT 'game', game_id, game_label || ' · ' || to_char(starts_at AT TIME ZONE 'America/New_York', 'MM/DD HH12:MI AM') FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD} \
+        UNION SELECT DISTINCT 'book', book, book FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD}"), &[&sport]).await;
     let mut markets = Vec::new(); let mut games = Vec::new(); let mut books = Vec::new();
     if let Ok(rows) = opts {
         for r in rows {
@@ -1516,10 +1530,14 @@ pub async fn meta(state: web::Data<State>, q: web::Query<MetaQ>) -> impl Respond
         json!({ "provider": r.get::<_, String>(0), "requests": r.get::<_, i32>(1), "units": r.get::<_, i32>(2) })).collect::<Vec<_>>()).unwrap_or_default();
     let fresh = db.query("SELECT source, sport, max(observed_at), count(*) FROM market_lines WHERE observed_at > now() - interval '1 day' GROUP BY 1,2 ORDER BY 1,2", &[]).await
         .map(|rows| rows.iter().map(|r| json!({ "source": r.get::<_, String>(0), "sport": r.get::<_, String>(1), "last": r.get::<_, DateTime<Utc>>(2), "rows": r.get::<_, i64>(3) })).collect::<Vec<_>>()).unwrap_or_default();
-    let hidden = db.query_one("SELECT count(*) FILTER (WHERE tier NOT IN ('proven','baseline')), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1)", &[&sport]).await
+    let hidden = db.query_one(&format!("SELECT count(*) FILTER (WHERE tier NOT IN ('proven','baseline')), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD}"), &[&sport]).await
         .map(|r| json!({ "hidden": r.get::<_, i64>(0), "total": r.get::<_, i64>(1) })).unwrap_or(Value::Null);
+    let holds = db.query("SELECT engine, market, reason, decided_at FROM publication_holds_active ORDER BY engine, market", &[]).await
+        .map(|rows| rows.iter().map(|r| json!({ "engine": r.get::<_, String>(0), "market": r.get::<_, String>(1), "reason": r.get::<_, String>(2),
+            "since": r.get::<_, DateTime<Utc>>(3) })).collect::<Vec<_>>()).unwrap_or_default();
     let llm = json!({ "configured": llm_endpoint().is_some(), "model": llm_endpoint().map(|e| e.1), "reachable": llm_reachable(&state).await });
     HttpResponse::Ok().json(json!({ "markets": markets, "games": games, "books": books, "usage_today": usage, "lines": fresh, "counts": hidden, "llm_writeups": llm,
+        "publication_holds": holds,
         "settings": { "min_edge": lines::setting(db, "min_edge", 0.015).await, "oddsapi_daily_credits": lines::setting(db, "oddsapi_daily_credits", 9.0).await,
             "sgo_daily_entities": lines::setting(db, "sgo_daily_entities", 60.0).await } }))
 }

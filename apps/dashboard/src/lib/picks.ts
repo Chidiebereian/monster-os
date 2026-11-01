@@ -48,6 +48,8 @@ export interface Interval { mean: number; lo: number; hi: number }
 export interface ScoreMarket {
   sport: string; engine: string; version: string | null; market: string; kind: "prop" | "game"; tier: Tier; tier_source: string | null;
   model_quality: string; status: MarketStatus; excluded_picks: number; reasons: string[];
+  /** hidden from public AI Picks by a publication decision, whatever the evidence says (migration 0037) */
+  publication_hold?: { reason: string; since: string } | null;
   backtest: { comparison: string; n: number; seasons: number; better: number; worse: number; w: number | null } | null;
   lines: (Calib & { brier_model?: number; brier_market?: number; brier_vs_market?: Interval | null }) | null;
   picks: { n: number; units: number; roi: number; roi_lo: number; roi_hi: number; hit_rate: number; max_drawdown: number; profit_factor: number | null;

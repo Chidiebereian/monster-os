@@ -108,3 +108,46 @@ numbers.
   models first (NFL props: pass/rush/rec yards, receptions beat their baseline).
 - Conformal intervals, regime detection, ensembles, Bayesian player models.
 - Pushing pick and validation changes over the gateway WebSocket.
+
+## Publication holds (migration 0037)
+
+`publication_holds` is an append-only log of decisions to hide an engine x
+market from public AI Picks, independent of its evidence tier;
+`publication_holds_active` is the latest decision per pair. Held picks are still
+built, priced and settled, and the evidence underneath is untouched (each
+decision stores a snapshot of it). Public reads leave them out: `/picks`,
+`/picks/{id}`, `/picks/meta` (which lists the holds) and the Games hub; internal
+callers pass `include_held=true`, where held picks show as "suspended". The
+scorecard marks held markets ("on hold" in AI Picks > Models). A hold is lifted
+only by a new `release` decision with a named decider, a reason and `--confirm`
+(`scripts/ops/release_hold.py`); there is no HTTP path that writes holds.
+
+Current holds (2026-11-01, `phase-2a-audit`): nhl_team team_total_away,
+team_total_home, moneyline_1h, team_total_away_1h; nba_team moneyline_1h. Their
+evidence was refreshed ahead of schedule by research backtests run in normal
+mode (ml-research.md).
+
+## Research isolation
+
+- Research scripts (`scripts/ml`) connect as `monster_research`: SELECT on
+  everything, INSERT on `ml_examples`, `ml_experiments`, `feature_snapshots`
+  only. Writing evidence, picks, holds, the ledger or the registry fails with
+  "permission denied".
+- Manual backtests need an explicit mode: `POST /picks/evidence/run` without
+  `mode=production` or `mode=research` is refused (400). Research mode is a
+  separate code path with no `pick_evidence` writes, bounded (`max_games`) and
+  resumable, one batch per engine at a time.
+- `scripts/ci/research_checks.py` runs the migration, ML, integrity, Rust,
+  dashboard (and optionally end-to-end) checks and fails closed.
+
+## Credentials for scripts
+
+No database credential is stored in tracked files. Scripts read `ML_DATABASE_URL`
+(research role) and `OPS_DATABASE_URL` (owner, for operations such as
+publication decisions) from the environment or the git-ignored `.env`
+(`scripts/dbenv.py`); a missing variable stops the script with the command that
+fixes it. `monster_research` is created without a password (migration 0037);
+`python scripts/ops/rotate_research_password.py` sets a random one and writes
+`ML_DATABASE_URL` to `.env` without printing it. Run it again to rotate. The
+gate's `secrets` step scans tracked, staged and new files and the git history.
+

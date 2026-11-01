@@ -24,7 +24,11 @@ import sys
 
 import psycopg
 
-DB = os.environ.get("ML_DATABASE_URL", "postgresql://monster:monster@localhost:5434/monsteros")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import dbenv  # noqa: E402
+
+# research role (migration 0037): reads everything, can only add rows to the research tables
+DB = dbenv.url("ML_DATABASE_URL")
 
 # One row per settled eval with features from the quote history, clean books only.
 SQL = r"""

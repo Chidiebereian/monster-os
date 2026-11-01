@@ -129,23 +129,30 @@ async fn season_obs(state: &State, engine: &str, season: i32, cfg: &Value, out: 
     let games = learning::season_games(state, engine, season).await?;
     let mut used = 0;
     for id in &games {
-        let seed = learning::fnv(&[engine, id, "evidence"]);
-        let Ok(Some(ge)) = learning::evaluate(state, engine, id, cfg, SIMS, DRAWS, seed).await else { continue };
-        used += 1;
-        // a moneyline compared with "the market" needs that game's real spread
-        let has_line = ge.forecasts.iter().any(|f| f.market == "home_cover");
-        let mut keep = Vec::new();
-        for f in &ge.forecasts {
-            let Some((pm, cmp)) = pick_market(engine, f.market) else { continue };
-            if pm == "moneyline" && cmp == "market" && !has_line { continue; }
-            let Some(y) = ge.outcomes.y(f) else { continue };
-            out.entry((pm, cmp)).or_insert_with(|| (f.baseline.to_string(), Vec::new())).1.push((season, f.p_model, f.p_base, y));
-            keep.push(json!({ "market": pm, "subject": f.subject, "line": f.line, "comparison": cmp, "p_model": f.p_model, "p_base": f.p_base, "y": y,
-                "kind": if f.subject == "game" { "game" } else { "prop" }, "features": { "forecast_market": f.market, "baseline": f.baseline, "stat": f.stat } }));
-        }
-        save_examples(state, engine, season, id, &keep).await;
+        if game_obs(state, engine, season, id, cfg, Some(&mut *out)).await { used += 1; }
     }
     Ok(used)
+}
+
+/// Evaluate one game (inputs strictly before it), store its forecasts in the ML
+/// dataset, and add them to `out` when the caller aggregates evidence.
+async fn game_obs(state: &State, engine: &str, season: i32, id: &str, cfg: &Value, out: Option<&mut Obs>) -> bool {
+    let seed = learning::fnv(&[engine, id, "evidence"]);
+    let Ok(Some(ge)) = learning::evaluate(state, engine, id, cfg, SIMS, DRAWS, seed).await else { return false };
+    // a moneyline compared with "the market" needs that game's real spread
+    let has_line = ge.forecasts.iter().any(|f| f.market == "home_cover");
+    let mut keep = Vec::new();
+    let mut out = out;
+    for f in &ge.forecasts {
+        let Some((pm, cmp)) = pick_market(engine, f.market) else { continue };
+        if pm == "moneyline" && cmp == "market" && !has_line { continue; }
+        let Some(y) = ge.outcomes.y(f) else { continue };
+        if let Some(o) = out.as_deref_mut() { o.entry((pm, cmp)).or_insert_with(|| (f.baseline.to_string(), Vec::new())).1.push((season, f.p_model, f.p_base, y)); }
+        keep.push(json!({ "market": pm, "subject": f.subject, "line": f.line, "comparison": cmp, "p_model": f.p_model, "p_base": f.p_base, "y": y,
+            "kind": if f.subject == "game" { "game" } else { "prop" }, "features": { "forecast_market": f.market, "baseline": f.baseline, "stat": f.stat } }));
+    }
+    save_examples(state, engine, season, id, &keep).await;
+    true
 }
 
 /// Every backtest forecast also goes to the immutable ML dataset (migration
@@ -224,7 +231,50 @@ pub(crate) async fn run(state: &State, engine: &str) -> Result<Value, String> {
         db.execute("INSERT INTO pick_evidence (engine, market, source, comparison, n, detail) VALUES ($1,'_none','backtest','baseline',0,$2) \
             ON CONFLICT (engine, market, source, comparison) DO UPDATE SET detail=EXCLUDED.detail, updated_at=now()", &[&engine, &detail]).await.map_err(|e| dberr(&e))?;
     }
-    Ok(json!({ "engine": engine, "engine_version": code, "rows": rows, "markets": summary, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
+    Ok(json!({ "engine": engine, "engine_version": code, "mode": "production", "rows": rows, "markets": summary, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
+}
+
+/// Research mode: evaluate up to `max_games` games of the engine's backtest
+/// seasons that are not yet in ml_examples for its current code, store them, and
+/// stop. There is no pick_evidence code on this path, so AI Picks tiers cannot
+/// move. Completed games are committed one by one; the next batch resumes after
+/// them (see scripts/ml/backtest_runner.py).
+pub(crate) async fn research_batch(state: &State, engine: &str, max_games: usize) -> Result<Value, String> {
+    let db = &state.db;
+    let (_, cfg) = learning::champion(db, engine).await?;
+    let code = learning::engine_of(engine);
+    let started = Utc::now();
+    let (mut done, mut skipped, mut failed, mut remaining) = (0usize, 0usize, 0usize, 0usize);
+    let mut per_season = Vec::new();
+    for season in seasons(engine, (Utc::now() - chrono::Duration::hours(5)).date_naive()) {
+        let games = learning::season_games(state, engine, season).await?;
+        let have: std::collections::HashSet<String> = db.query("SELECT DISTINCT game_id FROM ml_examples WHERE source='backtest' AND engine=$1 AND engine_version=$2 AND season=$3",
+            &[&engine, &code, &season]).await.map_err(|e| dberr(&e))?.iter().map(|r| r.get(0)).collect();
+        let (mut d, mut s) = (0, 0);
+        for id in &games {
+            if have.contains(id) { skipped += 1; s += 1; continue; }
+            if done + failed >= max_games { remaining += 1; continue; }
+            if game_obs(state, engine, season, id, &cfg, None).await { done += 1; d += 1; } else { failed += 1; }
+        }
+        per_season.push(json!({ "season": season, "games": games.len(), "stored_before": s, "stored_now": d }));
+    }
+    Ok(json!({ "engine": engine, "engine_version": code, "mode": "research", "evidence_rows_written": 0, "games_done": done, "games_skipped_existing": skipped,
+        "games_without_forecast": failed, "games_remaining": remaining, "complete": remaining == 0, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
+}
+
+fn research_lock() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static L: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    L.get_or_init(Default::default)
+}
+
+/// Holds the per-engine research lock and releases it however the request ends
+/// (a client that disconnects drops the handler future; games stored so far stay).
+struct ResearchGuard(String);
+impl ResearchGuard {
+    fn take(engine: &str) -> Option<Self> { research_lock().lock().unwrap().insert(engine.to_string()).then(|| ResearchGuard(engine.to_string())) }
+}
+impl Drop for ResearchGuard {
+    fn drop(&mut self) { research_lock().lock().unwrap().remove(&self.0); }
 }
 
 /// The next pick engine whose champion code has no current backtest evidence (and did not fail in the last day).
@@ -242,22 +292,50 @@ pub(crate) async fn due(state: &State) -> Option<String> {
 }
 
 #[derive(Deserialize)]
-pub struct RunQ { engine: String, #[serde(default)] wait: bool }
+pub struct RunQ { engine: String, #[serde(default)] wait: bool, mode: Option<String>, #[serde(default)] research_only: bool, max_games: Option<usize> }
 
 /// POST /picks/evidence/run?engine=[&wait=true] — run now. By default the run is
 /// started on the server and the call returns at once (a full sport takes half an
 /// hour, longer than a client should hold a connection; a dropped connection would
 /// cancel it). Results land in pick_evidence and the `evidence:{engine}` job row.
 /// `wait=true` blocks and returns the summary.
+/// Explicit execution mode of a manual run. There is no default: a call without
+/// `mode=production` or `mode=research` (or the older `research_only=true`) is
+/// refused, so research tooling can never refresh production evidence by omission.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Mode { Production, Research }
+
+pub(crate) fn mode_of(mode: Option<&str>, research_only: bool) -> Result<Mode, String> {
+    match (mode, research_only) {
+        (Some("research"), _) | (None, true) => Ok(Mode::Research),
+        (Some("production"), false) => Ok(Mode::Production),
+        (Some("production"), true) => Err("mode=production contradicts research_only=true".into()),
+        (Some(m), _) => Err(format!("unknown mode {m:?}: use mode=production or mode=research")),
+        (None, false) => Err("say mode=production (refreshes pick_evidence and AI Picks tiers) or mode=research (stores ML examples only)".into()),
+    }
+}
+
 pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Responder {
     if !PICK_ENGINES.contains(&q.engine.as_str()) { return HttpResponse::BadRequest().json(json!({ "error": format!("engine must be one of {PICK_ENGINES:?}") })); }
+    let mode = match mode_of(q.mode.as_deref(), q.research_only) { Ok(m) => m, Err(e) => return HttpResponse::BadRequest().json(json!({ "error": e })) };
+    if mode == Mode::Research {
+        // bounded batches, one at a time per engine; always synchronous so the caller sees progress
+        let max_games = q.max_games.unwrap_or(50).clamp(1, 500);
+        let Some(_guard) = ResearchGuard::take(&q.engine) else {
+            return HttpResponse::Conflict().json(json!({ "error": format!("a research batch for {} is already running", q.engine) }));
+        };
+        let v = research_batch(&state, &q.engine, max_games).await;
+        let detail = match &v { Ok(x) => x.clone(), Err(e) => json!({ "error": e }) };
+        crate::autopilot::mark(&state.db, &format!("research:{}", q.engine), v.is_ok(), &detail).await;
+        return match v { Ok(v) => HttpResponse::Ok().json(v), Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })) };
+    }
     if !q.wait {
         let (st, engine) = (state.clone(), q.engine.clone());
         actix_web::rt::spawn(async move {
             let v = run(&st, &engine).await;
             crate::autopilot::mark(&st.db, &format!("evidence:{engine}"), v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
         });
-        return HttpResponse::Accepted().json(json!({ "engine": q.engine, "started": true, "note": "running on the server; poll pick_evidence or /learning jobs" }));
+        return HttpResponse::Accepted().json(json!({ "engine": q.engine, "mode": "production", "started": true, "note": "running on the server; poll pick_evidence or /learning jobs" }));
     }
     match run(&state, &q.engine).await {
         Ok(v) => HttpResponse::Ok().json(v),
@@ -267,6 +345,17 @@ pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Resp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_runs_need_an_explicit_mode() {
+        use super::{mode_of, Mode};
+        assert!(mode_of(None, false).is_err());
+        assert!(mode_of(Some("prod"), false).is_err());
+        assert!(mode_of(Some("production"), true).is_err());
+        assert_eq!(mode_of(None, true), Ok(Mode::Research));
+        assert_eq!(mode_of(Some("research"), false), Ok(Mode::Research));
+        assert_eq!(mode_of(Some("production"), false), Ok(Mode::Production));
+    }
+
     use super::*;
 
     #[test]

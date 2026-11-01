@@ -110,9 +110,105 @@ little room left by then).
   are answered from the stored results (`diag.rs`); training runs only in
   `scripts/ml`, never from chat.
 
+## Phase 2A: decision-time enrichment (2026-11-01, research only)
+
+### Gap analysis
+
+| Information | What exists | Known at decision time? |
+|---|---|---|
+| Injuries / availability, NBA + NHL | every frozen forecast's `payload.inputs`: `p_active`, ESPN injury-report status line, "not used in last 5" | yes: `prediction_ledger.frozen_at`, projected or confirmed lineup, write-once (since 2026-10-20) |
+| Raw ESPN injury reports | fetched live at confirmed freezes, never stored | only going forward, if a snapshotter is added |
+| NFL injuries / depth charts | `nfl_injuries`, `nfl_roster_weekly` (weekly, no timestamps) | not provable: at best 'inferred' (final report before kickoff); not used |
+| Lineups / starters | NBA starter flags, NHL projected goalie and its source, projected vs confirmed freeze | yes, at freeze. NHL "goalie confirmed" is always 0 at freeze: no confirmation is captured before games |
+| Expected minutes / TOI | `min_mean` (NBA), `toi_mean` (NHL) in the inputs | yes, at freeze |
+| Workload | games played and last-5 status in the inputs; box scores (`nba_box_espn`, `nhl_box_api`) are post-game | box scores only lagged to earlier games (not built yet) |
+| Coaching / rotation | NFL coach and QB names in `nfl_game_info`; nothing for NBA / NHL | NFL only (not built yet) |
+| Rest / back-to-backs | schedules (`nba_games_espn`, `nhl_games_api`; NFL rest in `nfl_game_info`) | yes, derived |
+| Odds at several horizons | hourly ESPN snapshots in `market_lines` since 2026-10-21. 6 h before: every game line, 98% of props; 12 h: most game lines, 59% of props; 24 h: 16% of props | yes |
+| Historical prop prices (before 2026-10-21) | none | no: never reconstructed |
+
+### Feature store (migration 0036, `feature_snapshots`, write-once)
+
+One row per value: `event_at`, `observed_at`, `available_at`, `source`,
+`quality` (observed / derived / inferred / missing; missing has no value),
+`extractor`. `scripts/ml/features.py` fills it (re-runs add nothing):
+
+- `engine_inputs` (NBA, NHL; available at `frozen_at`): per player `p_active`,
+  `injury_listed`, `status`, `starter`, `lineup_confirmed`, `team`,
+  `exp_minutes`, `games_recent`; per team `out_count`, `out_minutes` (regulars
+  not expected to play and their expected minutes), `injury_listed_count`, NHL
+  `goalie_confirmed`. 173,255 rows.
+- `market_horizon`: each live example's line consensus 24 / 12 / 6 / 2 h before
+  the start (quarantined books left out); 58,490 of 121,864 are 'missing'.
+- `schedule` (NBA, NHL): `rest_days`, `back_to_back` (derived; available at the
+  team's previous game). 12,660 rows.
+
+Experiments attach features with `asof()`: the latest value whose
+`available_at` is at or before the example's decision time, for the same game
+and subject; 'inferred' and 'missing' are never used. Tests cover later
+snapshots being ignored, ties, and no borrowing across games or players.
+Horizon experiments (`--horizon 6|12`) replace the market with the consensus at
+the horizon, set the decision time to start - h, and drop the engine and naive
+probabilities, which may have been updated after the horizon.
+
+### Feature ablation (`--ablation`: v1, +availability, +lineup, +minutes, +schedule, all; identical eligible rows)
+
+Each arm is judged against the market and, paired on the same test rows,
+against the v1 arm (99% game-bootstrap). Results (code v1.2 / v1.2.1):
+
+| Data | Rows (games) | vs market, every arm | Any arm better than v1 at 99%? |
+|---|---|---|---|
+| NBA props + game lines, outcome | 7,385 (52) | inconclusive | no; availability and all-features significantly worse for the elastic net |
+| NHL, outcome | 3,166 (47) | v1 to minutes rejected; schedule and all inconclusive | no |
+| NBA game lines, outcome | 740 (52) | inconclusive | no |
+| NHL game lines, outcome | 212 (28) | insufficient data | no |
+| NBA movement 6 h -> close | 3,786 (52) | inconclusive: LightGBM on market-only features beats the base rate (-0.0091, 99% upper -0.0002) but its calibration error is 3.1% vs 1.6% | no; availability and all-features worse |
+| NBA movement 12 h | 1,086 (42) | inconclusive | no |
+| NHL movement 6 h / 12 h | 1,935 (47) / 1,183 (42) | inconclusive | no |
+
+Read: the information the engines already use (availability, expected
+minutes, lineups, rest) does not add anything the market has not priced, at
+least on two weeks of live data; added features mostly add noise. 120 paired
+comparisons from correlated data, not family-wise corrected. The one thing
+worth watching is short-horizon line movement from market-only information.
+
+### Player-prop backtests (NBA / NFL simulators)
+
+`evidence.rs` now has a research-only mode (`POST
+/picks/evidence/run?engine=...&research_only=true`): it stores every per-game
+forecast in `ml_examples` and does not write `pick_evidence`, so AI Picks tiers
+cannot move. These rows compare the simulator with the naive model only: no
+historical prop prices exist and none are made up. Experiments on them are
+labelled "(vs naive model, no market prices)" and can never be a shadow
+candidate.
+
+### Phase 2A audit (2026-11-01)
+
+- Five markets whose evidence the normal-mode backtests refreshed are under a
+  publication hold (validation.md); their evidence is unchanged.
+- Research and production are separated three ways: the `monster_research`
+  database role, an explicit `mode` on manual backtests (research mode has no
+  evidence code path), and holds that sit beside the evidence.
+- `scripts/ml/backtest_runner.py`: bounded, resumable research backtests with a
+  free-memory floor and a checkpoint; `scripts/ml/test_integrity.py` (24 tests
+  against the live database and service) and `scripts/ci/research_checks.py`.
+- Open items: `research-backlog.md`.
+
+### Production side effect (found in this phase)
+
+The v1 build ran the team-model backtests in normal mode to fill the dataset.
+That also refreshed their `pick_evidence` rows ahead of the 30-day schedule:
+`nhl_team` team totals moved from unproven to baseline, and 16 first-half /
+team-total markets got evidence for the first time (`nba_team` 1H moneyline,
+`nhl_team` 1H moneyline and 1H away team total as baseline; the rest
+unproven). Baseline picks are shown by default (capped B+). No team-model pick
+was open at the time. The research-only mode above exists so this cannot
+happen again.
+
 ## Next
 
-Injury / lineup / usage features captured at decision time; an earlier decision
-time for the movement target; storing the NFL and NBA simulators' backtests
-(player props vs the naive model); CRPS on the ledger PMFs; Bayesian player
-models; a shadow runner that scores candidates live beside AI Picks.
+Saving raw ESPN injury reports as they are published (a snapshotter); lagged
+workload from box scores; NFL coaching / QB context; running the NFL simulator
+backtest in research mode; more live weeks (two weeks of data is thin); CRPS on
+the ledger PMFs; Bayesian player models; a shadow runner that scores candidates
+live beside AI Picks.

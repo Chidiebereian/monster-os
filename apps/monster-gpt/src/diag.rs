@@ -71,10 +71,19 @@ pub fn experiments_text(sc: &Value, sport: Option<&str>, named: &[&str], limit: 
         let best = e["best_model"].as_str().unwrap_or("");
         let m = e["models"].as_array().into_iter().flatten().find(|m| m["model"] == best);
         let d = m.map(|m| &m["brier_vs_market"]);
-        s.push_str(&format!("- {}: {} ({} test rows). Best learned model {}{}. {}\n", e["name"].as_str().unwrap_or(""), e["verdict"].as_str().unwrap_or("").replace('_', " "),
-            e["n_test"], best.replace("residual_", ""),
-            d.map(|d| format!(", Brier vs market {} (95% {} to {})", pct4(&d["mean"]), pct4(&d["lo95"]), pct4(&d["hi95"]))).unwrap_or_default(),
-            if e["verdict"] == "inconclusive" { "Its 99% interval includes 0: no evidence it beats the market." } else { e["gate"]["why"].as_str().unwrap_or("") }));
+        let why = e["gate"]["why"].as_str().unwrap_or("");
+        // the Brier number is already in the line: keep only the reason
+        let why = match why.find("fails: ") {
+            Some(i) => format!("Fails: {}.", &why[i + 7..]),
+            None if why.starts_with("Brier vs market") && why.contains("includes 0") => "Its 99% interval includes 0: no evidence it beats the market.".into(),
+            None => why.to_string(),
+        };
+        let best_part = if best.is_empty() { String::new() } else {
+            format!(" Best learned model {}{}.", best.replace("residual_", ""),
+                d.map(|d| format!(", Brier vs market {} (95% {} to {})", pct4(&d["mean"]), pct4(&d["lo95"]), pct4(&d["hi95"]))).unwrap_or_default())
+        };
+        s.push_str(&format!("- {}: {} ({} test rows).{} {}\n", e["name"].as_str().unwrap_or(""), e["verdict"].as_str().unwrap_or("").replace('_', " "),
+            e["n_test"], best_part, why));
     }
     let shadow = ex.iter().filter(|e| e["verdict"] == "shadow_candidate").count();
     s.push_str(&format!("{shadow} of {} experiments reached shadow candidate. Nothing is promoted automatically: a candidate would run beside AI Picks without changing what it publishes.\n\n", ex.len()));
@@ -195,11 +204,11 @@ mod tests {
     fn ml_questions_report_experiments() {
         let mut v = sc();
         v["experiments"] = json!([{ "name": "nfl spread backtest outcome", "sport": "nfl", "markets": ["spread"], "verdict": "inconclusive", "n_test": 775,
-            "best_model": "residual_enet", "gate": { "why": "includes 0" },
+            "best_model": "residual_enet", "gate": { "why": "Brier vs market +0.0015; fails: 99% interval -0.0029 to +0.0056 includes 0" },
             "models": [{ "model": "residual_enet", "brier_vs_market": { "mean": 0.0015, "lo95": -0.0016, "hi95": 0.0048 } }] }]);
         v["dataset"] = json!([{ "sport": "nfl", "source": "backtest", "examples": 10195, "games": 1035 }]);
         let r = reply(&v, Some("nfl"), "does the XGBoost residual model beat the market on NFL spreads?");
-        assert!(r.contains("nfl spread backtest outcome: inconclusive (775 test rows). Best learned model enet, Brier vs market +0.0015 (95% -0.0016 to +0.0048). Its 99% interval includes 0"), "{r}");
+        assert!(r.contains("nfl spread backtest outcome: inconclusive (775 test rows). Best learned model enet, Brier vs market +0.0015 (95% -0.0016 to +0.0048). Fails: 99% interval -0.0029 to +0.0056 includes 0."), "{r}");
         assert!(r.contains("0 of 1 experiments reached shadow candidate") && r.contains("NFL backtest 10195 examples over 1035 games"), "{r}");
         let s = reply(&v, Some("nfl"), "Why isn't Monster publishing NFL spreads?");
         assert!(s.contains("ML research") && s.contains("775 test rows"), "{s}");

@@ -44,8 +44,12 @@ import psycopg
 from scipy.optimize import minimize
 
 warnings.filterwarnings("ignore")
-DB = os.environ.get("ML_DATABASE_URL", "postgresql://monster:monster@localhost:5434/monsteros")
-CODE = "experiment.py v1.1"
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import dbenv  # noqa: E402
+
+# research role (migration 0037): reads everything, can only add rows to the research tables
+DB = dbenv.url("ML_DATABASE_URL")
+CODE = "experiment.py v1.2.1"
 # a training game must have finished this long before the first decision of the test fold
 GAME_HOURS = 4
 LGBM = {"objective": "binary", "learning_rate": 0.03, "num_leaves": 7, "min_data_in_leaf": 50, "feature_fraction": 0.8, "bagging_fraction": 0.8,
@@ -102,6 +106,98 @@ def load(sport, markets, source):
     return df.sort_values(["fold", "game_id"]).reset_index(drop=True)
 
 
+# ---------------------------------------------------------------- decision-time enrichment (feature_snapshots)
+
+# feature set -> columns it adds (props / game lines); "v1" adds nothing
+SETS = {
+    "availability": (["p_active", "injury_listed", "team_out_minutes", "opp_out_minutes", "team_out_count", "opp_out_count"],
+                     ["out_minutes_diff", "out_count_diff", "injury_listed_diff"]),
+    "lineup": (["starter", "lineup_confirmed"], ["goalie_confirmed_home", "goalie_confirmed_away"]),
+    "minutes": (["exp_minutes", "games_recent"], []),
+    "schedule": (["rest_own", "rest_opp", "b2b_own", "b2b_opp"], ["rest_diff", "b2b_home", "b2b_away"]),
+}
+USABLE = ("observed", "derived")  # 'inferred' is kept apart; 'missing' has no value
+
+
+def snapshots(sport, sets=("availability", "lineup", "minutes", "schedule")):
+    with psycopg.connect(DB) as cx:
+        S = pd.DataFrame(cx.execute("SELECT game_id, subject, feature_set, name, value, value_text, available_at FROM feature_snapshots "
+                                    "WHERE sport=%s AND feature_set = ANY(%s) AND quality = ANY(%s)", (sport, list(sets), list(USABLE))).fetchall(),
+                         columns=["game_id", "subject", "feature_set", "name", "value", "value_text", "available_at"])
+    S["available_at"] = pd.to_datetime(S["available_at"], utc=True)
+    return S
+
+
+def asof(keys, S, names):
+    """Latest value of each feature name per key row, using only snapshots with available_at <= the key's decision time.
+
+    keys: DataFrame with columns row, game_id, subject, decision_at. Returns DataFrame indexed by row with one column per name
+    (value) plus '<name>__text' for text values."""
+    S = S[S["name"].isin(names)]
+    m = keys.merge(S, on=["game_id", "subject"], how="inner")
+    m = m[m["available_at"] <= m["decision_at"]]
+    if m.empty:
+        return pd.DataFrame(index=keys["row"])
+    m = m.sort_values("available_at").groupby(["row", "name"]).tail(1)
+    v = m.pivot(index="row", columns="name", values="value")
+    t = m.pivot(index="row", columns="name", values="value_text").add_suffix("__text")
+    return v.join(t)
+
+
+def enrich(df, sport):
+    """Attach decision-time features to every example. Returns (df with feature columns, eligible mask = engine inputs known at decision)."""
+    S = snapshots(sport)
+    dec = pd.to_datetime(df["decision_at"], utc=True)
+    keys = pd.DataFrame({"row": df.index, "game_id": df["game_id"].astype(str), "subject": df["subject"].astype(str), "decision_at": dec})
+    P = asof(keys, S, ["p_active", "injury_listed", "starter", "lineup_confirmed", "team", "exp_minutes", "games_recent"])
+    out = df.copy()
+    for c in ["p_active", "injury_listed", "starter", "lineup_confirmed", "exp_minutes", "games_recent", "team__text"]:
+        out[c] = P[c] if c in P else np.nan
+    team = out["team__text"].fillna("|").str.split("|", expand=True)
+    out["own"], out["side"] = team[0], team[1]
+
+    def team_feats(abbr_col, prefix):
+        tk = pd.DataFrame({"row": df.index, "game_id": df["game_id"].astype(str), "subject": "team:" + out[abbr_col].fillna("?"), "decision_at": dec})
+        T = asof(tk, S, ["out_minutes", "out_count", "injury_listed_count", "goalie_confirmed", "rest_days", "back_to_back"])
+        for src, dst in [("out_minutes", "out_minutes"), ("out_count", "out_count"), ("injury_listed_count", "listed"), ("goalie_confirmed", "goalie"),
+                         ("rest_days", "rest"), ("back_to_back", "b2b")]:
+            out[f"{prefix}_{dst}"] = T[src] if src in T else np.nan
+
+    # props: own team and opponent; game lines: home and away (team abbrs come from any player snapshot of the game)
+    if (df["kind"] == "game").any():
+        side_of = S[(S["name"] == "out_minutes")][["game_id", "subject", "value_text"]].drop_duplicates()
+        home = side_of[side_of["value_text"] == "home"].groupby("game_id")["subject"].first().str.replace("team:", "")
+        away = side_of[side_of["value_text"] == "away"].groupby("game_id")["subject"].first().str.replace("team:", "")
+        g = df["game_id"].astype(str)
+        out.loc[df["kind"] == "game", "own"] = g.map(home)
+        out.loc[df["kind"] == "game", "opp"] = g.map(away)
+    opp = out.groupby("game_id")["own"].transform(lambda x: ",".join(sorted(set(x.dropna()) - {"", "?"})))
+    out["opp"] = out.get("opp")
+    need = out["opp"].isna()
+    out.loc[need, "opp"] = [next((t for t in o.split(",") if t and t != w), None) for o, w in zip(opp[need], out.loc[need, "own"])]
+    team_feats("own", "t")
+    team_feats("opp", "o")
+    # props view
+    out["team_out_minutes"], out["opp_out_minutes"] = out["t_out_minutes"], out["o_out_minutes"]
+    out["team_out_count"], out["opp_out_count"] = out["t_out_count"], out["o_out_count"]
+    out["rest_own"], out["rest_opp"], out["b2b_own"], out["b2b_opp"] = out["t_rest"], out["o_rest"], out["t_b2b"], out["o_b2b"]
+    # game-line view: own = home, opp = away
+    out["out_minutes_diff"] = out["t_out_minutes"] - out["o_out_minutes"]
+    out["out_count_diff"] = out["t_out_count"] - out["o_out_count"]
+    out["injury_listed_diff"] = out["t_listed"] - out["o_listed"]
+    out["goalie_confirmed_home"], out["goalie_confirmed_away"] = out["t_goalie"], out["o_goalie"]
+    out["rest_diff"] = out["t_rest"] - out["o_rest"]
+    out["b2b_home"], out["b2b_away"] = out["t_b2b"], out["o_b2b"]
+    if (df["kind"] == "game").any():
+        lc = asof(pd.DataFrame({"row": df.index, "game_id": df["game_id"].astype(str), "subject": "team:" + out["own"].fillna("?"), "decision_at": dec}),
+                  S, ["out_minutes"])
+        eligible_game = lc["out_minutes"].notna() if "out_minutes" in lc else pd.Series(False, index=df.index)
+    else:
+        eligible_game = pd.Series(False, index=df.index)
+    eligible = np.where(df["kind"] == "game", eligible_game.reindex(df.index).fillna(False), out["p_active"].notna())
+    return out, np.asarray(eligible, bool)
+
+
 def design(df, source, markets_seen):
     """Features known at decision time, relative to the market."""
     lm = logit(df["p_base"])
@@ -116,6 +212,9 @@ def design(df, source, markets_seen):
         X["hold"] = 1 / df["best_over"] + 1 / df["best_under"] - 1
     for m in markets_seen[1:]:
         X[f"m_{m}"] = (df["market"] == m).astype(float)
+    for c in df.attrs.get("extra", []):
+        X[c] = df[c].astype(float).fillna(-1.0)  # trees split on the sentinel; the elastic net sees it as a level
+        X[f"{c}__na"] = df[c].isna().astype(float)
     return X.astype(float), lm
 
 
@@ -217,18 +316,54 @@ def score(name, p, y, df, ref, live):
 
 # ---------------------------------------------------------------- experiment
 
-def run(sport, markets, source="live", target="outcome", name=None, save=True):
+def horizon_frame(df, sport, h):
+    """Movement from h hours before the start to the close: the market at the horizon replaces the decision-time market,
+    and the engine / naive probabilities (possibly updated after the horizon) are dropped."""
+    S = snapshots(sport, ("market_horizon",))
+    S = S[S["name"] == f"p_h{h}"]
+    key = "line:" + df["market"] + "|" + df["subject"].astype(str) + "|" + df["line"].astype(str)
+    m = dict(zip(zip(S["game_id"], S["subject"]), S["value"]))
+    out = df.copy()
+    out["p_base"] = [m.get((g, k)) for g, k in zip(df["game_id"].astype(str), key)]
+    out["decision_at"] = pd.to_datetime(df["starts_at"], utc=True) - pd.Timedelta(hours=h)
+    out = out[out["p_base"].notna() & out["p_close"].notna() & (out["p_close"] != out["p_base"])].reset_index(drop=True)
+    out["y"] = (out["p_close"] > out["p_base"]).astype(float)
+    out["p_model"] = out["p_base"]  # unknown at the horizon: neutral (d_model = 0)
+    out["p_naive"] = np.nan
+    out["hours_to_start"] = float(h)
+    return out
+
+
+def run(sport, markets, source="live", target="outcome", name=None, save=True, sets=None, eligible_only=False, horizon=None):
     df = load(sport, markets, source)
-    label = name or f"{sport} {'+'.join(markets) if markets else 'all'} {source} {target}"
+    arm = "v1" if not sets else "+".join(sets)
+    label = name or (f"{sport} {'+'.join(markets) if markets else 'all'} {source} {target}" + (f" h{horizon}" if horizon else "")
+                     + (f" [{arm}]" if eligible_only else ""))
     if df.empty:
         print(f"{label}: no data")
         return None
     live = source == "live"
-    if target == "movement":
+    if horizon:
+        df = horizon_frame(df, sport, horizon)
+    if eligible_only or sets:
+        df, elig = enrich(df, sport)
+        df = df[elig].reset_index(drop=True)
+        cols = []
+        for st in sets or []:
+            cols += SETS[st][1] if (df["kind"] == "game").all() else SETS[st][0]
+        df.attrs["extra"] = [c for c in dict.fromkeys(cols) if c in df.columns]
+    if target == "movement" and not horizon:
         if not live:
             raise SystemExit("movement needs live data")
         df = df[df["p_close"].notna() & (df["p_close"] != df["p_base"])].reset_index(drop=True)
         df["y"] = (df["p_close"] > df["p_base"]).astype(float)
+    if df.empty:
+        print(f"{label}: no eligible rows")
+        return None
+    # backtests without historical lines (player props, NHL game markets) compare against the naive model
+    vs_naive = (df["comparison"] == "baseline").all()
+    if vs_naive and not name:
+        label += " (vs naive model, no market prices)"
     markets_seen = sorted(df["market"].unique())
     X, lm = design(df, source, markets_seen)
     y = df["y"].to_numpy(float)
@@ -296,12 +431,23 @@ def run(sport, markets, source="live", target="outcome", name=None, save=True):
         d = best["brier_vs_market"]
         folds_used = len(T["fold"].unique())
         calibrated = best["ece"] <= mk["ece"] + 0.01
-        if d["hi99"] < 0 and calibrated and best["folds_better"] >= 0.6 * folds_used:
+        if vs_naive:
+            verdict = "inconclusive"
+            why = (f"Brier vs the naive model {d['mean']:+.4f} (99% {d['lo99']:+.4f} to {d['hi99']:+.4f}); no historical market prices exist for these markets, "
+                   "so this can never show an edge over the market")
+        elif d["hi99"] < 0 and calibrated and best["folds_better"] >= 0.6 * folds_used:
             verdict, why = "shadow_candidate", "beats the market out of sample (99% interval below 0), calibrated, better in most folds"
         elif d["lo99"] > 0:
             verdict, why = "rejected", "worse than the market out of sample (99% interval above 0)"
         else:
-            verdict, why = "inconclusive", f"Brier vs market {d['mean']:+.4f} (99% interval {d['lo99']:+.4f} to {d['hi99']:+.4f}) includes 0"
+            failed = []
+            if d["hi99"] >= 0:
+                failed.append(f"99% interval {d['lo99']:+.4f} to {d['hi99']:+.4f} includes 0")
+            if not calibrated:
+                failed.append(f"calibration error {best['ece']:.3f} vs market {mk['ece']:.3f}")
+            if best["folds_better"] < 0.6 * folds_used:
+                failed.append(f"better in {best['folds_better']} of {folds_used} folds")
+            verdict, why = "inconclusive", f"Brier vs market {d['mean']:+.4f}; fails: " + "; ".join(failed)
     gate = {"rule": "best residual model: 99% game-bootstrap interval of the Brier difference vs market below 0, calibration error within 1 point of the market's, "
                     f"better in at least 60% of folds, at least {MIN_TEST} test rows and {MIN_TEST_GAMES} games; shadow only, never auto-promoted",
             "why": why, "best_model": best["model"] if best else None,
@@ -313,7 +459,8 @@ def run(sport, markets, source="live", target="outcome", name=None, save=True):
     payload = {"results": results, "info": {"blend_w_by_fold": info["blend_w"], "enet_coef_last_fold": info["enet_coef"],
                "lgbm_gain_last_fold": info["lgbm_gain"], "xgb_gain_last_fold": info["xgb_gain"], "features": list(X.columns.drop("lm")),
                "folds": [f for f in folds if (df["fold"] == f).any()], "test_folds": sorted(T["fold"].unique().tolist()), "test_games": games,
-               "ev_min": EV_MIN, "splits": train_ranges, "games": int(df["game_id"].nunique()), "test_rows": n_test,
+               "ev_min": EV_MIN, "splits": train_ranges, "arm": arm, "extra_features": df.attrs.get("extra", []), "horizon_hours": horizon,
+               "eligible_only": eligible_only, "games": int(df["game_id"].nunique()), "test_rows": n_test,
                "feature_definitions": {k: v for k, v in FEATURES.items() if k in X.columns or k == "m_<market>"},
                "config": {"lgbm": LGBM, "xgb": XGB, "enet": ENET, "blend": "w in [0,1] step 0.02 by Brier on training folds", "min_train_folds": min_train,
                           "game_hours": GAME_HOURS if live else None, "bootstrap": "1000 resamples of games, seed 7", "novig": "multiplicative (proportional)"}}}
@@ -323,18 +470,69 @@ def run(sport, markets, source="live", target="outcome", name=None, save=True):
     except Exception:
         rev = "?"
     print_summary(label, results, verdict, why, n_test, games)
+    oos = {"ids": T["id"].to_numpy(), "games": T["game_id"].to_numpy(), "y": yt, "label": label, "hash": h,
+           "preds": {k: p[test_mask] for k, p in preds.items() if not np.isnan(p[test_mask]).all()}}
     if save:
         with psycopg.connect(DB) as cx:
             same = cx.execute("SELECT id FROM ml_experiments WHERE name=%s AND dataset_hash=%s AND code_version=%s", (label, h, f"{CODE} @ {rev}")).fetchone()
             if same:
                 print(f"   unchanged: already recorded as experiment {same[0]} (same data and code)")
-                return verdict
+                return verdict, oos
             cx.execute("INSERT INTO ml_experiments (name, sport, markets, source, target, dataset_hash, n, n_test, folds, best_model, verdict, results, gate, code_version) "
                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)",
                        (label, sport, markets_seen, source, target, h, int(len(df)), n_test, len(T["fold"].unique()) if len(T) else 0,
                         gate["best_model"], verdict, json.dumps(payload, default=float), json.dumps(gate), f"{CODE} @ {rev}"))
             cx.commit()
-    return verdict
+    return verdict, oos
+
+
+def ablation(sport, markets, source, target, horizon, save):
+    """Every feature set alone and all together, on the same eligible rows, judged against the v1 arm as well as the market."""
+    arms = [None] + [[k] for k in SETS] + [list(SETS)]
+    runs = []
+    for sets in arms:
+        r = run(sport, markets, source, target, save=save, sets=sets, eligible_only=True, horizon=horizon)
+        if r:
+            runs.append(("v1" if not sets else "+".join(sets), r[1]))
+    if len(runs) < 2:
+        return
+    base_name, base = runs[0]
+    rows = []
+    print(f"\n-- {base['label']}: each arm minus v1 (Brier, paired on identical test rows, 99% game-bootstrap)")
+    for arm, o in runs[1:]:
+        assert np.array_equal(o["ids"], base["ids"]), "arms must be scored on identical rows"
+        for m in ("residual_enet", "residual_lgbm", "residual_xgb"):
+            if m not in o["preds"] or m not in base["preds"]:
+                continue
+            d = (o["preds"][m] - o["y"]) ** 2 - (base["preds"][m] - base["y"]) ** 2
+            c = clustered(d, o["games"])
+            rows.append({"arm": arm, "model": m, "vs_v1": c})
+            print(f"   {arm:40} {m:14} {c['mean']:+.4f} [{c['lo99']:+.4f}, {c['hi99']:+.4f}]")
+    helped = [r for r in rows if r["vs_v1"]["hi99"] < 0]
+    hurt = [r for r in rows if r["vs_v1"]["lo99"] > 0]
+    # an ablation never promotes anything: at best it says a feature set is worth keeping
+    verdict = "rejected" if hurt and not helped else "inconclusive"
+    why = (f"{len(helped)} of {len(rows)} arm x model comparisons improve on v1 at 99% (a shadow candidate also needs to beat the market; none of the arms did)"
+           if helped else f"no feature set improves on v1 at 99% ({len(hurt)} of {len(rows)} comparisons are significantly worse)")
+    print(f"   => {why}")
+    if save:
+        label = base["label"].replace(" [v1]", " ablation")
+        with psycopg.connect(DB) as cx:
+            try:
+                rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+            except Exception:
+                rev = "?"
+            if cx.execute("SELECT 1 FROM ml_experiments WHERE name=%s AND dataset_hash=%s AND code_version=%s", (label, base["hash"], f"{CODE} @ {rev}")).fetchone():
+                return
+            cx.execute("INSERT INTO ml_experiments (name, sport, markets, source, target, dataset_hash, n, n_test, folds, best_model, verdict, results, gate, code_version) "
+                       "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)",
+                       (label, sport, markets or ["all"], source, target, base["hash"], int(len(base["y"])), int(len(base["y"])), 0, None, verdict,
+                        json.dumps({"results": [], "ablation": rows, "arms": [a for a, _ in runs]}, default=float),
+                        json.dumps({"rule": "an arm helps only if its paired Brier difference vs the v1 arm has a 99% game-bootstrap interval below 0; "
+                                            "it still has to beat the market to become a shadow candidate", "why": why, "best_model": None,
+                                    "caveats": [f"{len(rows)} correlated comparisons from one dataset; not family-wise corrected"]}),
+                        f"{CODE} @ {rev}"))
+            cx.commit()
 
 
 def print_summary(label, results, verdict, why, n_test, games):
@@ -365,6 +563,9 @@ def main():
     ap.add_argument("--source", default="live", choices=["live", "backtest"])
     ap.add_argument("--target", default="outcome", choices=["outcome", "movement"])
     ap.add_argument("--suite", action="store_true")
+    ap.add_argument("--ablation", action="store_true", help="v1 vs each feature set vs all, on the same eligible rows")
+    ap.add_argument("--sets", help="comma list of feature sets to add: " + ",".join(SETS))
+    ap.add_argument("--horizon", type=int, help="movement from H hours before the start (6, 12, 24)")
     ap.add_argument("--no-save", action="store_true")
     a = ap.parse_args()
     if a.suite:
@@ -373,7 +574,11 @@ def main():
         return
     if not a.sport:
         ap.error("--sport or --suite")
-    run(a.sport, a.markets.split(",") if a.markets else None, a.source, a.target, save=not a.no_save)
+    mk = a.markets.split(",") if a.markets else None
+    if a.ablation:
+        ablation(a.sport, mk, a.source, a.target, a.horizon, not a.no_save)
+        return
+    run(a.sport, mk, a.source, a.target, save=not a.no_save, sets=a.sets.split(",") if a.sets else None, eligible_only=bool(a.sets), horizon=a.horizon)
 
 
 if __name__ == "__main__":

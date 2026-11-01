@@ -291,6 +291,8 @@ async fn build(state: &State) -> Result<Value, String> {
         e.0.push((r.get(3), r.get::<_, Option<f64>>(4).unwrap_or(0.0), r.get(5)));
     }
 
+    let holds: HashMap<(String, String), (String, DateTime<Utc>)> = db.query("SELECT engine, market, reason, decided_at FROM publication_holds_active", &[]).await
+        .map(|rows| rows.iter().map(|r| ((r.get(0), r.get(1)), (r.get(2), r.get(3)))).collect()).unwrap_or_default();
     let mut keys: Vec<(String, String)> = lines.keys().chain(picks.keys()).chain(ev.keys()).filter(|k| k.1 != "_none").cloned().collect();
     keys.sort(); keys.dedup();
     let mut markets = Vec::new();
@@ -324,6 +326,7 @@ async fn build(state: &State) -> Result<Value, String> {
             "tier": tier, "tier_source": decided.map(|d| format!("{} vs {}", d.source, d.comparison)), "model_quality": grade, "status": status,
             "backtest": backtest, "lines": lj, "picks": pj,
             "excluded_picks": excluded.get(&k).copied().unwrap_or(0),
+            "publication_hold": holds.get(&k).map(|(reason, at)| json!({ "reason": reason, "since": at })),
             "reasons": why,
         }));
     }
@@ -361,6 +364,10 @@ pub async fn statuses(state: &State) -> HashMap<(String, String), (String, Strin
     let Ok(v) = scorecard(state, false).await else { return HashMap::new() };
     let mut out: HashMap<(String, String), (String, String)> = v["markets"].as_array().into_iter().flatten().filter_map(|m| Some(((m["engine"].as_str()?.to_string(), m["market"].as_str()?.to_string()),
         (m["model_quality"].as_str()?.to_string(), m["status"].as_str()?.to_string())))).collect();
+    // publication holds as ("h:<engine>", "<market>")
+    if let Ok(rows) = state.db.query("SELECT engine, market FROM publication_holds_active", &[]).await {
+        for r in rows { out.insert((format!("h:{}", r.get::<_, String>(0)), r.get(1)), (String::new(), "held".into())); }
+    }
     // quarantined feeds as ("q:<sport>", "<market>|<book>")
     for q in v["quarantined_feeds"].as_array().into_iter().flatten() {
         if let (Some(s), Some(m), Some(b)) = (q["sport"].as_str(), q["market"].as_str(), q["book"].as_str()) {
