@@ -19,6 +19,19 @@
 //! simulation-engine / pricing-engine output automatically. Until then,
 //! callers pass that evidence in `context`.
 
+mod card;
+mod judge;
+mod llm;
+mod memory;
+mod orchestrator;
+mod protocol;
+mod rag;
+mod router;
+mod store;
+mod tools;
+mod validate;
+mod ws;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -589,7 +602,7 @@ async fn main() -> std::io::Result<()> {
             .unwrap_or_else(|| "http://localhost:11434/v1".into())
             .trim_end_matches('/')
             .to_string(),
-        model: env_opt("LLM_MODEL").unwrap_or_else(|| "qwen2.5:14b".into()),
+        model: env_opt("LLM_MODEL").unwrap_or_else(|| "qwen2.5:7b".into()),
         api_key: env_opt("LLM_API_KEY"),
     };
     // Fallback is opt-in: set FALLBACK_LLM_BASE_URL (e.g. a local freellmapi
@@ -645,9 +658,104 @@ async fn main() -> std::io::Result<()> {
             llm.primary.model, llm.primary.base_url
         ),
     }
+    // Chat orchestrator (router + tools + bet card + streaming model + WebSocket)
+    let models = llm::models_from_env(&|k: &str| env_opt(k));
+    let store = match env_opt("DATABASE_URL") {
+        Some(url) => match store::Store::connect(&url).await {
+            Ok(s) => Some(s),
+            Err(e) => { eprintln!("monster-gpt: conversation storage off: {e}"); None }
+        },
+        None => { println!("monster-gpt: DATABASE_URL not set; conversation storage off"); None }
+    };
+    // document search (hybrid) + long-term memory, both on Postgres
+    let ollama_url = env_opt("OLLAMA_URL").unwrap_or_else(|| models.iter().find(|m| m.provider == llm::Provider::Ollama).map(|m| m.base_url.clone()).unwrap_or_else(|| "http://localhost:11434".into()));
+    let (rag, memory) = match env_opt("DATABASE_URL") {
+        Some(url) => {
+            let dirs: Vec<String> = env_opt("RAG_DIRS").unwrap_or_else(|| "docs,research,models,README.md,apps/monster-gpt/SYSTEM_PROMPT.md".into())
+                .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let rag = match rag::Rag::connect(&url, &ollama_url, &env_opt("RAG_EMBED_MODEL").unwrap_or_else(|| rag::EMBED_MODEL_DEFAULT.into()),
+                PathBuf::from(env_opt("RAG_ROOT").unwrap_or_else(|| ".".into())), dirs).await {
+                Ok(r) => Some(r),
+                Err(e) => { eprintln!("monster-gpt: document search off: {e}"); None }
+            };
+            let memory = match memory::Memory::connect(&url).await { Ok(m) => Some(m), Err(e) => { eprintln!("monster-gpt: memory off: {e}"); None } };
+            (rag, memory)
+        }
+        None => (None, None),
+    };
+    let max_slots: usize = env_opt("MONSTER_GPT_MAX_GENERATIONS").and_then(|v| v.parse().ok()).unwrap_or(2);
+    let gpt = web::Data::new(orchestrator::Gpt {
+        llm: llm.clone(),
+        rag,
+        memory,
+        http: reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        tools: tools::Tools {
+            http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+            projection_url: llm.rag.projection_url.clone(),
+        },
+        store,
+        models,
+        slots: std::sync::Arc::new(tokio::sync::Semaphore::new(max_slots)),
+        max_slots,
+        sessions: Default::default(),
+        origins: env_opt("MONSTER_GPT_ORIGINS").unwrap_or_else(|| "http://localhost:5190,http://127.0.0.1:5190".into())
+            .split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()).collect(),
+        metrics: Default::default(),
+        max_connections: env_opt("MONSTER_GPT_MAX_CONNECTIONS").and_then(|v| v.parse().ok()).unwrap_or(50),
+    });
+    println!("monster-gpt: chat models {:?}; storage {}; ws /ws (protocol v{})",
+        gpt.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), if gpt.store.is_some() { "on" } else { "off" }, protocol::VERSION);
+    // keep the chat model and the embedder loaded on the GPU: a cold load costs 30-140 s
+    {
+        let g = gpt.clone();
+        actix_web::rt::spawn(async move {
+            let http = reqwest::Client::new();
+            loop {
+                let base = g.models.iter().find(|m| m.provider == llm::Provider::Ollama).map(|m| m.base_url.clone());
+                if let Some(base) = base {
+                    let t0 = std::time::Instant::now();
+                    let chat = http.post(format!("{base}/api/generate")).json(&json!({ "model": g.models[0].id, "prompt": "", "keep_alive": "60m" }))
+                        .timeout(Duration::from_secs(300)).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    let embed = match &g.rag { Some(r) => http.post(format!("{base}/api/embed")).json(&json!({ "model": r.embed_model, "input": ["warm"], "keep_alive": "60m" }))
+                        .timeout(Duration::from_secs(120)).send().await.map(|r| r.status().is_success()).unwrap_or(false), None => true };
+                    println!("monster-gpt: warm-up {} chat={chat} embed={embed} in {:.1}s", g.models[0].id, t0.elapsed().as_secs_f64());
+                }
+                actix_web::rt::time::sleep(Duration::from_secs(1200)).await;
+            }
+        });
+    }
+    // index docs now and every 30 minutes (unchanged files are skipped)
+    {
+        let g = gpt.clone();
+        actix_web::rt::spawn(async move {
+            loop {
+                if let Some(r) = &g.rag {
+                    let v = r.ingest(false).await;
+                    println!("monster-gpt: docs index {} files, {} chunks ({} added, {} updated, {} deleted, {} errors)", v["files"], v["chunks_indexed"],
+                        v["added"], v["updated"], v["deleted"], v["errors"].as_array().map(|a| a.len()).unwrap_or(0));
+                } else { break; }
+                actix_web::rt::time::sleep(Duration::from_secs(1800)).await;
+            }
+        });
+    }
     HttpServer::new(move || {
         App::new()
             .app_data(llm.clone())
+            .app_data(gpt.clone())
+            .route("/memory", web::get().to(ws::memory_list))
+            .route("/memory/{id}", web::delete().to(ws::memory_delete))
+            .route("/rag/search", web::get().to(ws::rag_search))
+            .route("/rag/reindex", web::post().to(ws::rag_reindex))
+            .route("/rag/eval", web::get().to(ws::rag_eval))
+            .route("/ws", web::get().to(ws::ws))
+            .route("/session", web::post().to(ws::session))
+            .route("/chat", web::post().to(ws::chat))
+            .route("/conversations", web::get().to(ws::conversations))
+            .route("/conversations/{id}", web::get().to(ws::conversation_messages))
+            .route("/conversations/{id}", web::delete().to(ws::delete_conversation))
+            .route("/metrics", web::get().to(ws::metrics))
             .route("/healthz", web::get().to(healthz))
             .route("/ask", web::post().to(ask))
             .route("/retrieve", web::get().to(retrieve_handler))

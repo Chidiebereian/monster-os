@@ -5,8 +5,12 @@
 //! ANY  /api/{service}/{path..}   reverse-proxied to that service, e.g.
 //!      /api/pricing-engine/price?probability=0.61 -> http://localhost:8082/price?...
 //!
+//! GET  /ws/{service}/{path..}    WebSocket pass-through (ws.rs; monster-gpt only)
+//!
 //! Upstreams default to localhost on each service's default port; override
 //! one with `<SERVICE>_URL`, e.g. PRICING_ENGINE_URL=http://pricing:8082.
+
+mod ws;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -49,6 +53,8 @@ const SERVICES: &[(&str, u16)] = &[
 const HOP_BY_HOP: &[&str] = &[
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
+    // set by the gateway itself from the socket address; never trusted from the client
+    "x-forwarded-for",
 ];
 
 struct Gateway {
@@ -90,6 +96,8 @@ async fn proxy(
         Err(_) => return HttpResponse::MethodNotAllowed().finish(),
     };
     let mut upstream = gw.http.request(method, &url).body(body.to_vec());
+    // the real client address, so services can tell local callers from remote ones
+    if let Some(ip) = req.peer_addr().map(|a| a.ip().to_string()) { upstream = upstream.header("x-forwarded-for", ip); }
     for (name, value) in req.headers() {
         if !HOP_BY_HOP.contains(&name.as_str()) {
             upstream = upstream.header(name.as_str(), value.as_bytes());
@@ -139,6 +147,7 @@ async fn main() -> std::io::Result<()> {
             .route("/healthz", web::get().to(healthz))
             .route("/", web::get().to(directory))
             .route("/api/{service}/{tail:.*}", web::to(proxy))
+            .route("/ws/{service}/{tail:.*}", web::get().to(ws::ws_proxy))
     })
     .bind(("0.0.0.0", port))?
     .run()

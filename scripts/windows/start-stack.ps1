@@ -28,6 +28,8 @@ if (Test-Path $envFile) {
     }
 }
 $env:DATABASE_URL = "postgres://monster:monster@localhost:5434/monsteros"
+# MonsterGPT: extra selectable chat model (fast, weaker) next to LLM_MODEL from .env
+if (-not $env:MONSTER_GPT_MODELS) { $env:MONSTER_GPT_MODELS = "qwen2.5:0.5b" }
 $env:CLICKHOUSE_USER = "monster"
 $env:CLICKHOUSE_PASSWORD = "monster"
 

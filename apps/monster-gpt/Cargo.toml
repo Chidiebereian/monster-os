@@ -10,4 +10,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"
 
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+actix-ws = "0.2.5"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"

@@ -1,0 +1,17 @@
+# NVIDIA GPU for Ollama (MonsterGPT). Needs Docker's NVIDIA runtime.
+# Recreate only the Ollama container with it:
+#   docker compose -p monster-os -f infrastructure/docker-compose.yml -f infrastructure/docker-compose.gpu.yml up -d --no-deps ollama
+services:
+  ollama:
+    environment:
+      # chat model (qwen2.5:3b, ~2.3 GB) + embedder (nomic-embed-text, ~0.3 GB) share a 4 GB card
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_FLASH_ATTENTION: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

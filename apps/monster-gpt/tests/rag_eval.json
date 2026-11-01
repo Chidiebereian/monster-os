@@ -1,0 +1,20 @@
+[
+  { "q": "How are AI pick grades capped by track record?", "relevant": ["docs/architecture/ai-picks.md"] },
+  { "q": "what does proven vs baseline tier mean for a pick", "relevant": ["docs/architecture/ai-picks.md"] },
+  { "q": "How does the parlay builder price correlated legs in a same game parlay?", "relevant": ["docs/architecture/parlay-builder.md"] },
+  { "q": "joint probability of parlay legs from simulations", "relevant": ["docs/architecture/parlay-builder.md"] },
+  { "q": "How is the NBA possession simulator validated walk-forward?", "relevant": ["docs/nba-poss-sim-model-card.md"] },
+  { "q": "what data does the hockey event simulator fit each season", "relevant": ["docs/nhl-event-sim-model-card.md"] },
+  { "q": "How does the NFL play simulator handle confirmed lineups?", "relevant": ["docs/nfl-play-sim-model-card.md"] },
+  { "q": "baseball plate appearance simulation model", "relevant": ["docs/mlb-model-card.md"] },
+  { "q": "When does a shadow model get promoted to champion?", "relevant": ["docs/architecture/learning-loop.md"] },
+  { "q": "first half and first period markets and the game_segments table", "relevant": ["docs/architecture/game-markets.md"] },
+  { "q": "how do player prop projections work across layers", "relevant": ["docs/architecture/player-props.md"] },
+  { "q": "Why can a trader's win rate look too high on the top traders leaderboard?", "relevant": ["docs/architecture/top-traders.md"] },
+  { "q": "how is the smart signals score from 0 to 100 computed", "relevant": ["docs/architecture/smart-signals.md"] },
+  { "q": "broadcast simulation endpoints and execution modes", "relevant": ["docs/architecture/broadcast-simulation.md"] },
+  { "q": "WebSocket protocol events for MonsterGPT streaming", "relevant": ["docs/architecture/monster-gpt.md"] },
+  { "q": "Which storage does Monster OS use for analytics vs transactions?", "relevant": ["docs/architecture.md"] },
+  { "q": "recipe for chocolate chip cookies", "relevant": [] },
+  { "q": "who won the 1998 world cup final", "relevant": [] }
+]

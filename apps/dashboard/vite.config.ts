@@ -12,6 +12,8 @@ export default defineConfig({
     port: 5190,
     proxy: {
       "/api": { target: gateway, changeOrigin: true },
+      // MonsterGPT WebSocket (protocol v1) through the gateway's WS pass-through
+      "/ws/monster-gpt": { target: gateway.replace(/^http/, "ws"), ws: true, rewrite: () => "/ws/monster-gpt/ws" },
     },
   },
 });
