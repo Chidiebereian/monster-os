@@ -59,16 +59,41 @@ pub struct Bet {
     pub source: String,
 }
 
+/// One parlay: a single wager that pays only if every leg wins.
 #[derive(Clone, Debug, Serialize)]
 pub struct Parlay {
+    /// pick ids of the legs
     pub legs: Vec<i64>,
+    /// "Cale Makar Under 1.5 Points -150", in leg order
+    pub selections: Vec<String>,
     pub decimal_odds: f64,
     pub american: i64,
     pub p_model: f64,
     pub ev: f64,
+    /// the stake on the whole parlay (None = unstaked recommendation)
     pub stake_usd: Option<f64>,
+    /// stake x combined decimal odds
+    pub payout_usd: Option<f64>,
+    /// profit if every leg wins (payout - stake)
     pub to_win_usd: Option<f64>,
     pub note: String,
+}
+
+/// How a parlay card is staked, kept apart so a parlay stake is never read as
+/// a bankroll (or split across legs).
+#[derive(Clone, Debug, Serialize)]
+pub struct Staking {
+    /// "requested" (the user named the stake), "bankroll" (sized from the
+    /// bankroll they stated) or "unstaked" (no amount given)
+    pub basis: &'static str,
+    /// the stake the user asked for, per parlay
+    pub parlay_stake: Option<f64>,
+    /// only when the user said it is their bankroll
+    pub bankroll: Option<f64>,
+    pub stake_per_parlay: Option<f64>,
+    pub number_of_parlays: usize,
+    /// sum of all parlay stakes
+    pub total_exposure: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -79,7 +104,10 @@ pub struct Card {
     pub bets: Vec<Bet>,
     pub total_stake_usd: Option<f64>,
     pub expected_profit_usd: Option<f64>,
-    pub parlay: Option<Parlay>,
+    /// parlays built from `bets` (legs are listed in `bets` and carry no stake of their own)
+    pub parlays: Vec<Parlay>,
+    /// set for parlay requests
+    pub staking: Option<Staking>,
     /// why the card is empty or short, and what else is open
     pub notes: Vec<String>,
     /// open picks by sport before filtering (so the user can widen the ask)
@@ -100,7 +128,9 @@ fn first_sentence(s: &str) -> String {
 /// Build the card from `/picks` rows. `today` is the ET date "now".
 pub fn build(picks: &[Value], f: &Filters, today: NaiveDate, game_filter: Option<&[String]>) -> Card {
     let risk = f.risk.as_deref().unwrap_or("normal");
-    let count = f.count.unwrap_or(if f.parlay { 3 } else if risk == "safe" { 3 } else { 5 }).max(1);
+    let n_parlays = f.parlays.unwrap_or(1).clamp(1, 5);
+    let legs_per = f.legs.or(f.count).unwrap_or(3).clamp(2, 6);
+    let count = if f.parlay { legs_per * n_parlays } else { f.count.unwrap_or(if risk == "safe" { 3 } else { 5 }).max(1) };
     let mut available = serde_json::Map::new();
     for p in picks.iter().filter(|p| p["status"] == "open") {
         let k = p["sport"].as_str().unwrap_or("?").to_string();
@@ -152,7 +182,8 @@ pub fn build(picks: &[Value], f: &Filters, today: NaiveDate, game_filter: Option
         *per_game.entry(game.clone()).or_default() += 1;
         let price = p["price"].as_i64().unwrap_or(0);
         let stake_frac = p["stake"].as_f64().filter(|x| *x > 0.0).unwrap_or(0.005);
-        let stake_usd = f.bankroll.map(|b| (b * stake_frac).max(1.0).round());
+        // a parlay leg is not a wager of its own: only the parlay is staked
+        let stake_usd = if f.parlay { None } else { f.bankroll.map(|b| (b * stake_frac).max(1.0).round()) };
         let subj = p["subject_name"].as_str().unwrap_or("");
         let label = p["label"].as_str().unwrap_or("");
         let pick = if p["kind"] == "prop" { format!("{subj} {label}") } else { label.to_string() };
@@ -181,35 +212,63 @@ pub fn build(picks: &[Value], f: &Filters, today: NaiveDate, game_filter: Option
         });
         if risk == "safe" { notes.push("\"Safe\" only allows proven or baseline picks graded B+ or better; say \"normal risk\" to widen it.".into()); }
     } else if bets.len() < count {
-        notes.push(format!("Only {} pick{} cleared the filters (asked for {count}).", bets.len(), if bets.len() == 1 { "" } else { "s" }));
+        notes.push(if f.parlay {
+            format!("Only {} leg{} from different games cleared the filters (asked for {count}).", bets.len(), if bets.len() == 1 { "" } else { "s" })
+        } else {
+            format!("Only {} pick{} cleared the filters (asked for {count}).", bets.len(), if bets.len() == 1 { "" } else { "s" })
+        });
     }
     if dropped_unplayable > 0 {
         notes.push(format!("{dropped_unplayable} pick{} left out because the price has moved past the playable price.", if dropped_unplayable == 1 { " was" } else { "s were" }));
     }
-    if f.bankroll.is_none() && !bets.is_empty() {
+    if !f.parlay && f.bankroll.is_none() && !bets.is_empty() {
         notes.push("Stakes are shown as a share of bankroll; tell me your bankroll for dollar amounts.".into());
     }
 
-    let parlay = if f.parlay && bets.len() >= 2 {
-        let legs: Vec<&Bet> = bets.iter().take(4).collect();
-        let dec: f64 = legs.iter().map(|b| decimal(b.price)).product();
-        let p: f64 = legs.iter().map(|b| b.p_model).product();
-        let stake = f.bankroll.map(|b| (b * 0.005).max(1.0).round());
-        Some(Parlay {
-            legs: legs.iter().map(|b| b.id).collect(), decimal_odds: round2(dec), american: american(dec), p_model: (p * 1000.0).round() / 1000.0,
-            ev: round2(p * dec - 1.0), stake_usd: stake, to_win_usd: stake.map(|s| round2(s * (dec - 1.0))),
-            note: "Legs from different games, priced as independent at each leg's own price. Books pay less than this on same-game parlays; the Parlay Builder prices correlation properly.".into(),
-        })
-    } else {
-        if f.parlay { notes.push("A parlay needs at least two legs from different games.".into()); }
-        None
+    // parlays: consecutive groups of legs; the stake is the user's, or a small
+    // share of a bankroll they stated, never made up
+    let (stake_per, basis) = match (f.parlay_stake, f.bankroll) {
+        (Some(s), _) => (Some(s), "requested"),
+        (None, Some(b)) => (Some((b * 0.005).max(1.0).round()), "bankroll"),
+        _ => (None, "unstaked"),
     };
+    let mut parlays = Vec::new();
+    if f.parlay {
+        for chunk in bets.chunks(legs_per).take(n_parlays) {
+            if chunk.len() < 2 { break; }
+            let dec: f64 = chunk.iter().map(|b| decimal(b.price)).product();
+            let p: f64 = chunk.iter().map(|b| b.p_model).product();
+            parlays.push(Parlay {
+                legs: chunk.iter().map(|b| b.id).collect(), selections: chunk.iter().map(|b| format!("{} {}", b.pick, odds_s(b.price))).collect(),
+                decimal_odds: round2(dec), american: american(dec), p_model: (p * 1000.0).round() / 1000.0, ev: round2(p * dec - 1.0),
+                stake_usd: stake_per, payout_usd: stake_per.map(|s| round2(s * dec)), to_win_usd: stake_per.map(|s| round2(s * (dec - 1.0))),
+                note: "One wager on all legs together: it pays only if every leg wins. Legs from different games, priced as independent at each leg's own price. Books pay less than this on same-game parlays; the Parlay Builder prices correlation properly.".into(),
+            });
+        }
+        if parlays.is_empty() && !bets.is_empty() { notes.push("A parlay needs at least two legs from different games.".into()); }
+        else if !parlays.is_empty() && parlays.len() < n_parlays {
+            notes.push(format!("Only enough legs for {} of the {n_parlays} parlays asked for.", parlays.len()));
+        }
+        if basis == "unstaked" && !parlays.is_empty() {
+            notes.push("No stake given, so this is an unstaked recommendation. Say an amount (\"put $20 on it\") to see the payout.".into());
+        }
+    }
+    let staking = f.parlay.then(|| {
+        let exposure = stake_per.map(|s| round2(s * parlays.len() as f64));
+        if let (Some(e), Some(b)) = (exposure, f.bankroll) {
+            if b > 0.0 && e > b { notes.push(format!("These parlays stake ${}, more than your ${} bankroll.", crate::router::money_s(e), crate::router::money_s(b))); }
+        }
+        Staking { basis, parlay_stake: f.parlay_stake, bankroll: f.bankroll, stake_per_parlay: stake_per, number_of_parlays: parlays.len(), total_exposure: exposure }
+    });
 
-    let total_stake = f.bankroll.map(|_| bets.iter().filter_map(|b| b.stake_usd).sum::<f64>());
-    let exp = f.bankroll.map(|_| round2(bets.iter().map(|b| b.stake_usd.unwrap_or(0.0) * b.ev).sum::<f64>()));
+    let (total_stake, exp) = if f.parlay {
+        (staking.as_ref().and_then(|s| s.total_exposure), stake_per.map(|s| round2(parlays.iter().map(|p| s * p.ev).sum::<f64>())))
+    } else {
+        (f.bankroll.map(|_| bets.iter().filter_map(|b| b.stake_usd).sum::<f64>()), f.bankroll.map(|_| round2(bets.iter().map(|b| b.stake_usd.unwrap_or(0.0) * b.ev).sum::<f64>())))
+    };
     Card {
-        title: format!("{} for {}", if f.parlay { "Parlay" } else { "Bets" }, crate::router::describe(f)),
-        filters: f.clone(), generated_at: Utc::now(), bets, total_stake_usd: total_stake, expected_profit_usd: exp, parlay, notes,
+        title: format!("{} for {}", if f.parlay { if parlays.len() > 1 { "Parlays" } else { "Parlay" } } else { "Bets" }, crate::router::describe(f)),
+        filters: f.clone(), generated_at: Utc::now(), bets, total_stake_usd: total_stake, expected_profit_usd: exp, parlays, staking, notes,
         available: Value::Object(available),
     }
 }
@@ -223,19 +282,35 @@ pub fn render_text(c: &Card) -> String {
         return s;
     }
     s.push_str(&format!("{}:\n", c.title));
+    let parlay = c.staking.is_some();
     for (i, b) in c.bets.iter().enumerate() {
-        s.push_str(&format!("{}. {} ({}, {}) {} at {}. Model {:.0}% vs market {:.0}%, edge {:+.1} pts, grade {} ({}).",
+        s.push_str(&format!("{}{}. {} ({}, {}) {} at {}. Model {:.0}% vs market {:.0}%, edge {:+.1} pts, grade {} ({}).", if parlay { "Leg " } else { "" },
             i + 1, b.pick, b.game, b.sport.to_uppercase(), odds_s(b.price), b.book, b.p_model * 100.0, b.p_market * 100.0, b.edge * 100.0, b.grade, b.tier));
         match b.stake_usd {
             Some(u) => s.push_str(&format!(" Stake ${u:.0} to win ${:.2}; model-expected profit ${:.2}.", b.to_win_usd.unwrap_or(0.0), u * b.ev)),
+            None if parlay => {}
             None => s.push_str(&format!(" Stake {:.1}% of bankroll.", b.stake_frac * 100.0)),
         }
         if let Some(pp) = b.playable_price { s.push_str(&format!(" Playable down to {}.", odds_s(pp))); }
         s.push('\n');
     }
-    if let (Some(t), Some(e)) = (c.total_stake_usd, c.expected_profit_usd) { s.push_str(&format!("Total stake ${t:.0}; model-expected profit ${e:.2}.\n")); }
-    if let Some(p) = &c.parlay {
-        s.push_str(&format!("Parlay of {} legs: {} (decimal {:.2}), model probability {:.1}%, EV {:+.0}%.\n", p.legs.len(), odds_s(p.american), p.decimal_odds, p.p_model * 100.0, p.ev * 100.0));
+    if !parlay {
+        if let (Some(t), Some(e)) = (c.total_stake_usd, c.expected_profit_usd) { s.push_str(&format!("Total stake ${t:.0}; model-expected profit ${e:.2}.\n")); }
+    }
+    let m = crate::router::money_s;
+    for (i, p) in c.parlays.iter().enumerate() {
+        s.push_str(&format!("Parlay{}: {} legs: {}. Combined odds {} (decimal {:.2}), model probability {:.1}%, EV {:+.0}%.",
+            if c.parlays.len() > 1 { format!(" {}", i + 1) } else { String::new() }, p.legs.len(), p.selections.join("; "), odds_s(p.american), p.decimal_odds, p.p_model * 100.0, p.ev * 100.0));
+        match (p.stake_usd, p.payout_usd, p.to_win_usd) {
+            (Some(st), Some(pay), Some(win)) => s.push_str(&format!(" Total parlay stake ${}: potential payout ${pay:.2}, potential profit ${win:.2}.", m(st))),
+            _ => s.push_str(" Unstaked."),
+        }
+        s.push('\n');
+    }
+    if let Some(st) = &c.staking {
+        if let (Some(e), Some(per)) = (st.total_exposure, st.stake_per_parlay) {
+            if st.number_of_parlays > 1 { s.push_str(&format!("Total exposure ${} ({} parlays at ${} each).\n", m(e), st.number_of_parlays, m(per))); }
+        }
     }
     if !c.notes.is_empty() {
         s.push_str("Notes (about the card as a whole, or about picks NOT on it):\n");
@@ -304,9 +379,43 @@ mod tests {
     }
 
     #[test]
+    fn a_parlay_stake_is_one_wager_on_the_whole_parlay() {
+        let c = build(&slate(), &route("make me an aggressive 3-leg parlay with $50", None).filters, NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(), None);
+        let p = &c.parlays[0];
+        assert_eq!(p.legs.len(), 3);
+        assert_eq!(p.stake_usd, Some(50.0), "not $50 split by legs, not a bankroll share");
+        assert!(c.bets.iter().all(|b| b.stake_usd.is_none()), "legs carry no stake of their own");
+        assert!((p.payout_usd.unwrap() - (50.0 * p.decimal_odds * 100.0).round() / 100.0).abs() < 0.05);
+        assert!((p.to_win_usd.unwrap() - (p.payout_usd.unwrap() - 50.0)).abs() < 1e-6);
+        let st = c.staking.as_ref().unwrap();
+        assert_eq!((st.basis, st.bankroll, st.stake_per_parlay, st.number_of_parlays, st.total_exposure), ("requested", None, Some(50.0), 1, Some(50.0)));
+        assert_eq!(c.total_stake_usd, Some(50.0));
+        let text = render_text(&c);
+        assert!(text.contains("Total parlay stake $50: potential payout $") && text.contains("Leg 1."), "{text}");
+    }
+
+    #[test]
+    fn unstaked_and_multiple_parlays() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        let c = build(&slate(), &route("aggressive parlay", None).filters, today, None);
+        assert_eq!((c.parlays[0].stake_usd, c.staking.as_ref().unwrap().basis, c.total_stake_usd), (None, "unstaked", None));
+        assert!(c.notes.iter().any(|n| n.contains("unstaked")));
+        let mut s = slate();
+        s.push(pick(6, "nhl", "prop", "EDM @ VAN", "McDavid", -115, 0.09, "A", "proven", "2026-11-01T02:00:00Z"));
+        let c = build(&s, &route("aggressive: two 2-leg parlays, $10 each", None).filters, today, None);
+        assert_eq!(c.parlays.len(), 2);
+        assert!(c.parlays.iter().all(|p| p.legs.len() == 2 && p.stake_usd == Some(10.0)));
+        assert_eq!(c.staking.as_ref().unwrap().total_exposure, Some(20.0));
+        // a stated bankroll sizes the parlay; it is not the stake
+        let c = build(&slate(), &route("aggressive parlay, I have a $1000 bankroll", None).filters, today, None);
+        let st = c.staking.unwrap();
+        assert_eq!((st.basis, st.bankroll, st.stake_per_parlay), ("bankroll", Some(1000.0), Some(5.0)));
+    }
+
+    #[test]
     fn parlay_uses_one_leg_per_game_and_multiplies() {
         let c = build(&slate(), &route("aggressive parlay with $200", None).filters, NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(), None);
-        let p = c.parlay.expect("parlay");
+        let p = c.parlays[0].clone();
         assert_eq!(p.legs.len(), 3);
         let games: std::collections::HashSet<&str> = c.bets.iter().map(|b| b.game.as_str()).collect();
         assert_eq!(games.len(), 3);

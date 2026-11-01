@@ -355,7 +355,7 @@ function BetCard({ card, sources }: { card: GptCard; sources?: GptSource[] }) {
               <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1 pl-7 text-[11px] text-gray-400">
                 <span>model {pct(b.p_model)} vs market {pct(b.p_market)}</span>
                 <span className="text-emerald-light">edge +{(b.edge * 100).toFixed(1)} pts</span>
-                <span>stake {b.stake_usd != null ? `${usd(b.stake_usd)} to win ${usd(b.to_win_usd)}` : `${(b.stake_frac * 100).toFixed(1)}% of bankroll`}</span>
+                {!card.staking && <span>stake {b.stake_usd != null ? `${usd(b.stake_usd)} to win ${usd(b.to_win_usd)}` : `${(b.stake_frac * 100).toFixed(1)}% of bankroll`}</span>}
                 {b.playable_price != null && <span>playable to {odds(b.playable_price)}</span>}
                 <span className="capitalize">{b.tier}</span>
                 {(b.why || b.risks.length > 0) && <button onClick={() => setOpen(open === b.id ? null : b.id)} className="text-violet-light hover:underline">{open === b.id ? "hide" : "why + risks"}</button>}
@@ -369,13 +369,29 @@ function BetCard({ card, sources }: { card: GptCard; sources?: GptSource[] }) {
             </div>))}
         </div>
       )}
-      {card.parlay && (
-        <div className="px-4 py-2.5 border-t border-glass text-sm">
-          <span className="font-medium">{card.parlay.legs.length}-leg parlay</span> <span className="font-mono text-violet-light">{odds(card.parlay.american)}</span>
-          <span className="text-xs text-gray-400"> · model {(card.parlay.p_model * 100).toFixed(1)}% · EV {card.parlay.ev >= 0 ? "+" : ""}{(card.parlay.ev * 100).toFixed(0)}%{card.parlay.stake_usd != null ? ` · stake ${usd(card.parlay.stake_usd)} to win ${usd(card.parlay.to_win_usd)}` : ""}</span>
-          <div className="text-[11px] text-gray-500 mt-0.5">{card.parlay.note} <Link to="/parlays" className="text-violet-light hover:underline">Parlay Builder</Link></div>
+      {(card.parlays ?? []).map((p, i) => (
+        <div key={i} className="px-4 py-2.5 border-t border-glass text-sm">
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <span className="font-medium">{card.parlays.length > 1 ? `Parlay ${i + 1} · ` : ""}{p.legs.length}-leg parlay</span>
+            <span className="font-mono text-violet-light">{odds(p.american)}</span>
+            <span className="text-xs text-gray-400">model {(p.p_model * 100).toFixed(1)}% · EV {p.ev >= 0 ? "+" : ""}{(p.ev * 100).toFixed(0)}%</span>
+          </div>
+          <div className="text-xs text-gray-300 mt-1">{p.selections.join(" + ")}</div>
+          <div className="flex flex-wrap gap-x-4 mt-1 text-xs">
+            {p.stake_usd != null ? <>
+              <span>Total parlay stake <span className="font-medium text-gray-100">{usd(p.stake_usd)}</span></span>
+              <span>potential payout <span className="font-medium text-gray-100">{usd(p.payout_usd)}</span></span>
+              <span>potential profit <span className="font-medium text-emerald-light">{usd(p.to_win_usd)}</span></span>
+            </> : <span className="text-gray-400">Unstaked recommendation: say an amount ("put $20 on it") to see the payout.</span>}
+          </div>
+          <div className="text-[11px] text-gray-500 mt-0.5">{p.note} <Link to="/parlays" className="text-violet-light hover:underline">Parlay Builder</Link></div>
+        </div>))}
+      {card.staking && card.parlays.length > 0 && card.staking.stake_per_parlay != null && (
+        <div className="px-4 py-2 border-t border-glass text-xs text-gray-400">
+          {card.staking.basis === "requested" ? "Stake you asked for" : "Sized from your bankroll"}: {usd(card.staking.stake_per_parlay)}{card.staking.number_of_parlays > 1 ? ` per parlay × ${card.staking.number_of_parlays} = ${usd(card.staking.total_exposure)} total exposure` : ""}
+          {card.staking.bankroll != null ? ` · bankroll ${usd(card.staking.bankroll)}` : ""}
         </div>)}
-      {(card.total_stake_usd != null && card.bets.length > 0) && (
+      {(!card.staking && card.total_stake_usd != null && card.bets.length > 0) && (
         <div className="px-4 py-2 border-t border-glass text-xs text-gray-400">Total stake {usd(card.total_stake_usd)} · model-expected profit {usd(card.expected_profit_usd)}</div>)}
       {card.notes.length > 0 && <div className="px-4 py-2 border-t border-glass text-[11px] text-gray-500 space-y-0.5">{card.notes.map((n) => <div key={n}>{n}</div>)}</div>}
       {sources && sources.length > 0 && <div className="px-4 py-2 border-t border-glass"><Sources sources={sources} /></div>}

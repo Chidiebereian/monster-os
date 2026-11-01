@@ -8,11 +8,23 @@ export interface GptBet {
   price: number; book: string; link: string | null; p_model: number; p_market: number; edge: number; ev: number; grade: string; tier: string;
   stake_frac: number; stake_usd: number | null; to_win_usd: number | null; playable_price: number | null; why: string; risks: string[]; source: string;
 }
+export interface GptParlay {
+  legs: number[]; selections: string[]; decimal_odds: number; american: number; p_model: number; ev: number;
+  stake_usd: number | null; payout_usd: number | null; to_win_usd: number | null; note: string;
+}
+/** basis: "requested" = the user named the stake, "bankroll" = sized from their stated bankroll, "unstaked" = no amount given */
+export interface GptStaking {
+  basis: "requested" | "bankroll" | "unstaked"; parlay_stake: number | null; bankroll: number | null;
+  stake_per_parlay: number | null; number_of_parlays: number; total_exposure: number | null;
+}
 export interface GptCard {
   title: string; generated_at: string; bets: GptBet[]; total_stake_usd: number | null; expected_profit_usd: number | null; notes: string[];
-  parlay: { legs: number[]; decimal_odds: number; american: number; p_model: number; ev: number; stake_usd: number | null; to_win_usd: number | null; note: string } | null;
+  /** one wager each; legs are listed in `bets` and carry no stake of their own */
+  parlays: GptParlay[];
+  staking: GptStaking | null;
   available: Record<string, number>;
-  filters: { sport: string | null; kind: string | null; day: string | null; count: number | null; bankroll: number | null; risk: string | null; odds: string | null; parlay: boolean };
+  filters: { sport: string | null; kind: string | null; day: string | null; count: number | null; bankroll: number | null; risk: string | null; odds: string | null; parlay: boolean;
+    parlay_stake?: number | null; legs?: number | null; parlays?: number | null; unclear_amount?: number | null };
 }
 export interface GptStatus { stage: "route" | "tool" | "retrieval" | "model" | "validate" | "judge"; name: string; state: "started" | "queued" | "completed" | "failed"; detail?: string; ms?: number }
 export interface GptUsage {

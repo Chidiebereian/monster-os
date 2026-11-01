@@ -34,6 +34,8 @@ from monster_gpt.transformer import GPT  # noqa: E402
 
 
 def main():
+    # samples can hold any character; a redirected Windows console is cp1252
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default=str(ROOT / "runs" / "micro"))
     ap.add_argument("--steps", type=int, default=1500)

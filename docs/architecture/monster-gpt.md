@@ -117,7 +117,7 @@ connection limits), admin training/eval dashboard, benchmark regression gates.
 | --- | --- | --- |
 | M1 plain-English bets | done | `apps/monster-gpt/src/{router,card,tools,orchestrator,ws}.rs` |
 | M2 curriculum | done, 46 pytest tests | `models/monster-gpt/monster_gpt/{math,nn,nlp}` |
-| M3 Micro | built; training resumable (see `models/monster-gpt/README.md`) | `models/monster-gpt/` |
+| M3 Micro | trained 1,500 steps: test perplexity 56.7 (see `models/monster-gpt/README.md`) | `models/monster-gpt/` |
 | M4 RAG | done | `rag.rs`, migration 0031, `tests/rag_eval.json` |
 | M5 memory | done (preferences, notes, summaries) | `memory.rs`, `/memory` |
 | M6 gateway pass-through | done; load tests and admin dashboard not started | `apps/api-gateway/src/ws.rs` |
@@ -146,8 +146,22 @@ RAG at k=3 on 16 labelled queries plus 2 off-topic ones: hybrid P@3 0.61,
 R@3 0.89, MRR 0.86; BM25 MRR 0.82; vector MRR 0.83; off-topic queries return
 nothing. Warm search about 0.3 s including the embedding.
 
-Known limits: "a 3-leg parlay with $50" reads $50 as the bankroll, not the
-parlay stake; the checker cannot judge reasoning quality, only facts against
+Parlay stakes (`router::parlay_money`, `card::Staking`). In a parlay request
+a dollar amount is the stake on the whole parlay ("a 3-leg parlay with $50",
+"a $25 four-leg parlay"). It is a bankroll only with bankroll words ("I have a
+$50 bankroll", "my budget is $100", "$200 available", "within my $100
+bankroll"). A parlay is one wager: its legs carry no stake, and the card shows
+legs, selections, total parlay stake, combined odds, potential payout and
+potential profit. The card's `staking` keeps `parlay_stake`, `bankroll`,
+`stake_per_parlay`, `number_of_parlays` and `total_exposure` apart, with a
+`basis` of requested, bankroll (0.5% of a stated bankroll) or unstaked (no
+amount: nothing is made up). Several parlays with one amount take "each" or
+"total"/"split" at face value; otherwise MonsterGPT asks one question ("is the
+$100 on each parlay or in total?") with no model call, and the reply ("in
+total") resolves it. The judge flags "per leg"/"split the stake" wording on a
+parlay card.
+
+Known limits: the checker cannot judge reasoning quality, only facts against
 the evidence; the 7B model doesn't fit beside the 3B on a 4 GB GPU with the
 RAM this machine has free.
 

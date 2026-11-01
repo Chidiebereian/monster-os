@@ -56,6 +56,24 @@ vocab 4096, context 256, 4 layers, 4 query heads / 2 KV heads, width 256,
 RoPE, RMSNorm: 3.9M parameters, about 508 MB to train at batch 16 × 256.
 The tokenizer averages 3.46 characters per token on this corpus (419K training tokens).
 
+## Results (Micro, 1,500 steps)
+
+Trained on CPU in three sittings (the run was stopped twice for low memory and
+resumed from its checkpoint each time), about 5,000 tokens/s, peak RSS about 1.2 GB.
+
+| | loss | perplexity |
+| --- | --- | --- |
+| train sample | 2.67 | 14.4 |
+| validation | 4.04 | 57.0 |
+| test | 4.04 | 56.7 |
+
+Validation perplexity went 94 (step 500) → 74 (750) → 57.6 (1,500). The gap
+to the training sample shows it is starting to memorise a 1.4 MB corpus; more
+data, not more steps, is the next lever. The KV-cached generation matches
+uncached logits to 1e-5 and runs 2.5× faster (186 vs 75 tokens/s). Samples are
+locally fluent Markdown and docstring fragments without meaning, as expected
+at this size.
+
 ## What the tests prove
 
 - Hand-written backprop matches numerical gradients.

@@ -18,6 +18,7 @@ pub struct Issue {
 const GUARANTEES: &[&str] = &["guaranteed", "guarantee you", "can't lose", "cannot lose", "can not lose", "sure thing", "risk-free", "risk free", "free money",
     "100% chance", "100% sure", "will definitely", "definitely win", "lock of the", "easy money", "no-brainer", "cant lose", "certain to win"];
 const RISK_WORDS: &[&str] = &["risk", "variance", "lose", "afford", "no guarantee", "not guaranteed", "uncertain", "estimate", "could go wrong", "losing"];
+pub const PER_LEG: &[&str] = &["per leg", "on each leg", "for each leg", "on every leg", "each leg gets", "split the stake", "split your stake", "divide the stake", "divided across", "split across the legs", "split between the legs", "adjusted the stake", "adjust the stake"];
 const WHOLE_BANKROLL: &[&str] = &["entire bankroll", "whole bankroll", "all of your bankroll", "all your bankroll", "full bankroll", "all-in", "all in on", "your entire $", "all your money"];
 
 fn sentences(text: &str) -> Vec<String> {
@@ -110,8 +111,10 @@ fn has_number(text: &str, n: &str) -> bool {
 /// Last-resort cleanup: drop the sentences (or whole bullets, with the bullet's
 /// indented sub-points) that mention names or numbers the data doesn't support.
 /// Returns the cleaned text and how many pieces were removed.
-pub fn scrub(text: &str, names: &[String], numbers: &[String]) -> (String, usize) {
-    let bad = |s: &str| names.iter().any(|n| s.contains(n.as_str())) || numbers.iter().any(|n| has_number(s, n));
+/// `phrases` are lowercase wording to remove as well (per-leg stakes on a parlay).
+pub fn scrub(text: &str, names: &[String], numbers: &[String], phrases: &[&str]) -> (String, usize) {
+    let bad = |s: &str| names.iter().any(|n| s.contains(n.as_str())) || numbers.iter().any(|n| has_number(s, n))
+        || { let l = s.to_lowercase(); phrases.iter().any(|p| l.contains(p)) };
     let indent = |l: &str| l.len() - l.trim_start().len();
     let mut out: Vec<String> = Vec::new();
     let mut removed = 0;
@@ -178,6 +181,12 @@ pub fn check(answer: &str, card: Option<&Card>, evidence: &str) -> Vec<Issue> {
                 }
             }
         }
+        // a parlay is one wager: its stake is never per leg or split across legs
+        if c.staking.is_some() && !c.parlays.is_empty() {
+            if let Some(p) = PER_LEG.iter().find(|p| l.contains(*p)) {
+                issues.push(Issue { code: "per_leg_stake", detail: format!("says \"{p}\" but a parlay is one wager: the stake is on the whole parlay, not on each leg"), serious: true });
+            }
+        }
         // recommending bets when the card is empty
         if c.bets.is_empty() && ["i recommend", "you should bet", "take the", "bet on the", "my pick is", "best bet is"].iter().any(|p| l.contains(p)) {
             issues.push(Issue { code: "off_card", detail: "recommends a bet although the card is empty".into(), serious: true });
@@ -198,6 +207,14 @@ pub fn feedback(issues: &[Issue]) -> String {
 
 /// One plain sentence about the stake, added when the model never mentions risk.
 pub fn risk_line(card: &Card) -> String {
+    if let (Some(st), false) = (&card.staking, card.parlays.is_empty()) {
+        let all = if card.parlays.len() > 1 { "each parlay pays only if all of its legs win" } else { "the parlay pays only if every leg wins" };
+        return match (st.total_exposure, st.bankroll) {
+            (Some(t), Some(b)) if b > 0.0 => format!("\n\nThese are model estimates, not certainties, and {all}: this puts ${} of your ${} bankroll ({:.0}%) at risk, so only stake what you can afford to lose.", crate::router::money_s(t), crate::router::money_s(b), t / b * 100.0),
+            (Some(t), _) => format!("\n\nThese are model estimates, not certainties, and {all}: you could lose the full ${} stake, so only stake what you can afford to lose.", crate::router::money_s(t)),
+            _ => format!("\n\nThese are model estimates, not certainties, and {all}; only stake what you can afford to lose."),
+        };
+    }
     match (card.total_stake_usd, card.filters.bankroll) {
         (Some(t), Some(b)) if b > 0.0 => format!("\n\nThese are model estimates, not certainties: the card puts ${t:.0} of your ${b:.0} bankroll ({:.0}%) at risk, so only stake what you can afford to lose.", t / b * 100.0),
         _ => "\n\nThese are model estimates, not certainties; any of these bets can lose, so only stake what you can afford to lose.".into(),
@@ -268,14 +285,37 @@ mod tests {
     }
 
     #[test]
+    fn per_leg_stakes_are_flagged_on_a_parlay() {
+        let picks = vec![
+            json!({ "id": 1, "sport": "nhl", "kind": "prop", "game_label": "CGY @ COL", "subject": "Makar", "subject_name": "Cale Makar", "label": "Under 1.5 Points", "side": "under",
+                "price": -150, "p_model": 0.65, "p_market": 0.6, "edge": 0.05, "ev": 0.08, "grade": "A", "tier": "proven", "stake": 0.02, "status": "open", "playable_now": true }),
+            json!({ "id": 2, "sport": "nba", "kind": "game", "game_label": "BOS @ NYK", "subject": "BOS", "subject_name": "BOS", "label": "BOS Moneyline", "side": "home",
+                "price": 120, "p_model": 0.5, "p_market": 0.45, "edge": 0.05, "ev": 0.1, "grade": "A", "tier": "proven", "stake": 0.02, "status": "open", "playable_now": true }),
+        ];
+        let c = crate::card::build(&picks, &route("parlay with $50", None).filters, chrono::NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(), None);
+        assert_eq!(c.parlays.len(), 1);
+        let ev = crate::card::render_text(&c);
+        let bad = check("Put $25 on each leg: Cale Makar under and the BOS moneyline. Results vary.", Some(&c), &ev);
+        assert!(bad.iter().any(|i| i.code == "per_leg_stake"), "{bad:?}");
+        let ok = check("One $50 parlay on Cale Makar under and the BOS moneyline; every leg must win, so it is risky.", Some(&c), &ev);
+        assert!(!ok.iter().any(|i| i.code == "per_leg_stake"), "{ok:?}");
+        assert!(risk_line(&c).contains("full $50 stake"));
+    }
+
+    #[test]
     fn scrub_drops_only_the_unsupported_pieces() {
         let text = "**Overall Take:** Two solid unders.\n\n- **Bet 1 (Cale Makar Under 1.5 Points):**\n  - Why: proven model edge.\n- **Bet 2 (Luka Doncic Over 30.5):**\n  - Why: hot streak.\n  - Risk: minutes.\n\n**Sizing:** Stake $20 in total. That is 48% safer than last week. Only stake what you can afford to lose.";
-        let (out, n) = scrub(text, &["Luka Doncic".into()], &["48%".into()]);
+        let (out, n) = scrub(text, &["Luka Doncic".into()], &["48%".into()], &[]);
         assert!(!out.contains("Doncic") && !out.contains("hot streak") && !out.contains("48%"), "{out}");
         assert!(out.contains("Cale Makar") && out.contains("proven model edge") && out.contains("Stake $20 in total.") && out.contains("afford to lose"), "{out}");
         assert_eq!(n, 4);
         // "$20" is kept when only "$200" is unsupported
-        assert_eq!(scrub("Your $20 stake.", &[], &["$200".into()]).1, 0);
+        assert_eq!(scrub("Your $20 stake.", &[], &["$200".into()], &[]).1, 0);
+        // per-leg stake talk on a parlay goes too
+        let (out, n) = scrub("**Combined odds:** +3206. Total parlay stake $50.
+
+**Notes:** Adjusted the stakes slightly so $50 is used. The stake for each leg should be adjusted accordingly.", &[], &[], PER_LEG);
+        assert_eq!((out.as_str(), n), ("**Combined odds:** +3206. Total parlay stake $50.", 2));
     }
 
     #[test]

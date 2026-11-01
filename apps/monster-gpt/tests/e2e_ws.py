@@ -316,3 +316,37 @@ def test_document_search_finds_and_refuses():
     assert st == 200 and d["hits"][0]["doc_id"] == "docs/architecture/ai-picks.md"
     st, d = http("GET", "/rag/search?q=" + urllib.parse.quote("recipe for chocolate chip cookies"))
     assert st == 200 and d["hits"] == []
+
+
+def test_parlay_amount_is_the_stake_and_several_parlays_ask_first():
+    tok, _ = session()
+    # "with $50" is the stake on the whole parlay, never a bankroll or a per-leg split
+    st, r = http("POST", "/chat", token=tok, body={"text": "make me a 3-leg parlay with $50", "model": SMALL})
+    assert st == 200
+    route = next(e for e in r["events"] if e["type"] == "status" and e["stage"] == "route")
+    assert "3-leg parlay" in route["detail"] and "$50 stake" in route["detail"] and "bankroll" not in route["detail"], route
+    card = next((e["card"] for e in r["events"] if e["type"] == "card"), None)
+    assert card is not None
+    assert card["filters"]["parlay_stake"] == 50 and card["filters"]["bankroll"] is None
+    assert all(b["stake_usd"] is None for b in card["bets"]), "legs carry no stake of their own"
+    for p in card["parlays"]:
+        assert p["stake_usd"] == 50 and abs(p["payout_usd"] - p["to_win_usd"] - 50) < 0.01
+    if card["parlays"]:
+        assert card["staking"]["basis"] == "requested" and card["staking"]["total_exposure"] == 50
+
+    async def go():
+        ws, _ = await connect(tok)
+        r1 = f"pq-{time.time()}"
+        await ws.send(json.dumps({"type": "message", "request_id": r1, "text": "make 2 parlays with $100", "model": SMALL}))
+        f1 = await collect(ws, r1)
+        done = next(f for f in f1 if f["type"] == "done")
+        text = "".join(f["text"] for f in f1 if f["type"] == "delta")
+        assert done["model"] is None and done["usage"].get("clarify") == "parlay_stake", done
+        assert "each" in text and "in total" in text and not any(f["type"] == "card" for f in f1), text
+        r2 = f"pa-{time.time()}"
+        await ws.send(json.dumps({"type": "message", "request_id": r2, "conversation_id": f1[0]["conversation_id"], "text": "in total", "model": SMALL}))
+        f2 = await collect(ws, r2)
+        route = next(f for f in f2 if f["type"] == "status" and f["stage"] == "route")
+        assert "2 parlays" in route["detail"] and "$50 per parlay" in route["detail"], route
+        await ws.close()
+    run(go())
