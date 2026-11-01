@@ -284,7 +284,8 @@ pub fn route(text: &str, prev: Option<&Filters>) -> Route {
     let model_q = has(&l, &["calibrat", "brier", "log loss", "model quality", "which model", "which engine", "model perform", "models perform", "engine perform",
         "overconfident", "underconfident", "validat", "scorecard", "why isn't", "why aren't", "why no ", "why don't you", "why do you not", "not publishing",
         "publishing", "beat the market", "beat closing", "beating the market", "closing line value", "clv", "quarantin", "trust the model", "how accurate",
-        "how good is the model", "how good are the models", "verified edge", "proven"]);
+        "how good is the model", "how good are the models", "verified edge", "proven", "machine learning", "xgboost", "lightgbm", "elastic net",
+        "experiment", "residual", "overfit", "shadow", "promot", "ml model", "ml research"]);
     // "how good are the NHL player props models?", "can I trust the NBA engine"
     let model_q = model_q || (has(&l, &["model", "engine", "simulator"])
         && has(&l, &["how good", "how reliable", "reliable", "trust", "accurate", "accuracy", "working", "doing", "track record", "edge", "beat"]));
@@ -452,6 +453,8 @@ mod tests {
         assert_eq!((r.intent, r.filters.sport.as_deref()), (Intent::Model, Some("nfl")));
         assert_eq!(route("which models are best calibrated?", None).intent, Intent::Model);
         assert_eq!(route("how good are the NHL player props models?", None).intent, Intent::Model);
+        assert_eq!(route("does the XGBoost residual model beat the market on NFL spreads?", None).intent, Intent::Model);
+        assert_eq!(route("best NFL ML today", None).intent, Intent::Bets);
         assert_eq!(route("give me the best NHL props", None).intent, Intent::Bets);
         assert_eq!(route("how is the NBA model performing vs the market", None).intent, Intent::Model);
     }

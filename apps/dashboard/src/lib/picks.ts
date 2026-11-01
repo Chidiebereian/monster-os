@@ -53,12 +53,24 @@ export interface ScoreMarket {
   picks: { n: number; units: number; roi: number; roi_lo: number; roi_hi: number; hit_rate: number; max_drawdown: number; profit_factor: number | null;
     sharpe: number; sortino: number; clv_mean: number | null; clv_positive: number | null } | null;
 }
+export interface ExperimentModel {
+  model: string; brier: number; ece: number; brier_vs_market?: { mean: number; lo95: number; hi95: number; lo99: number; hi99: number } | null;
+  folds_better?: number; bets?: number | null; roi?: { mean: number; lo95: number; hi95: number } | null; clv_mean?: number | null;
+}
+export interface Experiment {
+  id: number; created_at: string; name: string; sport: string; markets: string[]; source: "live" | "backtest"; target: "outcome" | "movement";
+  dataset_hash: string; n: number; n_test: number; folds: number; best_model: string | null;
+  verdict: "shadow_candidate" | "inconclusive" | "rejected" | "insufficient_data"; gate: { rule: string; why: string; best_model: string | null };
+  models: ExperimentModel[]; code_version: string;
+}
 export interface Scorecard {
   generated_at: string; min_n: number;
   summary: Record<"markets" | MarketStatus, number>;
   markets: ScoreMarket[];
   forecasts: (Calib & { sport: string; engine: string; version: string; market: string; champion: boolean; brier_vs_baseline: Interval | null })[];
   quarantined_feeds: { sport: string; market: string; book: string }[];
+  experiments?: Experiment[];
+  dataset?: { sport: string; source: string; examples: number; games: number; from: string | null; to: string | null }[];
   feeds: { sport: string; market: string; book: string; side: string; n: number; implied: number; hit_rate: number; z: number; suspect: boolean }[];
 }
 

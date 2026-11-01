@@ -6,7 +6,7 @@ import { ExternalLink, X } from "lucide-react";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import {
   BANKROLL_KEY, GRADES, QUALIFICATIONS, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
-  type Edge, type MarketStatus, type Pick, type PickDetail, type PickFilters, type Qualification, type ScoreMarket, type Tier,
+  type Edge, type Experiment, type MarketStatus, type Pick, type PickDetail, type PickFilters, type Qualification, type ScoreMarket, type Scorecard, type Tier,
 } from "../lib/picks";
 
 // AI Picks: the curated feed. Every pick is a live two-way line priced by the
@@ -615,6 +615,7 @@ function Models() {
               );
             })}
           </Table>
+          <Experiments sc={d} sport={s} />
           <h2 className="font-medium pt-2">Engine forecasts vs their naive baseline</h2>
           <Table head={<tr><Th>Engine version</Th><Th>Market</Th><Th>n</Th><Th>Brier</Th><Th>Log loss</Th><Th>Calib. err.</Th><Th>vs baseline [95%]</Th></tr>}>
             {d.forecasts.filter((f) => f.champion && f.n >= 100).map((f) => (
@@ -628,6 +629,46 @@ function Models() {
         </>
       )}
     </div>
+  );
+}
+
+const verdictTone: Record<string, string> = {
+  shadow_candidate: "text-emerald-light", inconclusive: "text-amber", rejected: "text-crimson-light", insufficient_data: "text-gray-500",
+};
+
+/** Walk-forward ML experiments (scripts/ml): every learned model starts from the market and must beat it out of sample. */
+function Experiments({ sc, sport }: { sc: Scorecard; sport?: string }) {
+  const ex = (sc.experiments ?? []).filter((e) => !sport || e.sport === sport);
+  const ds = (sc.dataset ?? []).filter((r) => !sport || r.sport === sport);
+  if (!ex.length) return null;
+  const iv = (x?: { mean: number; lo95: number; hi95: number } | null) => (x ? `${x.mean >= 0 ? "+" : ""}${x.mean.toFixed(4)} [${x.lo95.toFixed(4)}, ${x.hi95.toFixed(4)}]` : "—");
+  const pick = (e: Experiment, m: string) => e.models.find((x) => x.model === m);
+  return (
+    <>
+      <h2 className="font-medium pt-2">ML research: residual models vs the market</h2>
+      <p className="text-xs text-gray-500 max-w-4xl">
+        Walk-forward (train on earlier days or seasons, test the next). Elastic net, LightGBM and XGBoost all start from the market's probability.
+        A model becomes a shadow candidate only if its 99% interval beats the market, it stays calibrated and it wins most folds; nothing is promoted automatically.
+        {ds.length > 0 && <> Dataset: {ds.map((r) => `${r.sport.toUpperCase()} ${r.source} ${r.examples.toLocaleString()} examples / ${r.games} games`).join(" · ")}.</>}
+      </p>
+      <Table head={<tr><Th>Experiment</Th><Th>Verdict</Th><Th>Test rows</Th><Th>Engine raw vs mkt</Th><Th>Blend vs mkt</Th><Th>Best learned</Th><Th>Best vs mkt [95%]</Th><Th>Best ROI [95%]</Th></tr>}>
+        {ex.map((e) => {
+          const best = e.best_model ? pick(e, e.best_model) : undefined;
+          return (
+            <tr key={e.id} className="border-t border-glass text-xs" title={e.gate.why}>
+              <Td>{e.name}</Td>
+              <Td className={verdictTone[e.verdict]}>{e.verdict.replace("_", " ")}</Td>
+              <Td className="font-mono">{e.n_test}</Td>
+              <Td className="font-mono">{iv(pick(e, "engine_raw")?.brier_vs_market)}</Td>
+              <Td className="font-mono">{iv(pick(e, "blend")?.brier_vs_market)}</Td>
+              <Td>{e.best_model?.replace("residual_", "") ?? "—"}</Td>
+              <Td className={clsx("font-mono", best?.brier_vs_market && best.brier_vs_market.hi95 < 0 ? "text-emerald-light" : best?.brier_vs_market && best.brier_vs_market.lo95 > 0 ? "text-crimson-light" : "")}>{iv(best?.brier_vs_market)}</Td>
+              <Td className="font-mono">{best?.roi ? `${signedPct(best.roi.mean)} [${signedPct(best.roi.lo95)}, ${signedPct(best.roi.hi95)}] (${best.bets})` : "—"}</Td>
+            </tr>
+          );
+        })}
+      </Table>
+    </>
   );
 }
 

@@ -744,6 +744,7 @@ async fn main() -> std::io::Result<()> {
             .route("/picks/run", web::post().to(picks::run_http))
             .route("/picks/record", web::get().to(picks::record))
             .route("/validation/scorecard", web::get().to(validation::scorecard_http))
+            .route("/validation/experiments", web::get().to(validation::experiments_http))
             .route("/picks/edges", web::get().to(sharp::list))
             .route("/picks/meta", web::get().to(picks::meta))
             .route("/picks/evidence/run", web::post().to(evidence::run_http))

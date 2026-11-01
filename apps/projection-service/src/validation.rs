@@ -29,7 +29,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use actix_web::{web, HttpResponse, Responder};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -350,6 +350,8 @@ async fn build(state: &State) -> Result<Value, String> {
     Ok(json!({ "generated_at": Utc::now(), "min_n": MIN_N,
         "summary": { "markets": markets.len(), "verified": count("verified"), "model_only": count("model_only"), "no_signal": count("no_signal"),
                      "losing": count("losing"), "insufficient_data": count("insufficient_data") },
+        "experiments": experiments(db, None, true).await.unwrap_or_default(),
+        "dataset": dataset_summary(db).await.unwrap_or(Value::Null),
         "quarantined_feeds": quarantined.iter().map(|(s, m, b)| json!({ "sport": s, "market": m, "book": b })).collect::<Vec<_>>(),
         "markets": markets, "forecasts": forecasts, "feeds": feeds }))
 }
@@ -381,6 +383,52 @@ pub async fn scorecard_http(state: web::Data<State>, q: web::Query<ScoreQ>) -> i
         a.retain(|m| q.sport.as_deref().map(|s| m["sport"] == s).unwrap_or(true) && q.engine.as_deref().map(|s| m["engine"] == s).unwrap_or(true));
     }
     HttpResponse::Ok().json(v)
+}
+
+// ---------------------------------------------------------------------------
+// ML research results (scripts/ml, migration 0035)
+// ---------------------------------------------------------------------------
+
+/// Experiments from ml_experiments, newest first; `latest` keeps one per name.
+pub async fn experiments(db: &tokio_postgres::Client, sport: Option<&str>, latest: bool) -> Result<Vec<Value>, String> {
+    let rows = db.query("SELECT id, created_at, name, sport, markets, source, target, dataset_hash, n, n_test, folds, best_model, verdict, results, gate, code_version \
+        FROM ml_experiments WHERE ($1::text IS NULL OR sport=$1) ORDER BY created_at DESC, id DESC LIMIT 500", &[&sport]).await.map_err(|e| dberr(&e))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let name: String = r.get(2);
+        if latest && !seen.insert(name.clone()) { continue; }
+        let results: tokio_postgres::types::Json<Value> = r.get(13);
+        let gate: tokio_postgres::types::Json<Value> = r.get(14);
+        // the compact table: one line per model
+        let models: Vec<Value> = results.0["results"].as_array().into_iter().flatten().map(|m| json!({
+            "model": m["model"], "brier": m["brier"], "ece": m["ece"], "brier_vs_market": m["brier_vs_market"], "folds_better": m["folds_better"],
+            "bets": m["betting"]["bets"], "roi": m["betting"]["roi"], "clv_mean": m["betting"]["clv_mean"] })).collect();
+        out.push(json!({ "id": r.get::<_, i64>(0), "created_at": r.get::<_, DateTime<Utc>>(1), "name": name, "sport": r.get::<_, String>(3),
+            "markets": r.get::<_, Vec<String>>(4), "source": r.get::<_, String>(5), "target": r.get::<_, String>(6), "dataset_hash": r.get::<_, String>(7),
+            "n": r.get::<_, i32>(8), "n_test": r.get::<_, i32>(9), "folds": r.get::<_, i32>(10), "best_model": r.get::<_, Option<String>>(11),
+            "verdict": r.get::<_, String>(12), "gate": gate.0, "models": models, "info": results.0["info"], "code_version": r.get::<_, String>(15) }));
+    }
+    Ok(out)
+}
+
+/// Size of the immutable ML dataset per sport and source.
+async fn dataset_summary(db: &tokio_postgres::Client) -> Result<Value, String> {
+    let rows = db.query("SELECT sport, source, count(*)::int, count(DISTINCT game_id)::int, min(COALESCE(game_date, decision_at::date))::text, max(COALESCE(game_date, decision_at::date))::text \
+        FROM ml_examples GROUP BY 1,2 ORDER BY 1,2", &[]).await.map_err(|e| dberr(&e))?;
+    Ok(Value::Array(rows.iter().map(|r| json!({ "sport": r.get::<_, String>(0), "source": r.get::<_, String>(1), "examples": r.get::<_, i32>(2),
+        "games": r.get::<_, i32>(3), "from": r.get::<_, Option<String>>(4), "to": r.get::<_, Option<String>>(5) })).collect()))
+}
+
+#[derive(Deserialize)]
+pub struct ExpQ { sport: Option<String>, #[serde(default)] all: bool }
+
+/// GET /validation/experiments?sport=&all= — walk-forward ML experiments (latest per name unless all=true).
+pub async fn experiments_http(state: web::Data<State>, q: web::Query<ExpQ>) -> impl Responder {
+    match experiments(&state.db, q.sport.as_deref(), !q.all).await {
+        Ok(v) => HttpResponse::Ok().json(json!({ "experiments": v, "dataset": dataset_summary(&state.db).await.unwrap_or(Value::Null) })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
 }
 
 #[cfg(test)]

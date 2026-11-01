@@ -134,14 +134,33 @@ async fn season_obs(state: &State, engine: &str, season: i32, cfg: &Value, out: 
         used += 1;
         // a moneyline compared with "the market" needs that game's real spread
         let has_line = ge.forecasts.iter().any(|f| f.market == "home_cover");
+        let mut keep = Vec::new();
         for f in &ge.forecasts {
             let Some((pm, cmp)) = pick_market(engine, f.market) else { continue };
             if pm == "moneyline" && cmp == "market" && !has_line { continue; }
             let Some(y) = ge.outcomes.y(f) else { continue };
             out.entry((pm, cmp)).or_insert_with(|| (f.baseline.to_string(), Vec::new())).1.push((season, f.p_model, f.p_base, y));
+            keep.push(json!({ "market": pm, "subject": f.subject, "line": f.line, "comparison": cmp, "p_model": f.p_model, "p_base": f.p_base, "y": y,
+                "kind": if f.subject == "game" { "game" } else { "prop" }, "features": { "forecast_market": f.market, "baseline": f.baseline, "stat": f.stat } }));
         }
+        save_examples(state, engine, season, id, &keep).await;
     }
     Ok(used)
+}
+
+/// Every backtest forecast also goes to the immutable ML dataset (migration
+/// 0035), so research can train on whole seasons instead of the aggregates
+/// pick_evidence keeps. A row already stored for this engine version is left as is.
+async fn save_examples(state: &State, engine: &str, season: i32, game: &str, rows: &[Value]) {
+    if rows.is_empty() { return; }
+    let code = learning::engine_of(engine);
+    let r = state.db.execute(
+        "INSERT INTO ml_examples (source, sport, engine, engine_version, season, game_id, game_date, kind, market, subject, line, comparison, p_model, p_base, y, features) \
+         SELECT 'backtest', $1, $2, $3, $4, $5, (SELECT game_date FROM sports_games WHERE game_id=$5 LIMIT 1), x.kind, x.market, x.subject, x.line, x.comparison, x.p_model, x.p_base, x.y, x.features \
+         FROM jsonb_to_recordset($6) AS x(kind text, market text, subject text, line float8, comparison text, p_model float8, p_base float8, y float8, features jsonb) \
+         ON CONFLICT DO NOTHING",
+        &[&base(engine), &engine, &code, &season, &game, &tokio_postgres::types::Json(Value::Array(rows.to_vec()))]).await;
+    if let Err(e) = r { eprintln!("ml_examples backtest {engine} {game}: {}", dberr(&e)); }
 }
 
 /// Full-season walk-forward backtests of the champion over the last five

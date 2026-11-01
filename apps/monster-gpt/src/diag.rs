@@ -52,7 +52,52 @@ fn kind_named(text: &str) -> Option<&'static str> {
     if l.contains("prop") || l.contains("player") { Some("prop") } else if l.contains("game line") || l.contains("game market") || l.contains("sides") { Some("game") } else { None }
 }
 
+fn asks_ml(text: &str) -> bool {
+    let l = format!(" {} ", text.to_lowercase());
+    ["machine learning", "xgboost", "lightgbm", "elastic net", "experiment", "residual", "overfit", "shadow", "promot", "ml model", "ml research"].iter().any(|k| l.contains(k))
+}
+
+fn pct4(v: &Value) -> String { v.as_f64().map(|x| format!("{x:+.4}")).unwrap_or_else(|| "?".into()) }
+
+/// Walk-forward ML experiments (scripts/ml) that match the sport and named markets.
+pub fn experiments_text(sc: &Value, sport: Option<&str>, named: &[&str], limit: usize) -> String {
+    let ex: Vec<&Value> = sc["experiments"].as_array().into_iter().flatten()
+        .filter(|e| sport.map(|s| e["sport"] == s).unwrap_or(true))
+        .filter(|e| named.is_empty() || e["markets"].as_array().into_iter().flatten().any(|m| named.contains(&m.as_str().unwrap_or(""))))
+        .collect();
+    if ex.is_empty() { return String::new(); }
+    let mut s = String::from("ML research (walk-forward; each learned model starts from the market's probability and may only move away from it when its features justify it):\n");
+    for e in ex.iter().take(limit) {
+        let best = e["best_model"].as_str().unwrap_or("");
+        let m = e["models"].as_array().into_iter().flatten().find(|m| m["model"] == best);
+        let d = m.map(|m| &m["brier_vs_market"]);
+        s.push_str(&format!("- {}: {} ({} test rows). Best learned model {}{}. {}\n", e["name"].as_str().unwrap_or(""), e["verdict"].as_str().unwrap_or("").replace('_', " "),
+            e["n_test"], best.replace("residual_", ""),
+            d.map(|d| format!(", Brier vs market {} (95% {} to {})", pct4(&d["mean"]), pct4(&d["lo95"]), pct4(&d["hi95"]))).unwrap_or_default(),
+            if e["verdict"] == "inconclusive" { "Its 99% interval includes 0: no evidence it beats the market." } else { e["gate"]["why"].as_str().unwrap_or("") }));
+    }
+    let shadow = ex.iter().filter(|e| e["verdict"] == "shadow_candidate").count();
+    s.push_str(&format!("{shadow} of {} experiments reached shadow candidate. Nothing is promoted automatically: a candidate would run beside AI Picks without changing what it publishes.\n\n", ex.len()));
+    s
+}
+
 pub fn reply(sc: &Value, sport: Option<&str>, text: &str) -> String {
+    if asks_ml(text) {
+        let named = markets_named(text);
+        let mut s = experiments_text(sc, sport, &named, 10);
+        if s.is_empty() { s = experiments_text(sc, sport, &[], 10); }
+        if s.is_empty() { return "No ML experiments have been run for this yet. They run from scripts/ml/experiment.py and are stored in ml_experiments.".into(); }
+        if let Some(d) = sc["dataset"].as_array() {
+            let parts: Vec<String> = d.iter().filter(|r| sport.map(|x| r["sport"] == x).unwrap_or(true))
+                .map(|r| format!("{} {} {} examples over {} games", r["sport"].as_str().unwrap_or("").to_uppercase(), r["source"].as_str().unwrap_or(""), r["examples"], r["games"])).collect();
+            if !parts.is_empty() { s.push_str(&format!("Training data (immutable, timestamped): {}.", parts.join("; "))); }
+        }
+        return s.trim_end().to_string();
+    }
+    reply_scorecard(sc, sport, text)
+}
+
+fn reply_scorecard(sc: &Value, sport: Option<&str>, text: &str) -> String {
     let all: Vec<&Value> = sc["markets"].as_array().into_iter().flatten().filter(|m| sport.map(|s| m["sport"] == s).unwrap_or(true)).collect();
     let scope = sport.map(|s| s.to_uppercase()).unwrap_or_else(|| "all sports".into());
     if all.is_empty() { return format!("The validation scorecard has no markets for {scope} yet."); }
@@ -72,6 +117,7 @@ pub fn reply(sc: &Value, sport: Option<&str>, text: &str) -> String {
             s.push('\n');
         }
         s.push_str(&quarantine_note(sc, sport));
+        s.push_str(&experiments_text(sc, sport, &named, 4));
         s.push_str("Model quality says whether the engine is reliable on a market; each pick also gets an opportunity grade from the EV of its current price. A pick is a verified edge only when both hold.");
         return s.trim_end().to_string();
     }
@@ -143,6 +189,20 @@ mod tests {
         let r = reply(&sc(), Some("nfl"), "Why isn't Monster publishing NFL spreads?");
         assert!(r.starts_with("NFL spread (play-by-play simulator): no verified signal, model quality C."), "{r}");
         assert!(r.contains("934 games over 4 seasons") && !r.contains("pass"), "{r}");
+    }
+
+    #[test]
+    fn ml_questions_report_experiments() {
+        let mut v = sc();
+        v["experiments"] = json!([{ "name": "nfl spread backtest outcome", "sport": "nfl", "markets": ["spread"], "verdict": "inconclusive", "n_test": 775,
+            "best_model": "residual_enet", "gate": { "why": "includes 0" },
+            "models": [{ "model": "residual_enet", "brier_vs_market": { "mean": 0.0015, "lo95": -0.0016, "hi95": 0.0048 } }] }]);
+        v["dataset"] = json!([{ "sport": "nfl", "source": "backtest", "examples": 10195, "games": 1035 }]);
+        let r = reply(&v, Some("nfl"), "does the XGBoost residual model beat the market on NFL spreads?");
+        assert!(r.contains("nfl spread backtest outcome: inconclusive (775 test rows). Best learned model enet, Brier vs market +0.0015 (95% -0.0016 to +0.0048). Its 99% interval includes 0"), "{r}");
+        assert!(r.contains("0 of 1 experiments reached shadow candidate") && r.contains("NFL backtest 10195 examples over 1035 games"), "{r}");
+        let s = reply(&v, Some("nfl"), "Why isn't Monster publishing NFL spreads?");
+        assert!(s.contains("ML research") && s.contains("775 test rows"), "{s}");
     }
 
     #[test]
