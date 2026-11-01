@@ -98,6 +98,21 @@ pub async fn delete_conversation(req: HttpRequest, g: web::Data<Gpt>, path: web:
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct FeedbackBody { rating: i16 }
+
+/// Thumbs up (1) / down (-1) / clear (0) on one of the caller's answers.
+pub async fn message_feedback(req: HttpRequest, g: web::Data<Gpt>, path: web::Path<String>, body: web::Json<FeedbackBody>) -> HttpResponse {
+    let owner = match owner_or_401(&req, &g) { Ok(o) => o, Err(r) => return r };
+    if !(-1..=1).contains(&body.rating) { return HttpResponse::BadRequest().json(json!({ "error": "rating must be -1, 0 or 1" })); }
+    let Some(s) = &g.store else { return HttpResponse::NotFound().json(json!({ "error": "conversation storage is off" })) };
+    match s.set_feedback(&owner, &path.into_inner(), body.rating).await {
+        Ok(true) => HttpResponse::NoContent().finish(),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "message not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
 pub async fn metrics(g: web::Data<Gpt>) -> HttpResponse { HttpResponse::Ok().json(g.metrics_json()) }
 
 pub async fn memory_list(req: HttpRequest, g: web::Data<Gpt>) -> HttpResponse {
@@ -250,6 +265,9 @@ async fn connection(g: web::Data<Gpt>, mut session: actix_ws::Session, mut strea
                             let ready = ServerMsg::Ready { session: session_id.clone(), owner: o, models,
                                 limits: json!({ "max_text": MAX_TEXT, "messages_per_min": RATE_PER_MIN, "concurrent_per_connection": 1, "heartbeat_s": HEARTBEAT.as_secs() }) };
                             if session.text(ready.to_json()).await.is_err() { break "client gone"; }
+                            // warm the picks cache so the first question doesn't wait on the fetch
+                            let g2 = g.clone();
+                            actix_web::rt::spawn(async move { g2.tools.call(crate::tools::Tool::PicksToday { sport: None }).await; });
                         }
                         None => {
                             let _ = session.text(ServerMsg::error(None, "unauthorized", "invalid or expired session token; get a new one from POST /session").to_json()).await;

@@ -42,18 +42,21 @@ pub enum Tool {
     HubBrief { q: String, sport: Option<String> },
     /// a sport's schedule for today
     HubSlate { sport: String },
+    /// validation scorecard: calibration, Brier vs baseline and market, ROI, CLV,
+    /// drawdown and status per engine x market, plus quarantined odds feeds
+    Validation { sport: Option<String> },
 }
 
 impl Tool {
     pub fn name(&self) -> &'static str {
-        match self { Tool::PicksToday { .. } => "picks.today", Tool::PicksRecord { .. } => "picks.record", Tool::HubBrief { .. } => "hub.brief", Tool::HubSlate { .. } => "hub.slate" }
+        match self { Tool::PicksToday { .. } => "picks.today", Tool::PicksRecord { .. } => "picks.record", Tool::HubBrief { .. } => "hub.brief", Tool::HubSlate { .. } => "hub.slate", Tool::Validation { .. } => "model.validation" }
     }
 
     /// Argument checks: known sports only, bounded free text.
     pub fn validate(&self) -> Result<(), String> {
         let sport_ok = |s: &Option<String>| s.as_deref().map(|x| SPORTS.contains(&x)).unwrap_or(true);
         match self {
-            Tool::PicksToday { sport } | Tool::PicksRecord { sport, .. } if !sport_ok(sport) => Err("unknown sport".into()),
+            Tool::PicksToday { sport } | Tool::PicksRecord { sport, .. } | Tool::Validation { sport } if !sport_ok(sport) => Err("unknown sport".into()),
             Tool::PicksRecord { days, .. } if *days == 0 || *days > 365 => Err("days must be 1-365".into()),
             Tool::HubBrief { q, sport } => {
                 if q.trim().is_empty() || q.len() > 400 { return Err("q must be 1-400 characters".into()); }
@@ -66,7 +69,7 @@ impl Tool {
     }
 
     fn timeout(&self) -> Duration {
-        match self { Tool::HubBrief { .. } => Duration::from_secs(25), Tool::HubSlate { .. } => Duration::from_secs(20), _ => Duration::from_secs(12) }
+        match self { Tool::HubBrief { .. } => Duration::from_secs(25), Tool::HubSlate { .. } => Duration::from_secs(20), Tool::Validation { .. } => Duration::from_secs(30), _ => Duration::from_secs(12) }
     }
 
     fn url(&self, base: &str) -> String {
@@ -75,6 +78,7 @@ impl Tool {
             Tool::PicksRecord { sport, days } => format!("{base}/picks/record?days={days}{}", sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default()),
             Tool::HubBrief { q, sport } => format!("{base}/hub/brief?q={}{}", crate::urlencode(q), sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default()),
             Tool::HubSlate { sport } => format!("{base}/hub/{sport}/schedule"),
+            Tool::Validation { sport } => format!("{base}/validation/scorecard{}", sport.as_deref().map(|s| format!("?sport={s}")).unwrap_or_default()),
         }
     }
 
@@ -84,6 +88,7 @@ impl Tool {
             Tool::PicksRecord { sport, days } => format!("AI Picks track record, last {days} days{}", sport.as_deref().map(|s| format!(" ({})", s.to_uppercase())).unwrap_or_default()),
             Tool::HubBrief { .. } => "Games hub: game briefs (model, best lines, injuries, matchup ranks)".into(),
             Tool::HubSlate { sport } => format!("Games hub: {} schedule", sport.to_uppercase()),
+            Tool::Validation { sport } => format!("Validation engine: model scorecard{}", sport.as_deref().map(|s| format!(" ({})", s.to_uppercase())).unwrap_or_default()),
         }
     }
 }
@@ -91,7 +96,12 @@ impl Tool {
 pub struct Tools {
     pub http: reqwest::Client,
     pub projection_url: String,
+    /// url -> (when, fetched_at, body). Picks and briefs change every few
+    /// minutes, so a follow-up within CACHE_TTL reuses the last fetch.
+    pub cache: std::sync::Mutex<std::collections::HashMap<String, (Instant, DateTime<Utc>, Value)>>,
 }
+
+const CACHE_TTL: Duration = Duration::from_secs(30);
 
 impl Tools {
     pub async fn call(&self, tool: Tool) -> ToolCall {
@@ -102,11 +112,17 @@ impl Tools {
             Tool::PicksRecord { sport, days } => json!({ "sport": sport, "days": days }),
             Tool::HubBrief { q, sport } => json!({ "q": q, "sport": sport }),
             Tool::HubSlate { sport } => json!({ "sport": sport }),
+            Tool::Validation { sport } => json!({ "sport": sport }),
         };
         if let Err(e) = tool.validate() {
             return ToolCall { tool: name, args, ok: false, ms: 0, error: Some(e), value: Value::Null, source: None };
         }
         let url = tool.url(&self.projection_url);
+        let hit = self.cache.lock().unwrap().get(&url).filter(|(at, _, _)| at.elapsed() < CACHE_TTL).map(|(_, f, v)| (*f, v.clone()));
+        if let Some((fetched_at, v)) = hit {
+            return ToolCall { tool: name, args, ok: true, ms: t0.elapsed().as_millis() as u64, error: None, value: v,
+                source: Some(Source { id: String::new(), tool: name.into(), label: tool.label(), url, fetched_at }) };
+        }
         let res = async {
             let r = self.http.get(&url).timeout(tool.timeout()).send().await.map_err(|e| if e.is_timeout() { "timed out".to_string() } else { format!("unreachable: {e}") })?;
             let status = r.status();
@@ -115,8 +131,14 @@ impl Tools {
         }.await;
         let ms = t0.elapsed().as_millis() as u64;
         match res {
-            Ok(v) => ToolCall { tool: name, args, ok: true, ms, error: None, value: v,
-                source: Some(Source { id: String::new(), tool: name.into(), label: tool.label(), url, fetched_at: Utc::now() }) },
+            Ok(v) => {
+                let now = Utc::now();
+                let mut c = self.cache.lock().unwrap();
+                c.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
+                c.insert(url.clone(), (Instant::now(), now, v.clone()));
+                ToolCall { tool: name, args, ok: true, ms, error: None, value: v,
+                    source: Some(Source { id: String::new(), tool: name.into(), label: tool.label(), url, fetched_at: now }) }
+            }
             Err(e) => ToolCall { tool: name, args, ok: false, ms, error: Some(e), value: Value::Null, source: None },
         }
     }
@@ -149,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_tool_never_calls_the_network() {
-        let tools = Tools { http: reqwest::Client::new(), projection_url: "http://127.0.0.1:9".into() };
+        let tools = Tools { http: reqwest::Client::new(), projection_url: "http://127.0.0.1:9".into(), cache: Default::default() };
         let c = tools.call(Tool::PicksToday { sport: Some("xfl".into()) }).await;
         assert!(!c.ok);
         assert_eq!(c.error.as_deref(), Some("unknown sport"));
@@ -158,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_service_is_a_controlled_error() {
-        let tools = Tools { http: reqwest::Client::new(), projection_url: "http://127.0.0.1:9".into() };
+        let tools = Tools { http: reqwest::Client::new(), projection_url: "http://127.0.0.1:9".into(), cache: Default::default() };
         let c = tools.call(Tool::PicksToday { sport: None }).await;
         assert!(!c.ok);
         assert!(c.error.unwrap().starts_with("unreachable"));

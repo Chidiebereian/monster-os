@@ -101,6 +101,32 @@ fn parse_espn_time(s: &str) -> Option<DateTime<Utc>> {
         .or_else(|| chrono::NaiveDateTime::parse_from_str(s.trim_end_matches('Z'), "%Y-%m-%dT%H:%M").ok().map(|n| n.and_utc()))
 }
 
+/// Kickoff times from ESPN for slate games that have none (the NFL games table
+/// stores dates only). Games are matched by "AWAY @ HOME" team codes and saved
+/// to game_kickoffs: ledger rows are immutable, and the line fetcher only looks
+/// at games starting in the next 40 hours, so a NULL start hid them from picks.
+pub(crate) async fn fill_kickoffs(state: &State, sport: &str, date: NaiveDate, games: &mut [crate::learning::SlateGame]) {
+    if games.iter().all(|g| g.start.is_some()) { return; }
+    let Some(path) = espn_path(sport) else { return };
+    let url = format!("https://site.api.espn.com/apis/site/v2/sports/{path}/scoreboard?dates={}&limit=100", date.format("%Y%m%d"));
+    let sb = match espn(state, &url, Duration::from_secs(600)).await { Ok(v) => v, Err(e) => { eprintln!("kickoffs {sport} {date}: {e}"); return } };
+    let mut starts: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
+    for e in sb["events"].as_array().into_iter().flatten() {
+        let Some(ev) = event_json(sport, e) else { continue };
+        let Some(t) = ev["start"].as_str().and_then(parse_espn_time) else { continue };
+        if let (Some(a), Some(h)) = (ev["away"]["abbr"].as_str(), ev["home"]["abbr"].as_str()) { starts.insert((a.to_string(), h.to_string()), t); }
+    }
+    for g in games.iter_mut().filter(|g| g.start.is_none()) {
+        let Some((a, h)) = g.label.split_once(" @ ") else { continue };
+        let Some(t) = starts.get(&(canon(sport, a.trim()), canon(sport, h.trim()))).copied() else { continue };
+        g.start = Some(t);
+        if let Err(e) = state.db.execute("INSERT INTO game_kickoffs (sport, game_id, starts_at) VALUES ($1,$2,$3) \
+            ON CONFLICT (sport, game_id) DO UPDATE SET starts_at = EXCLUDED.starts_at, updated_at = now()", &[&sport, &g.id, &t]).await {
+            eprintln!("kickoffs {sport} {}: {}", g.id, dberr(&e));
+        }
+    }
+}
+
 fn event_json(sport: &str, e: &Value) -> Option<Value> {
     let c = e["competitions"].as_array()?.first()?;
     let comps = c["competitors"].as_array()?;

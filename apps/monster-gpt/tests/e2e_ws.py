@@ -313,7 +313,10 @@ def test_memory_commands_and_isolation():
 
 def test_document_search_finds_and_refuses():
     st, d = http("GET", "/rag/search?q=" + urllib.parse.quote("how are pick grades capped by track record") + "&k=3")
-    assert st == 200 and d["hits"][0]["doc_id"] == "docs/architecture/ai-picks.md"
+    # both docs explain grade caps (validation.md adds model-quality grades)
+    ids = [h["doc_id"] for h in d["hits"]]
+    assert st == 200 and "docs/architecture/ai-picks.md" in ids, ids
+    assert ids[0] in ("docs/architecture/ai-picks.md", "docs/architecture/validation.md"), ids
     st, d = http("GET", "/rag/search?q=" + urllib.parse.quote("recipe for chocolate chip cookies"))
     assert st == 200 and d["hits"] == []
 

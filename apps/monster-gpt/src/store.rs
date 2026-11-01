@@ -52,12 +52,18 @@ impl Store {
     pub async fn messages(&self, owner: &str, conv: &str) -> Result<Value, String> {
         let ok = self.db.query_opt("SELECT 1 FROM gpt_conversations WHERE id=$1 AND owner=$2", &[&conv, &owner]).await.map_err(e)?;
         if ok.is_none() { return Err("conversation not found".into()); }
-        let rows = self.db.query("SELECT id, request_id, role, content, card, sources, model, usage, cancelled, created_at FROM gpt_messages \
+        let rows = self.db.query("SELECT id, request_id, role, content, card, sources, model, usage, cancelled, created_at, feedback FROM gpt_messages \
             WHERE conversation_id=$1 ORDER BY created_at, role DESC", &[&conv]).await.map_err(e)?;
         Ok(json!(rows.iter().map(|r| json!({ "id": r.get::<_, String>(0), "request_id": r.get::<_, Option<String>>(1), "role": r.get::<_, String>(2),
             "content": r.get::<_, String>(3), "card": r.get::<_, Option<Json<Value>>>(4).map(|j| j.0), "sources": r.get::<_, Option<Json<Value>>>(5).map(|j| j.0),
             "model": r.get::<_, Option<String>>(6), "usage": r.get::<_, Option<Json<Value>>>(7).map(|j| j.0), "cancelled": r.get::<_, bool>(8),
-            "created_at": r.get::<_, chrono::DateTime<chrono::Utc>>(9) })).collect::<Vec<_>>()))
+            "created_at": r.get::<_, chrono::DateTime<chrono::Utc>>(9), "feedback": r.get::<_, Option<i16>>(10) })).collect::<Vec<_>>()))
+    }
+
+    /// Rate one of the owner's assistant messages: 1, -1, or 0 to clear (migration 0032).
+    pub async fn set_feedback(&self, owner: &str, message_id: &str, rating: i16) -> Result<bool, String> {
+        let v: Option<i16> = if rating == 0 { None } else { Some(rating.signum()) };
+        Ok(self.db.execute("UPDATE gpt_messages m SET feedback=$3, feedback_at=now() FROM gpt_conversations c             WHERE m.id=$1 AND m.role='assistant' AND c.id=m.conversation_id AND c.owner=$2", &[&message_id, &owner, &v]).await.map_err(e)? > 0)
     }
 
     pub async fn delete(&self, owner: &str, conv: &str) -> Result<bool, String> {

@@ -21,6 +21,45 @@ export interface Pick {
   fair_price: number | null; playable_price: number | null;
   /** latest price still at least the playable price at the published line; null = settled, or the line moved (re-check) */
   playable_now: boolean | null;
+  /** validation engine: is the engine reliable on this market (A+..D, I = insufficient data)? */
+  model_quality?: string;
+  /** validation engine: is the current price worth it (EV at the latest price, A+..F)? */
+  opportunity_grade?: string;
+  ev_now?: number;
+  validation_status?: MarketStatus;
+  qualification?: Qualification;
+  feed_quarantined?: boolean;
+}
+
+export type MarketStatus = "verified" | "model_only" | "no_signal" | "losing" | "insufficient_data";
+export type Qualification = "verified_edge" | "watchlist" | "high_uncertainty" | "no_value" | "insufficient_data" | "suspended";
+
+export const QUALIFICATIONS: { key: Qualification; label: string; text: string }[] = [
+  { key: "verified_edge", label: "Verified edge", text: "The engine has beaten the market on this market, and the current price has positive EV" },
+  { key: "watchlist", label: "Watchlist", text: "The engine beats its naive baseline but has not beaten the market yet" },
+  { key: "high_uncertainty", label: "High uncertainty", text: "A large disagreement from an engine without a market track record" },
+  { key: "no_value", label: "No value", text: "The current price no longer has positive EV" },
+  { key: "insufficient_data", label: "Insufficient data", text: "Too few settled lines and no backtest for this market" },
+  { key: "suspended", label: "Suspended", text: "Started, price gone, or the odds feed is quarantined" },
+];
+
+export interface Calib { n: number; brier?: number; logloss?: number; ece?: number; mean_p?: number; hit_rate?: number; reliability?: { predicted: number; observed: number; n: number }[] }
+export interface Interval { mean: number; lo: number; hi: number }
+export interface ScoreMarket {
+  sport: string; engine: string; version: string | null; market: string; kind: "prop" | "game"; tier: Tier; tier_source: string | null;
+  model_quality: string; status: MarketStatus; excluded_picks: number; reasons: string[];
+  backtest: { comparison: string; n: number; seasons: number; better: number; worse: number; w: number | null } | null;
+  lines: (Calib & { brier_model?: number; brier_market?: number; brier_vs_market?: Interval | null }) | null;
+  picks: { n: number; units: number; roi: number; roi_lo: number; roi_hi: number; hit_rate: number; max_drawdown: number; profit_factor: number | null;
+    sharpe: number; sortino: number; clv_mean: number | null; clv_positive: number | null } | null;
+}
+export interface Scorecard {
+  generated_at: string; min_n: number;
+  summary: Record<"markets" | MarketStatus, number>;
+  markets: ScoreMarket[];
+  forecasts: (Calib & { sport: string; engine: string; version: string; market: string; champion: boolean; brier_vs_baseline: Interval | null })[];
+  quarantined_feeds: { sport: string; market: string; book: string }[];
+  feeds: { sport: string; market: string; book: string; side: string; n: number; implied: number; hit_rate: number; z: number; suspect: boolean }[];
 }
 
 /** Split a writeup into the case for the pick and the case against it. */
@@ -94,7 +133,7 @@ export interface EdgesResponse {
 
 export interface PickFilters {
   sport?: string; kind?: string; side?: string; grades?: string; market?: string; game?: string; book?: string;
-  min_edge?: number; min_prob?: number; sort?: string; q?: string; include_hidden?: boolean; status?: string; limit?: number;
+  min_edge?: number; min_prob?: number; sort?: string; q?: string; include_hidden?: boolean; status?: string; limit?: number; qualification?: string;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -118,6 +157,7 @@ export const picksApi = {
   record: (sport?: string, days = 90) => req<PickRecord>(`/picks/record?${qs({ sport, days })}`),
   edges: (sport?: string, status = "open", days = 90) => req<EdgesResponse>(`/picks/edges?${qs({ sport, status, days })}`),
   run: (sport?: string, force = false) => req<{ runs: unknown[] }>(`/picks/run?${qs({ sport, force })}`, { method: "POST" }),
+  scorecard: (sport?: string, kind?: string) => req<Scorecard>(`/validation/scorecard?${qs({ sport, kind })}`),
 };
 
 /** The bankroll stakes are shown against (per browser). */

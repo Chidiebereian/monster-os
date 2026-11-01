@@ -124,9 +124,11 @@ pub(crate) struct Upcoming {
 pub(crate) async fn upcoming(db: &tokio_postgres::Client, sport: &str) -> Result<Vec<Upcoming>, String> {
     let engines = vec![sport.to_string(), format!("{sport}_team")];
     let rows = db.query(
-        "SELECT DISTINCT ON (game_id) game_id, game_start, payload FROM prediction_ledger \
-         WHERE sport = ANY($1) AND game_start > now() AND game_start < now() + interval '40 hours' \
-         ORDER BY game_id, (sport = $2) DESC, id DESC", &[&engines, &sport]).await.map_err(|e| dberr(&e))?;
+        "SELECT * FROM (SELECT DISTINCT ON (l.game_id) l.game_id, COALESCE(l.game_start, k.starts_at) AS start, l.payload FROM prediction_ledger l \
+           LEFT JOIN game_kickoffs k ON k.sport = $2 AND k.game_id = l.game_id \
+           WHERE l.sport = ANY($1) AND l.game_date >= (now() - interval '1 day')::date \
+           ORDER BY l.game_id, (l.sport = $2) DESC, l.id DESC) x \
+         WHERE start > now() AND start < now() + interval '40 hours'", &[&engines, &sport]).await.map_err(|e| dberr(&e))?;
     Ok(rows.iter().map(|r| {
         let p: Json<Value> = r.get(2);
         Upcoming { game_id: r.get(0), start: r.get(1), home: payload_team(&p.0, "home"),

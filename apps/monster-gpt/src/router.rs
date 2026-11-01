@@ -46,6 +46,8 @@ pub enum Intent {
     Game,
     /// "how are your picks doing"
     Record,
+    /// model diagnostics: "why isn't Monster publishing NFL spreads?", "which models are calibrated?"
+    Model,
     /// anything else: concepts, explanations
     General,
 }
@@ -274,9 +276,19 @@ pub fn route(text: &str, prev: Option<&Filters>) -> Route {
     let concept_start = ["explain", "how does", "how do ", "how is ", "how are ", "what is", "what's", "whats ", "why ", "define", "tell me about", "what does", "what do "]
         .iter().any(|p| l.starts_with(p));
     let asks_for_bets = has(&l, &["best bet", "bets today", "bets tonight", "should i bet", "give me", "picks today", "props today", "picks tonight", "props tonight",
-        "what should i", "any bets", "any props", "any picks", "worth betting", "worth a bet", "bet on today", "bet on tonight"]);
+        "what should i", "any bets", "any props", "any picks", "worth betting", "worth a bet", "bet on today", "bet on tonight"])
+        // "what is the best NFL moneyline today?", "which spread should I take tonight"
+        || (has(&l, &["best ", "top ", "which ", "good ", "favorite "]) && has(&l, &["moneyline", "money line", "spread", "total", "over/under", "puck line", "run line", "prop", "pick", "play", "lean", "value", "edge"]));
     let concept = concept_start && !asks_for_bets;
-    let intent = if record { Intent::Record } else if concept { Intent::General } else if game { Intent::Game } else if bets || (touched && f.risk.is_some()) { Intent::Bets } else { Intent::General };
+    // questions about the models themselves, before "performance" makes them a track-record question
+    let model_q = has(&l, &["calibrat", "brier", "log loss", "model quality", "which model", "which engine", "model perform", "models perform", "engine perform",
+        "overconfident", "underconfident", "validat", "scorecard", "why isn't", "why aren't", "why no ", "why don't you", "why do you not", "not publishing",
+        "publishing", "beat the market", "beat closing", "beating the market", "closing line value", "clv", "quarantin", "trust the model", "how accurate",
+        "how good is the model", "how good are the models", "verified edge", "proven"]);
+    // "how good are the NHL player props models?", "can I trust the NBA engine"
+    let model_q = model_q || (has(&l, &["model", "engine", "simulator"])
+        && has(&l, &["how good", "how reliable", "reliable", "trust", "accurate", "accuracy", "working", "doing", "track record", "edge", "beat"]));
+    let intent = if model_q { Intent::Model } else if record { Intent::Record } else if concept { Intent::General } else if game { Intent::Game } else if bets || (touched && f.risk.is_some()) { Intent::Bets } else { Intent::General };
     Route { intent, filters: f, inherited: false }
 }
 
@@ -433,7 +445,15 @@ mod tests {
         assert_eq!(route("Explain how AI pick grades are capped", None).intent, Intent::General);
         assert_eq!(route("what are the best bets today?", None).intent, Intent::Bets);
         assert_eq!(route("what should I bet on tonight", None).intent, Intent::Bets);
+        let r = route("what is the best NFL moneyline today?", None);
+        assert_eq!((r.intent, r.filters.sport.as_deref()), (Intent::Bets, Some("nfl")));
         assert_eq!(route("how are your picks doing?", None).intent, Intent::Record);
+        let r = route("Why isn't Monster publishing NFL spreads?", None);
+        assert_eq!((r.intent, r.filters.sport.as_deref()), (Intent::Model, Some("nfl")));
+        assert_eq!(route("which models are best calibrated?", None).intent, Intent::Model);
+        assert_eq!(route("how good are the NHL player props models?", None).intent, Intent::Model);
+        assert_eq!(route("give me the best NHL props", None).intent, Intent::Bets);
+        assert_eq!(route("how is the NBA model performing vs the market", None).intent, Intent::Model);
     }
 
     #[test]

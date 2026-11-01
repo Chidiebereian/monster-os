@@ -5,8 +5,8 @@ import clsx from "clsx";
 import { ExternalLink, X } from "lucide-react";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import {
-  BANKROLL_KEY, GRADES, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
-  type Edge, type Pick, type PickDetail, type PickFilters, type Tier,
+  BANKROLL_KEY, GRADES, QUALIFICATIONS, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
+  type Edge, type MarketStatus, type Pick, type PickDetail, type PickFilters, type Qualification, type ScoreMarket, type Tier,
 } from "../lib/picks";
 
 // AI Picks: the curated feed. Every pick is a live two-way line priced by the
@@ -22,8 +22,19 @@ const SPORTS = [
 ];
 const KINDS = [{ key: "all", label: "All" }, { key: "prop", label: "Player Props" }, { key: "game", label: "Game Lines" }];
 const SIDES = [{ key: "all", label: "All" }, { key: "over", label: "Over" }, { key: "under", label: "Under" }];
-const SORTS = [{ key: "grade", label: "Grade" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
-const TABS = [{ key: "picks", label: "Picks" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }];
+const SORTS = [{ key: "grade", label: "Grade" }, { key: "ev", label: "EV" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
+const TABS = [{ key: "picks", label: "Picks" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }, { key: "models", label: "Models" }];
+const QUALS = [{ key: "all", label: "Any status" }, ...QUALIFICATIONS.filter((q) => q.key !== "suspended").map((q) => ({ key: q.key, label: q.label }))];
+const qualTone: Record<Qualification, string> = {
+  verified_edge: "text-emerald-light border-emerald/40", watchlist: "text-violet border-violet/40", high_uncertainty: "text-amber border-amber/40",
+  no_value: "text-gray-400 border-glass", insufficient_data: "text-gray-400 border-glass", suspended: "text-crimson-light border-crimson/40",
+};
+const STATUS_TEXT: Record<MarketStatus, string> = {
+  verified: "verified edge", model_only: "beats baseline only", no_signal: "no verified signal", losing: "losing to market", insufficient_data: "insufficient data",
+};
+const statusTone: Record<MarketStatus, string> = {
+  verified: "text-emerald-light", model_only: "text-violet", no_signal: "text-amber", losing: "text-crimson-light", insufficient_data: "text-gray-500",
+};
 
 const gradeTone = (g: string) =>
   g.startsWith("A") ? "bg-emerald/15 text-emerald-light border-emerald/40" : g.startsWith("B") ? "bg-violet/15 text-violet border-violet/40" : "bg-amber/15 text-amber border-amber/40";
@@ -57,7 +68,7 @@ export function AiPicks() {
           </>
         }
       />
-      {tab === "picks" ? <Feed search={search} bankroll={bankroll} /> : tab === "edges" ? <StaleLines bankroll={bankroll} /> : <Record />}
+      {tab === "picks" ? <Feed search={search} bankroll={bankroll} /> : tab === "edges" ? <StaleLines bankroll={bankroll} /> : tab === "models" ? <Models /> : <Record />}
     </div>
   );
 }
@@ -87,6 +98,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
   const [minProb, setMinProb] = useState(0);
   const [sort, setSort] = useState("grade");
   const [hidden, setHidden] = useState(url.get("hidden") === "1");
+  const [qual, setQual] = useState(url.get("qualification") ?? "all");
   const [open, setOpen] = useState<number | null>(url.get("pick") ? Number(url.get("pick")) : null);
   const q = useDebounced(search);
   const edge = useDebounced(minEdge);
@@ -97,6 +109,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
     sport: s, kind: kind === "all" ? undefined : kind, side: side === "all" ? undefined : side,
     grades: grades.length ? grades.join(",") : undefined, market, game, book,
     min_edge: edge > 0 ? edge / 100 : undefined, min_prob: prob > 0 ? prob / 100 : undefined, sort, q, include_hidden: hidden,
+    qualification: qual === "all" ? undefined : qual,
   };
   const picks = useQuery({ queryKey: ["picks", filters], queryFn: () => picksApi.list(filters), refetchInterval: 60_000 });
   const meta = useQuery({ queryKey: ["picks-meta", s], queryFn: () => picksApi.meta(s), refetchInterval: 120_000 });
@@ -128,6 +141,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
           <Select value={book} onChange={setBook} options={[{ id: "all", label: "All Books" }, ...(m?.books ?? [])]} />
           <Slider label="Edge" value={minEdge} max={20} onChange={setMinEdge} />
           <Slider label="Prob" value={minProb} max={90} onChange={setMinProb} />
+          <Select value={qual} onChange={setQual} options={QUALS.map((q) => ({ id: q.key, label: q.label }))} />
           <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">Sort <Pills options={SORTS} value={sort} onChange={setSort} /></div>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-gray-500">
@@ -155,6 +169,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
           {!hidden && m?.counts && m.counts.hidden > 0
             ? `${m.counts.hidden} picks come from engines without a track record on their market and are hidden; tick "Include unproven models" to see them as leans.`
             : "Picks appear when a champion engine has frozen a forecast for a game and a book's line disagrees with it by at least the minimum edge."}
+          {s && <WhyNone sport={s} kind={kind === "all" ? undefined : kind} />}
         </Msg>
       )}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -244,6 +259,7 @@ function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: 
         <span className={clsx("rounded border px-1.5 py-0.5 text-xs font-semibold", gradeTone(p.grade))}>{p.grade}</span>
         <span className="rounded bg-white/5 px-1.5 py-0.5 text-[11px] uppercase text-gray-400">{p.sport}</span>
         {p.tier !== "proven" && <span className={clsx("text-[10px]", tierTone[p.tier])} title={TIER_TEXT[p.tier]}>{p.tier}</span>}
+        {p.qualification && <QualBadge q={p.qualification} />}
         <span className="ml-auto text-xs text-gray-400">{p.book_title}</span>
         <span className="font-mono text-violet">{odds(p.price)}</span>
       </div>
@@ -258,10 +274,28 @@ function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: 
         <Chip tone="pos">Edge {signedPct(p.edge)}</Chip>
         <StakeChip stake={p.stake} bankroll={bankroll} />
         <PlayableChip p={p} />
+        <GradesChip p={p} />
       </div>
       <p className="text-xs text-gray-400 line-clamp-2 flex-1">{splitWriteup(p.writeup).case_for}</p>
       <BetButton p={p} />
     </div>
+  );
+}
+
+function QualBadge({ q }: { q: Qualification }) {
+  const d = QUALIFICATIONS.find((x) => x.key === q);
+  return <span className={clsx("rounded border px-1.5 py-0.5 text-[10px]", qualTone[q])} title={d?.text}>{d?.label ?? q}</span>;
+}
+
+/** Model quality (is the engine reliable here?) and opportunity (is this price worth it?), graded apart. */
+function GradesChip({ p }: { p: Pick }) {
+  if (!p.model_quality || !p.opportunity_grade) return null;
+  return (
+    <Chip tone="plain">
+      <span title="Model quality: the engine's validated reliability on this market (track record, calibration)">Model {p.model_quality}</span>
+      <span className="text-gray-600"> · </span>
+      <span title={`Opportunity: EV at the current price${p.ev_now != null ? ` (${signedPct(p.ev_now)})` : ""}`}>Price {p.opportunity_grade}</span>
+    </Chip>
   );
 }
 
@@ -512,6 +546,124 @@ function Record() {
         </>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Models: the validation scorecard
+// ---------------------------------------------------------------------------
+
+/** Why a sport has no picks: each market's validation status, from the scorecard. */
+function WhyNone({ sport, kind }: { sport: string; kind?: string }) {
+  const q = useQuery({ queryKey: ["scorecard", sport, kind], queryFn: () => picksApi.scorecard(sport, kind), staleTime: 300_000 });
+  const ms = q.data?.markets ?? [];
+  if (!ms.length) return null;
+  const by = (st: MarketStatus) => ms.filter((m) => m.status === st).map((m) => `${m.market}${m.engine.endsWith("_team") ? " (team)" : ""}`);
+  const parts = (["verified", "model_only", "no_signal", "losing", "insufficient_data"] as MarketStatus[])
+    .map((st) => [st, by(st)] as const).filter(([, v]) => v.length);
+  return (
+    <span className="block mt-2 text-xs text-gray-400">
+      {sport.toUpperCase()} validation: {parts.map(([st, v]) => `${STATUS_TEXT[st]}: ${v.join(", ")}`).join(" · ")}. See the Models tab for the evidence.
+    </span>
+  );
+}
+
+function Models() {
+  const [sport, setSport] = useState("all");
+  const [kind, setKind] = useState("all");
+  const [open, setOpen] = useState<string | null>(null);
+  const s = sport === "all" ? undefined : sport;
+  const q = useQuery({ queryKey: ["scorecard", s, kind], queryFn: () => picksApi.scorecard(s, kind === "all" ? undefined : kind), refetchInterval: 300_000 });
+  const d = q.data;
+  const order: MarketStatus[] = ["verified", "model_only", "no_signal", "losing", "insufficient_data"];
+  const rows = useMemo(() => [...(d?.markets ?? [])].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status) || (b.lines?.n ?? 0) - (a.lines?.n ?? 0)), [d]);
+  const ci = (x?: { mean: number; lo: number; hi: number } | null, scale = 1, dp = 4) =>
+    x == null ? "—" : `${(x.mean * scale).toFixed(dp)} [${(x.lo * scale).toFixed(dp)}, ${(x.hi * scale).toFixed(dp)}]`;
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pills options={SPORTS} value={sport} onChange={setSport} />
+        <Pills options={KINDS} value={kind} onChange={setKind} />
+      </div>
+      <p className="text-xs text-gray-500 max-w-4xl">
+        Every engine and market is scored the same way across sports. Model quality comes from the track-record tier (backtests, then settled lines and picks)
+        and calibration at real lines; status says what AI Picks may publish. Brier vs market below zero favours the model; intervals are 95% bootstrap,
+        resampled by game. ROI excludes quarantined odds feeds. Each pick also gets an opportunity grade from the EV of its current price.
+      </p>
+      {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
+      {q.isLoading && <Msg>Scoring every engine…</Msg>}
+      {d && (
+        <>
+          <div className="flex flex-wrap gap-2 text-xs">
+            {order.map((st) => (
+              <span key={st} className="rounded-md border border-glass bg-surface/60 px-2 py-1">
+                <span className={statusTone[st]}>{STATUS_TEXT[st]}</span> <span className="font-mono text-gray-300">{rows.filter((r) => r.status === st).length}</span>
+              </span>
+            ))}
+          </div>
+          {d.quarantined_feeds.length > 0 && (
+            <Msg tone="error">
+              Quarantined odds feeds (bets won far more often than their prices allow, so the quotes belong to another line or market):{" "}
+              {d.quarantined_feeds.map((f) => `${f.sport.toUpperCase()} ${f.market} @ ${f.book}`).join(", ")}. Their picks are voided and left out of evidence and ROI.
+            </Msg>
+          )}
+          <Table head={<tr><Th>Market</Th><Th>Engine</Th><Th>Status</Th><Th>Quality</Th><Th>Lines</Th><Th>Calib. err.</Th><Th>Brier vs mkt [95%]</Th><Th>Picks</Th><Th>ROI [95%]</Th><Th>CLV</Th><Th>Max DD</Th></tr>}>
+            {rows.map((m) => {
+              const key = m.engine + m.market;
+              return (
+                <ModelRow key={key} m={m} open={open === key} onToggle={() => setOpen(open === key ? null : key)} ci={ci} />
+              );
+            })}
+          </Table>
+          <h2 className="font-medium pt-2">Engine forecasts vs their naive baseline</h2>
+          <Table head={<tr><Th>Engine version</Th><Th>Market</Th><Th>n</Th><Th>Brier</Th><Th>Log loss</Th><Th>Calib. err.</Th><Th>vs baseline [95%]</Th></tr>}>
+            {d.forecasts.filter((f) => f.champion && f.n >= 100).map((f) => (
+              <tr key={f.version + f.market} className="border-t border-glass text-xs">
+                <Td>{f.version}</Td><Td>{f.market}</Td><Td className="font-mono">{f.n}</Td><Td className="font-mono">{f.brier?.toFixed(4)}</Td>
+                <Td className="font-mono">{f.logloss?.toFixed(4)}</Td><Td className="font-mono">{pct(f.ece, 1)}</Td>
+                <Td className={clsx("font-mono", (f.brier_vs_baseline?.hi ?? 0) < 0 ? "text-emerald-light" : (f.brier_vs_baseline?.lo ?? 0) > 0 ? "text-crimson-light" : "")}>{ci(f.brier_vs_baseline)}</Td>
+              </tr>
+            ))}
+          </Table>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ModelRow({ m, open, onToggle, ci }: { m: ScoreMarket; open: boolean; onToggle: () => void; ci: (x?: { mean: number; lo: number; hi: number } | null, scale?: number, dp?: number) => string }) {
+  const bvm = m.lines?.brier_vs_market;
+  return (
+    <>
+      <tr onClick={onToggle} className="border-t border-glass text-xs cursor-pointer hover:bg-white/[0.03]">
+        <Td>{m.sport.toUpperCase()} · {m.market} <span className="text-gray-500">({m.kind})</span></Td>
+        <Td className="text-gray-400">{m.engine.endsWith("_team") ? "team model" : "simulator"}</Td>
+        <Td className={statusTone[m.status]}>{STATUS_TEXT[m.status]}</Td>
+        <Td><span className={clsx("rounded border px-1.5 py-0.5 font-mono", gradeTone(m.model_quality))}>{m.model_quality}</span></Td>
+        <Td className="font-mono">{m.lines?.n ?? 0}</Td>
+        <Td className="font-mono">{pct(m.lines?.ece, 1)}</Td>
+        <Td className={clsx("font-mono", bvm && bvm.hi < 0 ? "text-emerald-light" : bvm && bvm.lo > 0 ? "text-crimson-light" : "")}>{ci(bvm)}</Td>
+        <Td className="font-mono">{m.picks?.n ?? 0}{m.excluded_picks ? <span className="text-crimson-light"> (−{m.excluded_picks})</span> : null}</Td>
+        <Td className={clsx("font-mono", m.picks && m.picks.roi_lo > 0 ? "text-emerald-light" : m.picks && m.picks.roi_hi < 0 ? "text-crimson-light" : "")}>
+          {m.picks ? `${signedPct(m.picks.roi)} [${signedPct(m.picks.roi_lo)}, ${signedPct(m.picks.roi_hi)}]` : "—"}
+        </Td>
+        <Td className="font-mono">{m.picks?.clv_mean == null ? "—" : signedPct(m.picks.clv_mean, 2)}</Td>
+        <Td className="font-mono">{m.picks ? `${m.picks.max_drawdown.toFixed(1)}u` : "—"}</Td>
+      </tr>
+      {open && (
+        <tr className="bg-white/[0.02]">
+          <td colSpan={11} className="px-3 py-2 text-xs text-gray-300 space-y-1">
+            {m.reasons.map((r, i) => <div key={i}>{r}</div>)}
+            {m.lines?.reliability && m.lines.reliability.length > 0 && (
+              <div className="pt-1 text-gray-400">
+                Reliability (predicted → observed, n): {m.lines.reliability.map((b) => `${pct(b.predicted)} → ${pct(b.observed)} (${b.n})`).join(" · ")}
+              </div>
+            )}
+            {m.picks && <div className="text-gray-400">Sharpe {m.picks.sharpe.toFixed(3)} · Sortino {m.picks.sortino.toFixed(3)} · profit factor {m.picks.profit_factor?.toFixed(2) ?? "—"} · hit rate {pct(m.picks.hit_rate, 1)}</div>}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 

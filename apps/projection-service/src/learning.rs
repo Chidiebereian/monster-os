@@ -188,7 +188,11 @@ pub(crate) async fn slate(state: &State, sport: &str, date: NaiveDate) -> Result
     match base(sport) {
         "nhl" => crate::nhl_game::slate(&state.db, date).await,
         "nba" => crate::nba_game::slate(&state.db, date).await,
-        "nfl" => crate::nfl_game::slate(&state.db, date).await,
+        "nfl" => {
+            let mut games = crate::nfl_game::slate(&state.db, date).await?;
+            crate::game_hub::fill_kickoffs(state, "nfl", date, &mut games).await;
+            Ok(games)
+        }
         "mlb" => crate::mlb::ledger_slate(state, date).await,
         _ => Err(format!("unknown sport {sport}")),
     }

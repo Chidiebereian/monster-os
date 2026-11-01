@@ -146,6 +146,47 @@ RAG at k=3 on 16 labelled queries plus 2 off-topic ones: hybrid P@3 0.61,
 R@3 0.89, MRR 0.86; BM25 MRR 0.82; vector MRR 0.83; off-topic queries return
 nothing. Warm search about 0.3 s including the embedding.
 
+Speed (2026-11-01). Tool results are cached for 30 s per URL, and open picks
+are fetched when a chat connects, so the card shows in 0.1–0.5 s. A flagged
+draft is first fixed in code (`judge::repair`: flipped over/under corrected;
+sentences with invented names or numbers, guarantees, whole-bankroll claims or
+per-leg parlay stakes removed); the second generation runs only when that
+isn't enough. Answers are capped at 360 tokens and trimmed back to the last
+full sentence if cut off. Measured: first word 0.7–1.1 s, full answer 3–6 s
+(a parlay that needed a rewrite took 9.9 s before, 4–6 s now). Switching
+models costs a reload on the 4 GB GPU (47 s once after the 0.5B tests).
+
+Chat page. Each answer shows a "Researching your answer" panel with three
+steps and a timer, then a "Pick: … @ book odds" headline over prose, the bet
+card behind a toggle (open for parlays), copy / share / thumbs up-down /
+ask-again buttons and follow-up questions built from the card. Ratings are
+stored on the message (`POST /messages/{id}/feedback`, migration 0032).
+
+Model vs market (`lean.rs`). A bets question that names a sport ("what is the
+best NFL moneyline today?") also fetches that sport's hub schedule and pick
+record; a matchup question with no sport takes it from the game brief. When
+AI Picks has nothing for the request, the answer is built in code instead of
+the canned "nothing to recommend": why there is no official pick (from the
+tier and the market-comparison backtest, e.g. NFL game lines: 4 seasons, 957
+games, fitted market weight 0) and then, for each game still to start, the raw
+model next to the market price, labelled as leans: moneyline (model win % vs
+no-vig market %), spread (model margin vs the line), total (model points vs the
+line). Matchups without an official pick get the same for all three markets of
+that game. When the card does have picks, the leans go into EVIDENCE as MODEL
+VS MARKET and prompt rule 10 tells the model to lead with them. Phrases like
+"best/top/which … moneyline/spread/total/pick" now count as bet requests.
+
+NFL kickoffs (projection-service, 2026-11-01). `sports_games` stores NFL dates
+only, so NFL forecasts were frozen with a NULL `game_start` and the line
+fetcher (games starting in the next 40 h) never saw them: no NFL lines, no NFL
+picks. `game_hub::fill_kickoffs` now reads kickoff times from the ESPN
+scoreboard when the NFL slate is built and stores them in `game_kickoffs`
+(migration 0033; ledger rows stay immutable), and `lines::upcoming` uses
+`COALESCE(game_start, kickoff)`. NFL game lines still publish nothing, by
+design, because the blend weight is 0. NFL props (which beat their naive
+baseline in backtests) need prop lines from the Odds API / SportsGameOdds,
+whose daily budgets run out.
+
 Parlay stakes (`router::parlay_money`, `card::Staking`). In a parlay request
 a dollar amount is the stake on the whole parlay ("a 3-leg parlay with $50",
 "a $25 four-leg parlay"). It is a bankroll only with bankroll words ("I have a

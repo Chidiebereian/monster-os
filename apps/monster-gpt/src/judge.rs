@@ -198,6 +198,81 @@ pub fn check(answer: &str, card: Option<&Card>, evidence: &str) -> Vec<Issue> {
     issues
 }
 
+/// Replace the whole word `from` with `to` (keeping a leading capital).
+fn replace_word(s: &str, from: &str, to: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.to_ascii_lowercase().find(from) {
+        let before_ok = rest[..i].chars().next_back().map_or(true, |c| !c.is_alphanumeric());
+        let after_ok = rest[i + from.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+        out.push_str(&rest[..i]);
+        let orig = &rest[i..i + from.len()];
+        if before_ok && after_ok {
+            if orig.chars().all(|c| c.is_uppercase()) { out.push_str(&to.to_uppercase()); }
+            else if orig.starts_with(|c: char| c.is_uppercase()) { let mut c = to.chars(); out.extend(c.next().map(|f| f.to_ascii_uppercase())); out.push_str(c.as_str()); }
+            else { out.push_str(to); }
+        } else { out.push_str(orig); }
+        rest = &rest[i + from.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Put a flipped over/under back to the card's side in sentences that name the
+/// player and only the wrong side. Returns the text and how many were fixed.
+pub fn fix_sides(text: &str, card: &Card) -> (String, usize) {
+    let mut fixed = 0;
+    let lines: Vec<String> = text.lines().map(|line| {
+        let mut out = String::new();
+        let mut rest = line;
+        while !rest.is_empty() {
+            let cut = rest.match_indices(". ").map(|(i, _)| i + 2).next().unwrap_or(rest.len());
+            let (sent, tail) = rest.split_at(cut);
+            let mut s = sent.to_string();
+            for b in &card.bets {
+                let side = b.side.to_lowercase();
+                let opposite = match side.as_str() { "over" => "under", "under" => "over", _ => continue };
+                let last = b.pick.split_whitespace().nth(1).unwrap_or("").to_lowercase();
+                let l = s.to_lowercase();
+                let has = |w: &str| replace_word(&l, w, "") != l;
+                if last.len() >= 3 && l.contains(&last) && has(opposite) && !has(&side) {
+                    s = replace_word(&s, opposite, &side);
+                    fixed += 1;
+                }
+            }
+            out.push_str(&s);
+            rest = tail;
+        }
+        out
+    }).collect();
+    (lines.join("\n"), fixed)
+}
+
+/// Repair a draft in code: flipped sides are corrected, and sentences with
+/// invented names or numbers, guarantees, "whole bankroll" claims or per-leg
+/// parlay stakes are removed. Cheaper than a second generation; the
+/// orchestrator rewrites only when this leaves too little or doesn't fix it.
+pub fn repair(text: &str, card: Option<&Card>, evidence: &str, issues: &[Issue]) -> (String, usize) {
+    let (mut t, mut n) = (text.to_string(), 0);
+    if let Some(c) = card { let (x, k) = fix_sides(&t, c); t = x; n += k; }
+    let mut phrases: Vec<&str> = Vec::new();
+    if issues.iter().any(|i| i.code == "per_leg_stake") { phrases.extend_from_slice(PER_LEG); }
+    if issues.iter().any(|i| i.code == "guarantee") { phrases.extend_from_slice(GUARANTEES); }
+    if issues.iter().any(|i| i.code == "bankroll_claim") { phrases.extend_from_slice(WHOLE_BANKROLL); }
+    let (x, k) = scrub(&t, &unknown_names(&t, evidence), &crate::validate::unsupported(&t, evidence), &phrases);
+    (x, n + k)
+}
+
+/// An answer cut off by the token cap, trimmed back to its last complete
+/// sentence. None when it already ends cleanly or no sentence ends in it.
+pub fn trim_unfinished(text: &str) -> Option<String> {
+    let t = text.trim_end();
+    if t.ends_with(['.', '!', '?', ')', '"']) { return None; }
+    // a sentence ends at ". " or ".\n" (not the "." inside "1.5")
+    let cut = t.char_indices().filter(|(i, c)| matches!(c, '.' | '!' | '?') && t[i + 1..].starts_with([' ', '\n'])).map(|(i, _)| i + 1).last()?;
+    Some(t[..cut].trim_end().to_string())
+}
+
 /// Feedback for the rewrite pass.
 pub fn feedback(issues: &[Issue]) -> String {
     let mut s = String::from("Your previous draft had these problems. Rewrite the whole answer and fix every one of them; keep using only EVIDENCE:\n");
@@ -282,6 +357,26 @@ mod tests {
     fn section_labels_are_not_names() {
         assert!(names("**Notes:** Remember to monitor injuries. **Sizing:** Stake $20").is_empty());
         assert_eq!(names("Bet 1 (Cale Makar Under 1.5 Points): proven"), vec!["Cale Makar"]);
+    }
+
+    #[test]
+    fn cut_off_answers_end_at_a_full_sentence() {
+        assert_eq!(trim_unfinished("Take Connor at +200. Stake $4 to win $8.\n\nThe third bet is Hutson. Stake $4 to win $").as_deref(),
+            Some("Take Connor at +200. Stake $4 to win $8.\n\nThe third bet is Hutson."));
+        assert_eq!(trim_unfinished("All done."), None);
+        assert_eq!(trim_unfinished("Over 1.5 points and"), None);
+    }
+
+    #[test]
+    fn repair_fixes_flipped_sides_without_a_rewrite() {
+        let c = card();
+        let ev = crate::card::render_text(&c);
+        let draft = "Cale Makar under 1.5 is fine. Take the Over on Makar tonight because he is hot. Results vary, so manage risk.";
+        let (fixed, n) = fix_sides(draft, &c);
+        assert_eq!(n, 1);
+        assert!(fixed.contains("Take the Under on Makar"), "{fixed}");
+        assert!(!check(&fixed, Some(&c), &ev).iter().any(|i| i.code == "side_flip"));
+        assert_eq!(replace_word("Overall the OVER, over-hyped", "over", "under"), "Overall the UNDER, under-hyped");
     }
 
     #[test]

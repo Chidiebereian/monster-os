@@ -20,7 +20,9 @@
 //! callers pass that evidence in `context`.
 
 mod card;
+mod diag;
 mod judge;
+mod lean;
 mod llm;
 mod memory;
 mod orchestrator;
@@ -694,6 +696,7 @@ async fn main() -> std::io::Result<()> {
             http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
             projection_url: llm.rag.projection_url.clone(),
+            cache: Default::default(),
         },
         store,
         models,
@@ -755,6 +758,7 @@ async fn main() -> std::io::Result<()> {
             .route("/conversations", web::get().to(ws::conversations))
             .route("/conversations/{id}", web::get().to(ws::conversation_messages))
             .route("/conversations/{id}", web::delete().to(ws::delete_conversation))
+            .route("/messages/{id}/feedback", web::post().to(ws::message_feedback))
             .route("/metrics", web::get().to(ws::metrics))
             .route("/healthz", web::get().to(healthz))
             .route("/ask", web::post().to(ask))

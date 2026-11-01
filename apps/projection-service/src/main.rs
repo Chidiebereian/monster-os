@@ -37,6 +37,7 @@ mod autopilot;
 mod team_engine;
 mod lines;
 mod picks;
+mod validation;
 mod parlay;
 mod parlay_store;
 mod sharp;
@@ -742,6 +743,7 @@ async fn main() -> std::io::Result<()> {
             .route("/picks", web::get().to(picks::list))
             .route("/picks/run", web::post().to(picks::run_http))
             .route("/picks/record", web::get().to(picks::record))
+            .route("/validation/scorecard", web::get().to(validation::scorecard_http))
             .route("/picks/edges", web::get().to(sharp::list))
             .route("/picks/meta", web::get().to(picks::meta))
             .route("/picks/evidence/run", web::post().to(evidence::run_http))

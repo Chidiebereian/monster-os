@@ -202,6 +202,15 @@ pub(crate) fn implied(american: i32) -> f64 { 1.0 / decimal(american) }
 /// De-vigged probability of side a from a two-way pair.
 pub(crate) fn novig(a: i32, b: i32) -> f64 { let (x, y) = (implied(a), implied(b)); x / (x + y) }
 
+/// A quote whose no-vig probability is this far from the median of 3+ books at the same line is dropped.
+pub(crate) const OUTLIER_GAP: f64 = 0.15;
+pub(crate) fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    if n == 0 { 0.0 } else if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2.0 }
+}
+
 /// The worst American price at which a bet with these win / loss chances (pushes
 /// are the rest) still earns `min_ev` per unit; 0 gives the break-even (fair)
 /// price. Rounded toward the safe side.
@@ -753,8 +762,12 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         if let Some(s) = r.get::<_, Option<DateTime<Utc>>>(13) { starts.insert(key.0.clone(), s); }
         sides.insert((key, r.get(0), r.get(7)), (r.get(8), r.get(9), r.get(10), r.get(12), r.get(11), r.get(6), r.get(5)));
     }
+    // odds feeds the validation engine found mislabelled (any sport, market, book)
+    let quarantined: HashSet<(String, String)> = db.query("SELECT market, book FROM feed_quarantine WHERE sport=$1", &[&sport]).await
+        .map(|rows| rows.iter().map(|r| (r.get(0), r.get(1))).collect()).unwrap_or_default();
     let mut quotes: HashMap<(Key, String), Vec<Quote>> = HashMap::new(); // (selection, side) -> quotes
     for ((key, book, side), (line, price, link, obs, open, ps, name)) in &sides {
+        if quarantined.contains(&(key.1.clone(), book.clone())) { continue; }
         let partner = sides.get(&(key.clone(), book.clone(), other(side).to_string())).map(|x| (x.0, x.1));
         let (oline, oprice) = match partner {
             Some(x) => x,
@@ -768,6 +781,20 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         quotes.entry((key.clone(), side.clone())).or_default().push(Quote { book: book.clone(), a_line: *line, a_price: *price, b_price: *oprice, a_link: link.clone(),
             observed: *obs, open_line: *open, provider_subject: ps.clone(), subject_name: name.clone() });
     }
+    // with three or more books at one line, a quote far from their median is a
+    // feed error (wrong line or market), not a soft price
+    let mut outliers = 0;
+    for qs in quotes.values_mut() {
+        let mut by_line: HashMap<String, Vec<f64>> = HashMap::new();
+        for q in qs.iter() { by_line.entry(format!("{:?}", q.a_line)).or_default().push(novig(q.a_price, q.b_price)); }
+        let n0 = qs.len();
+        qs.retain(|q| match by_line.get(&format!("{:?}", q.a_line)) {
+            Some(v) if v.len() >= 3 => (novig(q.a_price, q.b_price) - median(v)).abs() <= OUTLIER_GAP,
+            _ => true,
+        });
+        outliers += n0 - qs.len();
+    }
+    quotes.retain(|_, qs| !qs.is_empty());
     let games: Vec<String> = quotes.keys().map(|((g, _, _), _)| g.clone()).collect::<HashSet<_>>().into_iter().collect();
     // ledger entries of each champion engine for these games
     let mut ledgers: HashMap<&str, HashMap<String, Ledger>> = HashMap::new();
@@ -843,6 +870,23 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
             cands.push(c);
             break; // the best-evidenced engine that can price it decides
         }
+    }
+    // open picks follow the evidence as it changes: a quarantined feed voids them,
+    // a lower tier re-caps their grade (never raises it)
+    let mut withdrawn = db.execute("UPDATE ai_picks p SET status='void', result='void', profit=0, settled_at=now(), \
+        risk_flags = risk_flags || '[{\"code\":\"feed_quarantined\",\"text\":\"the odds feed for this market and book was quarantined: its quotes did not match real outcomes\"}]'::jsonb \
+        WHERE p.sport=$1 AND p.status='open' AND EXISTS (SELECT 1 FROM feed_quarantine q WHERE q.sport=p.sport AND q.market=p.market AND q.book=p.book)", &[&sport])
+        .await.map_err(|e| dberr(&e))?;
+    for r in db.query("SELECT id, engine, market, tier, grade FROM ai_picks WHERE sport=$1 AND status='open'", &[&sport]).await.map_err(|e| dberr(&e))? {
+        let (engine, market, old_tier, grade): (String, String, String, String) = (r.get(1), r.get(2), r.get(3), r.get(4));
+        let (t, _) = tier_of(&engine, &market);
+        if t == old_tier { continue; }
+        let g = GRADES.iter().find(|x| **x == grade).copied().unwrap_or("C");
+        // price, probabilities, line and ledger stay as published; the published grade is kept in the flag
+        let flag = json!([{ "code": "regraded", "text": format!("published as {grade} ({old_tier}); re-capped after the engine's track record on this market changed to {t}"),
+            "published_grade": grade, "published_tier": old_tier, "at": Utc::now() }]);
+        withdrawn += db.execute("UPDATE ai_picks SET tier=$2, grade=$3, risk_flags = risk_flags || $4, updated_at=now() WHERE id=$1",
+            &[&r.get::<_, i64>(0), &t, &cap(g, t), &Json(&flag)]).await.map_err(|e| dberr(&e))?;
     }
     // existing picks (for latest_* updates)
     // the implausibility guard looks at the RAW model: a blend can shrink a broken forecast into a plausible-looking edge
@@ -1029,7 +1073,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let _ = by_selection;
     let rewritten = rewrite_writeups(state, sport).await;
     Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "lines_recorded": recorded, "qualifying": keep.len(), "published": published, "updated": updated,
-        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch }, "llm_rewritten": rewritten,
+        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch, "outlier_quotes": outliers, "quarantined_feeds": quarantined.len() }, "regraded_or_voided": withdrawn, "llm_rewritten": rewritten,
         "orientation_check": { "checked": checked, "agree": agree, "ok": orientation_ok } }))
 }
 
@@ -1214,7 +1258,7 @@ pub(crate) async fn settle(state: &State, sport: &str) -> Result<Value, String> 
 /// probability or the market's predict the result better (paired Brier)?
 async fn refresh_evidence(db: &tokio_postgres::Client, sport: &str) -> Result<u64, String> {
     let rows = db.query("SELECT engine, market, split_part(model_version, '+', 1), p_model, p_market, result, profit, clv FROM ai_picks \
-        WHERE sport=$1 AND status='settled' AND result IN ('win','loss')", &[&sport]).await.map_err(|e| dberr(&e))?;
+        WHERE sport=$1 AND status='settled' AND result IN ('win','loss') AND NOT EXISTS (SELECT 1 FROM feed_quarantine q WHERE q.sport=ai_picks.sport AND q.market=ai_picks.market AND q.book=ai_picks.book)", &[&sport]).await.map_err(|e| dberr(&e))?;
     let mut g: BTreeMap<(String, String, String), Vec<(f64, f64, f64, f64, Option<f64>)>> = BTreeMap::new();
     for r in &rows {
         let y = if r.get::<_, String>(5) == "win" { 1.0 } else { 0.0 };
@@ -1267,7 +1311,7 @@ pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Resp
 pub struct ListQ {
     sport: Option<String>, kind: Option<String>, side: Option<String>, grades: Option<String>, market: Option<String>, game: Option<String>,
     book: Option<String>, min_edge: Option<f64>, min_prob: Option<f64>, sort: Option<String>, q: Option<String>,
-    #[serde(default)] include_hidden: bool, status: Option<String>, limit: Option<i64>,
+    #[serde(default)] include_hidden: bool, status: Option<String>, limit: Option<i64>, qualification: Option<String>,
 }
 
 const PICK_COLS: &str = "id, sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
@@ -1349,15 +1393,44 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     if !q.include_hidden { f.raw("tier IN ('proven','baseline')"); }
     let (w, p) = (f.w, f.p);
     let order = match q.sort.as_deref().unwrap_or("grade") {
-        "edge" => "edge DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
+        "edge" => "edge DESC", "ev" => "ev DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
         _ => "array_position(ARRAY['A+','A','A-','B+','B','B-','C+','C'], grade), edge DESC",
     };
     let sql = format!("SELECT {PICK_COLS} FROM ai_picks {} ORDER BY {order} LIMIT {}", if w.is_empty() { String::new() } else { format!("WHERE {}", w.join(" AND ")) }, q.limit.unwrap_or(300).clamp(1, 1000));
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = p.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
     match state.db.query(&sql, &params).await {
-        Ok(rows) => HttpResponse::Ok().json(json!({ "count": rows.len(), "picks": rows.iter().map(|r| pick_json(r, false)).collect::<Vec<_>>() })),
+        Ok(rows) => {
+            let st = crate::validation::statuses(&state).await;
+            let mut picks: Vec<Value> = rows.iter().map(|r| { let mut v = pick_json(r, false); qualify(&mut v, &st); v }).collect();
+            if let Some(want) = q.qualification.as_deref().filter(|s| !s.is_empty() && *s != "all") {
+                let want: Vec<&str> = want.split(',').collect();
+                picks.retain(|p| p["qualification"].as_str().map(|s| want.contains(&s)).unwrap_or(false));
+            }
+            HttpResponse::Ok().json(json!({ "count": picks.len(), "picks": picks }))
+        }
         Err(e) => internal(dberr(&e)),
     }
+}
+
+/// Two grades and a qualification status from the validation scorecard: model
+/// quality (is the engine reliable on this market?) and opportunity (is the
+/// current price worth it?), kept apart from the combined `grade`.
+fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
+    let key = (v["engine"].as_str().unwrap_or("").to_string(), v["market"].as_str().unwrap_or("").to_string());
+    let (quality, status) = st.get(&key).cloned().unwrap_or_else(|| ("I".into(), "insufficient_data".into()));
+    // EV at the latest price when the line has moved, else at the published one
+    let ev_now = match (v["latest"]["price"].as_i64(), v["latest"]["line"].as_f64().or(v["line"].as_f64()) == v["line"].as_f64()) {
+        (Some(p), true) => { let pm = v["p_model"].as_f64().unwrap_or(0.0); pm * (decimal(p as i32) - 1.0) - (1.0 - pm) }
+        _ => v["ev"].as_f64().unwrap_or(0.0),
+    };
+    let feed_bad = st.contains_key(&(format!("q:{}", v["sport"].as_str().unwrap_or("")), format!("{}|{}", key.1, v["book"].as_str().unwrap_or(""))));
+    let suspended = v["status"] != "open" || v["playable_now"] == json!(false) || feed_bad;
+    if feed_bad { v["feed_quarantined"] = json!(true); }
+    v["model_quality"] = json!(quality);
+    v["validation_status"] = json!(status);
+    v["opportunity_grade"] = json!(crate::validation::opportunity_grade(ev_now));
+    v["ev_now"] = json!(r3(ev_now));
+    v["qualification"] = json!(crate::validation::qualification(&status, ev_now, suspended, v["edge"].as_f64().unwrap_or(0.0)));
 }
 
 pub async fn get(state: web::Data<State>, path: web::Path<i64>) -> impl Responder {
@@ -1390,7 +1463,7 @@ pub async fn record(state: web::Data<State>, q: web::Query<RecordQ>) -> impl Res
            COALESCE(sum(profit) FILTER (WHERE result IN ('win','loss','push')),0), avg(clv), count(clv), \
            avg(power(p_model - (result='win')::int, 2) - power(p_market - (result='win')::int, 2)) FILTER (WHERE result IN ('win','loss')), \
            sum(stake * profit) FILTER (WHERE result IN ('win','loss','push')), sum(stake) FILTER (WHERE result IN ('win','loss','push')) \
-         FROM ai_picks WHERE status IN ('settled','void') AND settled_at > now() - make_interval(days => $1) AND ($2::text IS NULL OR sport=$2) \
+         FROM ai_picks WHERE status IN ('settled','void') AND settled_at > now() - make_interval(days => $1) AND ($2::text IS NULL OR sport=$2) AND NOT EXISTS (SELECT 1 FROM feed_quarantine q WHERE q.sport=ai_picks.sport AND q.market=ai_picks.market AND q.book=ai_picks.book) \
          GROUP BY ROLLUP (sport, kind, market, tier, grade) ORDER BY 1,2,3,4,5", &[&days, &sport]).await {
         Ok(r) => r, Err(e) => return internal(dberr(&e)),
     };

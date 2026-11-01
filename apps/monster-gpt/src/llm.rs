@@ -174,7 +174,7 @@ pub fn models_from_env(env: &dyn Fn(&str) -> Option<String>) -> Vec<ModelCfg> {
     };
     let base_url = if provider == Provider::Ollama { base.trim_end_matches("/v1").to_string() } else { base };
     let num_ctx = env("LLM_NUM_CTX").and_then(|v| v.parse().ok()).unwrap_or(4096);
-    let max_tokens = env("LLM_MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(450);
+    let max_tokens = env("LLM_MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(360);
     let primary = env("LLM_MODEL").unwrap_or_else(|| "qwen2.5:7b".into());
     let mut ids = vec![primary];
     for extra in env("MONSTER_GPT_MODELS").unwrap_or_default().split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {

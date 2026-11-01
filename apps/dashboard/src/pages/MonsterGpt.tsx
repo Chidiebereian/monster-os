@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Bot, Brain, Check, ChevronDown, Database, ExternalLink, Loader2, MessageSquarePlus, PanelLeft, Send, Sparkles, Square, Trash2, User, Wifi, WifiOff, X } from "lucide-react";
+import {
+  AlertTriangle, ArrowRight, Bot, Brain, Check, ChevronDown, Circle, Copy, Database, ExternalLink, Loader2, MessageSquarePlus, PanelLeft, RotateCw, Send, Share2, Sparkles,
+  Square, ThumbsDown, ThumbsUp, Trash2, Wifi, WifiOff, X,
+} from "lucide-react";
 import clsx from "clsx";
 import { GptLocks } from "../components/GptLocks";
 import {
@@ -25,6 +28,11 @@ interface Turn {
   cancelled?: boolean;
   error?: string;
   rewriting?: boolean;
+  /** ms timestamps for the research timer */
+  started?: number;
+  ended?: number;
+  message_id?: string | null;
+  feedback?: number | null;
 }
 
 const PILLS = [
@@ -49,7 +57,8 @@ function fromStored(ms: StoredMessage[]): Turn[] {
     else {
       const t = out.find((x) => x.request_id === m.request_id) ?? out[out.length - 1];
       if (!t) continue;
-      Object.assign(t, { text: m.content, card: m.card ?? undefined, sources: m.sources ?? undefined, model: m.model, usage: m.usage ?? undefined, cancelled: m.cancelled, done: true });
+      Object.assign(t, { text: m.content, card: m.card ?? undefined, sources: m.sources ?? undefined, model: m.model, usage: m.usage ?? undefined, cancelled: m.cancelled, done: true,
+        message_id: m.id, feedback: m.feedback ?? null });
     }
   }
   return out.map((t) => ({ ...t, done: true }));
@@ -90,7 +99,7 @@ export function MonsterGpt() {
       case "delta": patch(m.request_id, (t) => ({ ...t, text: t.text + m.text })); break;
       case "reset": patch(m.request_id, (t) => ({ ...t, text: "", rewriting: true })); break;
       case "done":
-        patch(m.request_id, (t) => ({ ...t, done: true, model: m.model, usage: m.usage, cancelled: m.cancelled }));
+        patch(m.request_id, (t) => ({ ...t, done: true, ended: Date.now(), model: m.model, usage: m.usage, cancelled: m.cancelled, message_id: m.message_id }));
         qc.invalidateQueries({ queryKey: ["gpt-conversations"] });
         qc.invalidateQueries({ queryKey: ["gpt-memory"] });
         break;
@@ -117,7 +126,7 @@ export function MonsterGpt() {
     const question = q.trim();
     if (!question || active || !sock.current) return;
     setInput("");
-    setTurns((ts) => [...ts.filter((t) => t.request_id !== request_id), { request_id, question, statuses: [], text: "", done: false }]);
+    setTurns((ts) => [...ts.filter((t) => t.request_id !== request_id), { request_id, question, statuses: [], text: "", done: false, started: Date.now() }]);
     sock.current.send({ request_id, conversation_id: conv, text: question, context, model });
   }
 
@@ -211,17 +220,29 @@ export function MonsterGpt() {
               </div>
             </div>
           )}
-          {turns.map((t) => <TurnView key={t.request_id} t={t} onRetry={() => send(t.question, undefined, t.request_id)} />)}
+          {turns.map((t, i) => (
+            <TurnView key={t.request_id} t={t} last={i === turns.length - 1} busy={!!active}
+              onRetry={() => send(t.question, undefined, t.request_id)}
+              onAsk={(q, context) => send(q, context)}
+              onRate={async (rating) => {
+                if (!t.message_id) return;
+                const next = t.feedback === rating ? 0 : rating;
+                patch(t.request_id, (x) => ({ ...x, feedback: next || null }));
+                await gptApi.feedback(t.message_id, next).catch(() => patch(t.request_id, (x) => ({ ...x, feedback: t.feedback ?? null })));
+              }} />))}
         </div>
 
-        <form onSubmit={(e) => { e.preventDefault(); send(input); }} className="mt-3 flex items-center gap-2 border border-glass rounded-lg bg-surface px-3 py-2">
-          <input value={input} onChange={(e) => setInput(e.target.value)} placeholder='e.g. "3 safe NHL props tonight, I have $200"' maxLength={8000}
-            className="flex-1 bg-transparent text-sm focus:outline-none text-gray-100 placeholder:text-gray-600" aria-label="Message MonsterGPT" />
+        <form onSubmit={(e) => { e.preventDefault(); send(input); }}
+          className="mt-3 flex items-center gap-2 rounded-xl border border-amber-400/25 bg-surface/90 px-4 py-3 shadow-[0_0_24px_-8px_rgba(139,92,246,0.45)] focus-within:border-violet/50">
+          <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask MonsterGPT anything to get the best picks." maxLength={8000}
+            className="flex-1 bg-transparent text-sm focus:outline-none text-gray-100 placeholder:text-amber-200/50" aria-label="Message MonsterGPT" />
           {active ? (
-            <button type="button" onClick={() => sock.current?.cancel(active.request_id)} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-crimson/20 text-crimson-light text-xs hover:bg-crimson/30">
-              <Square size={12} />Stop</button>
+            <button type="button" onClick={() => sock.current?.cancel(active.request_id)} title="Stop"
+              className="relative h-8 w-8 rounded-full text-gray-300 hover:text-crimson-light" aria-label="Stop">
+              <Loader2 size={30} className="absolute inset-0 m-auto animate-spin text-gray-500" strokeWidth={1.25} />
+              <Square size={10} className="absolute inset-0 m-auto fill-current" /></button>
           ) : (
-            <button type="submit" disabled={!input.trim()} className="p-1.5 rounded-md bg-violet/20 text-violet-light disabled:opacity-40 hover:bg-violet/30" aria-label="Send"><Send size={16} /></button>
+            <button type="submit" disabled={!input.trim()} className="h-8 w-8 inline-flex items-center justify-center rounded-full bg-violet/25 text-violet-light disabled:opacity-40 hover:bg-violet/35" aria-label="Send"><Send size={15} /></button>
           )}
         </form>
       </div>
@@ -229,55 +250,184 @@ export function MonsterGpt() {
   );
 }
 
-function TurnView({ t, onRetry }: { t: Turn; onRetry: () => void }) {
-  const modelStatus = t.statuses.find((s) => s.stage === "model");
-  const validation = t.statuses.find((s) => s.stage === "validate");
+const STEP_LABELS = ["Understanding your question", "Checking Monster picks, projections, and prices", "Building a clear answer"];
+
+/** Which of the three research steps are done, from the status frames. */
+function steps(t: Turn): { labels: string[]; done: number } {
+  const labels = [...STEP_LABELS];
+  if (t.statuses.some((s) => s.stage === "retrieval")) labels[1] = "Searching Monster OS docs and data";
+  if (t.statuses.some((s) => s.stage === "route" && s.name === "memory")) labels[1] = "Updating your saved memory";
+  if (t.done) return { labels, done: 3 };
+  const routed = t.statuses.some((s) => s.stage === "route");
+  const gathered = !!t.card || !!t.text || t.statuses.some((s) => s.stage === "model");
+  return { labels, done: gathered ? 2 : routed ? 1 : 0 };
+}
+
+function useElapsed(t: Turn) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (t.done) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [t.done]);
+  if (!t.started) return null;
+  return Math.max(0, Math.round(((t.done ? t.ended ?? now : now) - t.started) / 1000));
+}
+
+/** Questions worth asking next, built from the card (no model call). */
+function followUps(t: Turn): { q: string; context?: unknown }[] {
+  const c = t.card;
+  if (c && c.bets.length > 0) {
+    const top = c.bets[0];
+    const ctx = { bet: { pick: top.pick, game: top.game, sport: top.sport, price: top.price, book: top.book, p_model: top.p_model, p_market: top.p_market,
+      edge: top.edge, grade: top.grade, tier: top.tier, why: top.why, risks: top.risks } };
+    const out: { q: string; context?: unknown }[] = [{ q: `What could make ${top.pick} lose?`, context: ctx }];
+    if (c.parlays.length > 0) out.push({ q: "No parlay, straight bets", context: undefined }, { q: "Make it a safer parlay", context: undefined });
+    else {
+      if (c.bets.length > 1) out.push({ q: "Make it a parlay", context: undefined });
+      out.push({ q: c.filters.risk === "safe" ? "Only plus-money picks" : "Only the safest picks", context: undefined });
+    }
+    return out;
+  }
+  if (c) return [{ q: c.filters.day === "tomorrow" ? "What about today?" : "What about tomorrow?" }, { q: "Show me every sport" }, { q: "How are your picks doing?" }];
+  return [];
+}
+
+/** "Pick: Cale Makar Under 1.5 Points @ DraftKings -150" over the answer. */
+function Headline({ card }: { card: GptCard }) {
+  const p = card.parlays[0];
+  if (p) return (
+    <div className="mb-2 text-[15px] font-medium text-violet-light">
+      {card.parlays.length > 1 ? `${card.parlays.length} parlays` : `Parlay: ${p.legs.length} legs`} <span className="font-mono">{odds(p.american)}</span>
+      {p.stake_usd != null && <span className="text-gray-300 font-normal"> · {usd(p.stake_usd)} stake pays {usd(p.payout_usd)}</span>}
+    </div>);
+  const b = card.bets[0];
+  if (!b) return null;
+  return (
+    <div className="mb-2 text-[15px] font-medium text-violet-light">
+      {card.bets.length > 1 ? "Top pick" : "Pick"}: {b.pick} <span className="text-gray-400 font-normal">@</span>{" "}
+      {b.link ? <a href={b.link} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 underline decoration-violet/40 underline-offset-2 hover:decoration-violet-light">
+        <ExternalLink size={13} />{b.book} {odds(b.price)}</a> : <span>{b.book} {odds(b.price)}</span>}
+    </div>);
+}
+
+function TurnView({ t, last, busy, onRetry, onAsk, onRate }: {
+  t: Turn; last: boolean; busy: boolean; onRetry: () => void; onAsk: (q: string, context?: unknown) => void; onRate: (rating: number) => void;
+}) {
+  const [details, setDetails] = useState(false);
+  const [showCard, setShowCard] = useState<boolean | null>(null);
+  const [copied, setCopied] = useState<"copy" | "share" | null>(null);
+  const elapsed = useElapsed(t);
+  const st = steps(t);
   const issues = t.usage?.judge?.issues ?? [];
   const unsupported = t.usage?.unsupported_numbers ?? [];
+  const validation = t.statuses.find((s) => s.stage === "validate");
   const checked = t.done && (validation?.state === "completed" || (t.usage?.judge && issues.length === 0 && unsupported.length === 0));
+  const researching = !t.done && !t.text;
+  const cardOpen = showCard ?? (!!t.card && (t.card.parlays.length > 0 || !t.text));
+  const plain = () => {
+    const b = t.card?.bets[0];
+    return `${b ? `Pick: ${b.pick} @ ${b.book} ${odds(b.price)}\n\n` : ""}${t.text}`;
+  };
+  async function copy(kind: "copy" | "share") {
+    const text = plain();
+    try {
+      if (kind === "share" && navigator.share) { await navigator.share({ title: "MonsterGPT", text }); return; }
+      await navigator.clipboard.writeText(text);
+      setCopied(kind);
+      window.setTimeout(() => setCopied(null), 1500);
+    } catch { /* share sheet dismissed or clipboard blocked */ }
+  }
+  const icon = "p-1.5 rounded-md text-gray-500 hover:text-gray-200 hover:bg-white/5 disabled:opacity-30";
   return (
     <div className="space-y-3">
-      <div className="flex gap-3 justify-end">
-        <div className="max-w-[70ch] rounded-lg px-4 py-2.5 text-sm bg-violet/15 text-gray-100 whitespace-pre-wrap">{t.question}</div>
-        <div className="shrink-0 h-7 w-7 rounded-md bg-white/5 flex items-center justify-center"><User size={15} className="text-gray-400" /></div>
+      <div className="flex justify-end">
+        <div className="max-w-[70ch] rounded-2xl border border-violet/25 bg-violet/15 px-4 py-3 text-[15px] text-gray-100 whitespace-pre-wrap">{t.question}</div>
       </div>
       <div className="flex gap-3">
-        <div className="shrink-0 h-7 w-7 rounded-md bg-violet/15 flex items-center justify-center"><Bot size={15} className="text-violet-light" /></div>
+        <div className="shrink-0 h-9 w-9 rounded-full bg-gradient-to-br from-violet to-violet/40 ring-2 ring-violet/30 flex items-center justify-center"><Bot size={17} className="text-white" /></div>
         <div className="flex-1 min-w-0 space-y-3">
-          {t.statuses.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">{t.statuses.filter((s) => s.stage !== "validate" && !(s.stage === "judge" && s.state === "started" && t.done)).map((s) => (
-              <span key={`${s.stage}:${s.name}`} title={s.detail} className={clsx("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]",
-                s.state === "failed" ? "border-crimson/40 text-crimson-light" : s.state === "completed" ? "border-glass text-gray-400" : "border-violet/40 text-violet-light")}>
-                {s.state === "completed" ? <Check size={11} /> : s.state === "failed" ? <AlertTriangle size={11} /> : <Loader2 size={11} className="animate-spin" />}
-                {s.stage === "route" ? s.detail : s.stage === "model" ? `${s.name}${s.state === "queued" ? " (queued)" : ""}` : s.stage === "judge" ? "fixing the draft" : s.name}
-                {s.ms != null && s.stage !== "route" && <span className="text-gray-600">{s.ms < 1000 ? `${s.ms}ms` : `${(s.ms / 1000).toFixed(1)}s`}</span>}
-              </span>))}</div>
-          )}
-          {t.card && <BetCard card={t.card} sources={t.sources} />}
-          {(t.text || (!t.done && modelStatus)) && (
-            <div className="rounded-lg bg-surface border border-glass px-4 py-3">
-              <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1.5 flex items-center gap-1.5"><Bot size={11} />MonsterGPT's explanation{t.model ? ` · ${t.model}` : ""}</div>
-              <div className="text-sm text-gray-200 whitespace-pre-wrap leading-relaxed">
-                <Rich text={t.text} />{!t.done && <span className="inline-block w-1.5 h-4 bg-violet-light/70 animate-pulse align-text-bottom ml-0.5" />}
-                {!t.text && !t.done && <span className="text-gray-500">{t.rewriting ? "The checker found problems in the draft; rewriting it…" : modelStatus?.state === "queued" ? "Waiting for a free model slot…" : "Writing…"}</span>}
+          {researching ? (
+            <div className="max-w-md rounded-xl border border-glass bg-surface/80 p-4 shadow-[0_0_30px_-12px_rgba(139,92,246,0.5)]">
+              <div className="flex items-center gap-2.5 mb-3">
+                <span className="h-7 w-7 rounded-md bg-violet/20 flex items-center justify-center"><Sparkles size={14} className="text-violet-light" /></span>
+                <span className="font-medium text-gray-100">Researching your answer</span>
+                {elapsed != null && <span className="ml-auto text-xs text-gray-500 tabular-nums">{elapsed}s</span>}
               </div>
+              <ol className="space-y-1">
+                {st.labels.map((label, i) => (
+                  <li key={label} className={clsx("flex items-start gap-2.5 rounded-md px-2 py-1.5 text-sm", i === st.done ? "bg-white/5 text-gray-100 font-medium" : i < st.done ? "text-gray-400" : "text-gray-600")}>
+                    {i < st.done ? <Check size={15} className="mt-0.5 shrink-0 text-emerald-light" /> : i === st.done ? <Loader2 size={15} className="mt-0.5 shrink-0 animate-spin text-violet-light" /> : <Circle size={15} className="mt-0.5 shrink-0" />}
+                    {label}
+                  </li>))}
+              </ol>
+              {t.statuses.some((s) => s.stage === "model" && s.state === "queued") && <div className="mt-2 text-xs text-amber-400">Waiting for a free model slot…</div>}
+            </div>
+          ) : (
+            <button onClick={() => setDetails(!details)} className="inline-flex items-center gap-1.5 rounded-md bg-white/[0.03] px-2.5 py-1 text-xs text-gray-500 hover:text-gray-300">
+              {t.done ? <Check size={12} className="text-emerald-light" /> : <Loader2 size={12} className="animate-spin text-violet-light" />}
+              {t.done ? `Research complete · 3 steps${elapsed != null ? ` · ${elapsed}s` : ""}` : `Writing the answer${elapsed != null ? ` · ${elapsed}s` : ""}`}
+              <ChevronDown size={12} className={clsx(details && "rotate-180")} />
+            </button>
+          )}
+          {details && !researching && (
+            <div className="flex flex-wrap gap-1.5">{t.statuses.map((s) => (
+              <span key={`${s.stage}:${s.name}`} title={s.detail} className={clsx("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]",
+                s.state === "failed" ? "border-crimson/40 text-crimson-light" : "border-glass text-gray-400")}>
+                {s.state === "failed" ? <AlertTriangle size={11} /> : <Check size={11} />}
+                {s.stage === "route" ? s.detail : s.stage === "judge" ? (s.name === "repair" ? "fixed the draft" : "rewrote the draft") : s.stage === "validate" ? "checked against the data" : s.name}
+                {s.ms != null && s.stage !== "route" && s.stage !== "validate" && <span className="text-gray-600">{s.ms < 1000 ? `${s.ms}ms` : `${(s.ms / 1000).toFixed(1)}s`}</span>}
+              </span>))}
+              {t.usage?.ttft_ms != null && <span className="text-[11px] text-gray-500 px-1">first word {(t.usage.ttft_ms / 1000).toFixed(1)}s{t.usage.tokens_per_s != null ? ` · ${t.usage.tokens_per_s} tok/s` : ""}{t.model ? ` · ${t.model}` : ""}</span>}
+            </div>)}
+
+          {(t.text || (t.card && t.done)) && (
+            <div className="rounded-xl border border-glass bg-surface/70 px-4 py-3.5">
+              {t.card && <Headline card={t.card} />}
+              {t.text && (
+                <div className="text-[15px] text-gray-200 whitespace-pre-wrap leading-relaxed">
+                  <Rich text={t.text} />{!t.done && <span className="inline-block w-1.5 h-4 bg-violet-light/70 animate-pulse align-text-bottom ml-0.5" />}
+                </div>)}
               {t.done && (issues.length > 0 || unsupported.length > 0) && (
                 <div className="mt-2 flex gap-1.5 text-[11px] text-amber-400"><AlertTriangle size={12} className="shrink-0 mt-0.5" />
-                  <span>The checker still flags: {[...issues.map((i) => i.detail), ...(unsupported.length && !issues.some((i) => i.code === "unsupported_numbers") ? [`numbers not in the data: ${unsupported.join(", ")}`] : [])].join("; ")}. The card above is the source of truth.</span></div>)}
-              {t.done && (
-                <div className="mt-2 pt-2 border-t border-glass text-[11px] text-gray-500 flex flex-wrap gap-x-3">
-                  {t.cancelled && <span className="text-amber-400">stopped</span>}
-                  {t.usage?.ttft_ms != null && <span>first word {(t.usage.ttft_ms / 1000).toFixed(1)}s</span>}
-                  {t.usage?.tokens_per_s != null && <span>{t.usage.tokens_per_s} tok/s</span>}
-                  {t.usage?.context && <span>context ~{t.usage.context.used_est}/{t.usage.context.budget} tokens{t.usage.context.dropped_history_turns ? ` · ${t.usage.context.dropped_history_turns} old turns dropped` : ""}</span>}
-                  {checked && <span className="text-emerald-light">checked against the data{t.usage?.judge?.revised ? " (rewritten once to fix the draft)" : ""}{t.usage?.judge?.scrubbed ? ` · removed ${t.usage.judge.scrubbed} sentence${t.usage.judge.scrubbed === 1 ? "" : "s"} it couldn't verify` : ""}</span>}
+                  <span>The checker still flags: {[...issues.map((i) => i.detail), ...(unsupported.length && !issues.some((i) => i.code === "unsupported_numbers") ? [`numbers not in the data: ${unsupported.join(", ")}`] : [])].join("; ")}. The bet card is the source of truth.</span></div>)}
+              {checked && t.text && (
+                <div className="mt-2 text-[11px] text-emerald-light/80">Checked against Monster OS data{t.usage?.judge?.repaired ? " · fixed the draft" : ""}{t.usage?.judge?.revised ? " · rewritten once" : ""}{t.usage?.judge?.scrubbed ? ` · removed ${t.usage.judge.scrubbed} unverifiable sentence${t.usage.judge.scrubbed === 1 ? "" : "s"}` : ""}</div>)}
+              {t.cancelled && <div className="mt-2 text-[11px] text-amber-400">Stopped.</div>}
+              {t.card && (t.card.bets.length > 0 || t.card.notes.length > 0) && (
+                <div className="mt-3">
+                  <button onClick={() => setShowCard(!cardOpen)} className="inline-flex items-center gap-1 text-xs text-violet-light hover:underline">
+                    <Database size={12} />{cardOpen ? "Hide" : "Show"} the bet card{t.card.bets.length ? ` · ${t.card.bets.length} pick${t.card.bets.length === 1 ? "" : "s"}` : ""}
+                    <ChevronDown size={12} className={clsx(cardOpen && "rotate-180")} /></button>
+                  {cardOpen && <div className="mt-2"><BetCard card={t.card} sources={t.sources} /></div>}
                 </div>)}
             </div>
           )}
-          {t.sources && t.sources.length > 0 && !t.card && <Sources sources={t.sources} />}
+          {t.sources && t.sources.length > 0 && !t.card && t.done && <Sources sources={t.sources} />}
+
+          {t.done && t.text && (
+            <div className="flex items-center gap-0.5">
+              <button className={icon} onClick={() => copy("copy")} title={copied === "copy" ? "Copied" : "Copy"} aria-label="Copy">{copied === "copy" ? <Check size={15} /> : <Copy size={15} />}</button>
+              <button className={icon} onClick={() => copy("share")} title={copied === "share" ? "Copied to share" : "Share"} aria-label="Share">{copied === "share" ? <Check size={15} /> : <Share2 size={15} />}</button>
+              <button className={clsx(icon, t.feedback === 1 && "text-emerald-light")} disabled={!t.message_id} onClick={() => onRate(1)} title="Good answer" aria-label="Good answer" aria-pressed={t.feedback === 1}><ThumbsUp size={15} /></button>
+              <button className={clsx(icon, t.feedback === -1 && "text-crimson-light")} disabled={!t.message_id} onClick={() => onRate(-1)} title="Bad answer" aria-label="Bad answer" aria-pressed={t.feedback === -1}><ThumbsDown size={15} /></button>
+              <button className={icon} disabled={busy} onClick={() => onAsk(t.question)} title="Ask again" aria-label="Ask again"><RotateCw size={15} /></button>
+            </div>)}
+
           {t.error && (
             <div className="flex items-center gap-2 text-xs text-crimson-light"><AlertTriangle size={13} />{t.error}
               <button onClick={onRetry} className="underline text-gray-300">Resend</button></div>)}
+
+          {last && t.done && !t.error && followUps(t).length > 0 && (
+            <div className="pt-1">
+              <div className="text-sm font-medium text-gray-300 mb-1.5">Follow-up</div>
+              <div className="space-y-1">
+                {followUps(t).map((f) => (
+                  <button key={f.q} disabled={busy} onClick={() => onAsk(f.q, f.context)}
+                    className="flex w-full items-start gap-2.5 rounded-lg px-2 py-2 text-left text-sm text-gray-300 hover:bg-white/5 disabled:opacity-40">
+                    <ArrowRight size={15} className="mt-0.5 shrink-0 text-gray-500" />{f.q}</button>))}
+              </div>
+            </div>)}
         </div>
       </div>
     </div>

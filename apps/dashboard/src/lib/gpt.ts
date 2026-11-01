@@ -29,7 +29,7 @@ export interface GptCard {
 export interface GptStatus { stage: "route" | "tool" | "retrieval" | "model" | "validate" | "judge"; name: string; state: "started" | "queued" | "completed" | "failed"; detail?: string; ms?: number }
 export interface GptUsage {
   ttft_ms?: number | null; total_ms?: number; completion_tokens?: number; tokens_per_s?: number | null; cancelled?: boolean; error?: string;
-  unsupported_numbers?: string[]; judge?: { revised: boolean; scrubbed?: number; issues: { code: string; detail: string; serious: boolean }[] }; memory?: unknown; context?: { used_est: number; budget: number; dropped_history_turns: number; evidence_truncated: boolean };
+  unsupported_numbers?: string[]; judge?: { revised: boolean; repaired?: number; scrubbed?: number; issues: { code: string; detail: string; serious: boolean }[] }; memory?: unknown; context?: { used_est: number; budget: number; dropped_history_turns: number; evidence_truncated: boolean };
 }
 export interface GptModel { id: string; provider: string; num_ctx: number }
 
@@ -71,7 +71,7 @@ async function authed<T>(path: string, init: RequestInit = {}, retry = true): Pr
 export interface ConversationRow { id: string; title: string; updated_at: string; messages: number }
 export interface StoredMessage {
   id: string; request_id: string | null; role: "user" | "assistant"; content: string; card: GptCard | null; sources: GptSource[] | null;
-  model: string | null; usage: GptUsage | null; cancelled: boolean; created_at: string;
+  model: string | null; usage: GptUsage | null; cancelled: boolean; created_at: string; feedback?: number | null;
 }
 export interface MemoryItem { id: number; kind: "preference" | "note"; key: string; value: string; updated_at: string }
 export const gptApi = {
@@ -80,6 +80,9 @@ export const gptApi = {
   conversations: () => authed<{ conversations: ConversationRow[] }>("/conversations"),
   messages: (id: string) => authed<{ messages: StoredMessage[] }>(`/conversations/${id}`),
   remove: (id: string) => authed<void>(`/conversations/${id}`, { method: "DELETE" }),
+  /** 1 = thumbs up, -1 = thumbs down, 0 = clear */
+  feedback: (messageId: string, rating: number) => authed<void>(`/messages/${messageId}/feedback`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rating }) }),
 };
 
 export type ConnState = "connecting" | "open" | "reconnecting" | "closed";
