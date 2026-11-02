@@ -108,6 +108,11 @@ pub fn spawn(state: web::Data<State>) {
                 let v = crate::nba_refs::ensure(&s2.db, today - Duration::days(365 * 6), today).await;
                 mark(&s2.db, "fit:nba_refs", v.is_ok(), &json!({ "fitted": v.map(|x| x.len()).unwrap_or(0) })).await;
             }
+            // ESPN injury reports as published, every 15 min (injury_snap.rs, research-backlog R4)
+            if !paused(&s2.db).await && due(&s2.db, "snapshot:injuries", 15).await {
+                let v = crate::injury_snap::snapshot(&s2).await;
+                mark(&s2.db, "snapshot:injuries", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             if !paused(&s2.db).await && due(&s2.db, "ingest:nba_refs", 60).await {
                 let v = crate::nba_refs::ingest_assignments(&s2).await;
                 mark(&s2.db, "ingest:nba_refs", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;

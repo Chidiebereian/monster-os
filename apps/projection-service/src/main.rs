@@ -64,6 +64,7 @@ mod nhl_api;
 mod nhl_game;
 mod nhl_sim;
 mod nhl_teams;
+mod injury_snap;
 mod proj_sync;
 mod segments;
 mod screen;
