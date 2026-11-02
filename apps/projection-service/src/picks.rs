@@ -934,6 +934,10 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
 
     let mut published = 0;
     let mut updated = 0;
+    // no new pick this close to the start: picks made under 2 h before start beat the close 23% of the
+    // time vs 53% for picks made 24 h+ ahead (research-backlog R9). Lines are still recorded for evidence.
+    let min_lead = lines::setting(db, "pick_min_lead_minutes", 120.0).await as i64;
+    let mut too_late = 0;
     for c in &keep {
         let l = &ledgers[c.engine.as_str()][&c.key.0];
         let (home, away) = (lines::payload_team(&l.payload, "home"), lines::payload_team(&l.payload, "away"));
@@ -1058,6 +1062,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         let tpl = template(&facts);
         let (writeup, wsrc) = (tpl.clone(), "template".to_string());
         let start = starts.get(&c.key.0).copied();
+        if start.map(|s| (s - Utc::now()).num_minutes() < min_lead).unwrap_or(false) { too_late += 1; continue; }
         let head = c.q.provider_subject.as_ref().and_then(|p| heads.get(p).cloned());
         let n = db.execute("INSERT INTO ai_picks (sport, engine, model_version, ledger_id, game_id, game_label, home, away, starts_at, kind, market, subject, subject_name, subject_team, headshot, side, \
               line, book, price, link, p_model, p_market, edge, ev, projection, grade, tier, facts, risk_flags, writeup, writeup_source, \
@@ -1079,7 +1084,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let _ = by_selection;
     let rewritten = rewrite_writeups(state, sport).await;
     Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "lines_recorded": recorded, "qualifying": keep.len(), "published": published, "updated": updated,
-        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch, "outlier_quotes": outliers, "quarantined_feeds": quarantined.len() }, "regraded_or_voided": withdrawn, "publication_suspended": suspended, "llm_rewritten": rewritten,
+        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch, "outlier_quotes": outliers, "quarantined_feeds": quarantined.len(),
+                        "too_close_to_start": too_late, "min_lead_minutes": min_lead }, "regraded_or_voided": withdrawn, "publication_suspended": suspended, "llm_rewritten": rewritten,
         "orientation_check": { "checked": checked, "agree": agree, "ok": orientation_ok } }))
 }
 
