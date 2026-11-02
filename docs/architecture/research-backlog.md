@@ -13,6 +13,8 @@ backtests, publication holds; see `validation.md`).
 | R4 | Historical ESPN injury reports | not started | a snapshotter stores every ESPN injury report as published (observed_at = fetch time) into `feature_snapshots` (quality observed); no back-fill of the past |
 | R5 | NFL injury / depth-chart timestamps | not started | a source with publication times is found, or the weekly tables are stored as quality 'inferred' and kept out of experiments |
 | R6 | NHL starting-goalie confirmation | not started | a confirmed-starter source captured before puck drop; today `goalie_confirmed` is always 0 at freeze |
+| R7 | NFL key-number margin shape | started 2026-11-02 | the engines' margin distribution reaches real key-number frequencies (|margin| = 3: real 14.7%, team-points engine 8.7%, play simulator 9.9%; `scripts/ml/margin_shape.py`) and spread / moneyline calibration is re-tested walk-forward against the closing line, beside the unchanged champion |
+| R8 | NHL puck line and 2-goal margins | started 2026-11-02 | puck-line (+/-1.5) forecasts are in the NHL backtest; the simulator's 2+ goal share matches real games (real 59.3%, simulator 55.5%, team-goals engine 55.1%) and the puck line is calibrated over full seasons |
 
 ## R3 progress
 
