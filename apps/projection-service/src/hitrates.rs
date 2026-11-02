@@ -411,16 +411,20 @@ pub(crate) struct SegLines { spread: Option<f64>, total: Option<f64>, team_total
 /// closing spread in bettor convention (negative = favored).
 async fn team_games(state: &State, sport: &str, team: &str, limit: i64) -> Result<Vec<TeamGame>, String> {
     // NHL holds some games twice (NHL-API schedule id + MoneyPuck id), so keep
-    // one row per (date, matchup), preferring the one carrying market lines.
+    // one row per (date, matchup), preferring the one carrying market lines. The
+    // MoneyPuck history leaves out shootout goals (a shootout reads as a tie), so
+    // NHL scores come from the NHL API wherever it has the game (2019 on).
     let rows = state.db.query(
         "SELECT * FROM ( \
-           SELECT DISTINCT ON (game_date, home_team, away_team) \
-             season, game_date, home_team, away_team, home_score, away_score, spread_line, total_line, s.home_1h, s.away_1h FROM sports_games g \
+           SELECT DISTINCT ON (g.game_date, g.home_team, g.away_team) \
+             g.season, g.game_date, g.home_team, g.away_team, COALESCE(a.home_score, g.home_score) AS home_score, \
+             COALESCE(a.away_score, g.away_score) AS away_score, g.spread_line, g.total_line, s.home_1h, s.away_1h FROM sports_games g \
            LEFT JOIN game_segments s ON s.sport = g.sport AND s.game_id = g.game_id \
-           WHERE g.sport=$1 AND home_score IS NOT NULL AND away_score IS NOT NULL AND (home_team=$2 OR away_team=$2) \
+           LEFT JOIN nhl_games_api a ON g.sport = 'nhl' AND a.completed AND a.game_date = g.game_date AND a.home = g.home_team AND a.away = g.away_team \
+           WHERE g.sport=$1 AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND (g.home_team=$2 OR g.away_team=$2) \
              AND lower(COALESCE(g.status, 'final')) IN ('final', 'completed early') \
-             AND COALESCE(game_type, 'REG') NOT IN ('PRE', 'ASG') \
-           ORDER BY game_date, home_team, away_team, spread_line NULLS LAST, s.home_1h NULLS LAST) t \
+             AND COALESCE(g.game_type, 'REG') NOT IN ('PRE', 'ASG') \
+           ORDER BY g.game_date, g.home_team, g.away_team, g.spread_line NULLS LAST, s.home_1h NULLS LAST) t \
          ORDER BY game_date DESC NULLS LAST, season DESC LIMIT $3",
         &[&sport, &team, &limit],
     ).await.map_err(|e| e.to_string())?;

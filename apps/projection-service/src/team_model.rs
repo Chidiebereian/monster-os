@@ -83,9 +83,15 @@ pub async fn backtest(state: web::Data<State>, path: web::Path<String>, q: web::
         return HttpResponse::BadRequest().json(json!({ "error": "backtest supports nfl, nhl, nba" }));
     }
     let q = q.into_inner();
+    // one row per game (NHL holds some twice: NHL-API and MoneyPuck ids); NHL scores from the
+    // NHL API where it has the game, since the MoneyPuck history leaves out shootout goals
     let rows = match state.db.query(
-        "SELECT season, home_team, away_team, home_score, away_score, spread_line, total_line FROM sports_games \
-         WHERE sport=$1 AND game_type='REG' AND home_score IS NOT NULL AND away_score IS NOT NULL",
+        "SELECT DISTINCT ON (g.game_date, g.home_team, g.away_team) g.season, g.home_team, g.away_team, \
+                COALESCE(a.home_score, g.home_score) AS home_score, COALESCE(a.away_score, g.away_score) AS away_score, g.spread_line, g.total_line \
+         FROM sports_games g \
+         LEFT JOIN nhl_games_api a ON g.sport = 'nhl' AND a.completed AND a.game_date = g.game_date AND a.home = g.home_team AND a.away = g.away_team \
+         WHERE g.sport=$1 AND g.game_type='REG' AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL \
+         ORDER BY g.game_date, g.home_team, g.away_team, g.spread_line NULLS LAST",
         &[&sport],
     ).await { Ok(r) => r, Err(e) => return HttpResponse::InternalServerError().json(json!({ "error": e.to_string() })) };
     if rows.len() < 300 { return HttpResponse::InternalServerError().json(json!({ "error": "not enough stored games; ingest teams/schedule first" })); }

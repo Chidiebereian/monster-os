@@ -287,7 +287,7 @@ async fn nhl(state: &State) -> Result<Value, String> {
     let roster = apply_rosters(db, "nhl", &rosters, complete).await?;
     let games = db.execute("INSERT INTO sports_games (sport, game_id, season, week, game_date, home_team, away_team, status, home_score, away_score, game_type) \
         SELECT 'nhl', game_id::text, season / 10000, game_date::text, game_date, home, away, CASE WHEN completed THEN 'final' WHEN game_date < current_date - 1 THEN 'canceled' ELSE 'scheduled' END, \
-          home_score, away_score, CASE game_type WHEN 1 THEN 'PRE' WHEN 2 THEN 'REG' WHEN 3 THEN 'POST' ELSE 'OTHER' END \
+          CASE WHEN completed THEN home_score END, CASE WHEN completed THEN away_score END, CASE game_type WHEN 1 THEN 'PRE' WHEN 2 THEN 'REG' WHEN 3 THEN 'POST' ELSE 'OTHER' END \
         FROM nhl_games_api WHERE game_date >= $1 \
         ON CONFLICT (sport, game_id) DO UPDATE SET game_date=EXCLUDED.game_date, status=EXCLUDED.status, home_score=EXCLUDED.home_score, \
           away_score=EXCLUDED.away_score, updated_at=now()", &[&from]).await.map_err(|e| dberr(&e))?;

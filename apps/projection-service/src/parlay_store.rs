@@ -304,13 +304,19 @@ pub async fn learn(state: &State) -> Result<Value, String> {
     if cand == current { return Ok(json!({ "outcome": "kept", "version": version, "evidence": ev })); }
     let v = format!("{}+dep{:.2}", parlay::ENGINE, cand);
     if ev["pass"].as_bool().unwrap_or(false) {
-        // policy: recommend only; an admin-approved promotion request makes it the champion
+        // policy: recommend only; an admin-approved promotion request makes it the champion.
+        // A weight rejected on fewer tickets that passes now is a candidate again (never the champion row).
         db.execute("INSERT INTO parlay_models (version, dep_weight, status, parent, evidence) VALUES ($1,$2,'candidate',$3,$4) \
-            ON CONFLICT (version) DO UPDATE SET evidence=EXCLUDED.evidence WHERE parlay_models.status <> 'champion'",
+            ON CONFLICT (version) DO UPDATE SET evidence=EXCLUDED.evidence, \
+              status = CASE WHEN parlay_models.status = 'rejected' THEN 'candidate' ELSE parlay_models.status END, \
+              retired_at = CASE WHEN parlay_models.status = 'rejected' THEN NULL ELSE parlay_models.retired_at END \
+            WHERE parlay_models.status <> 'champion'",
             &[&v, &cand, &version, &Json(&ev)]).await.map_err(|e| dberr(&e))?;
         let req = crate::governance::propose(db, "parlay", "parlay", "promote", &v, "autopilot").await.unwrap_or_else(|e| json!({ "error": e }));
-        crate::learning::audit(db, "parlay", "promotion_recommended", Some(&v), json!({ "champion": version, "evidence": ev, "request": req })).await;
-        Ok(json!({ "outcome": "recommended", "version": v, "evidence": ev, "request": req }))
+        let filed = req.get("error").is_none();
+        let action = if filed { "promotion_recommended" } else { "promotion_recommendation_failed" };
+        crate::learning::audit(db, "parlay", action, Some(&v), json!({ "champion": version, "evidence": ev, "request": req })).await;
+        Ok(json!({ "outcome": if filed { "recommended" } else { "recommendation_failed" }, "version": v, "evidence": ev, "request": req }))
     } else {
         db.execute("INSERT INTO parlay_models (version, dep_weight, status, parent, evidence) VALUES ($1,$2,'rejected',$3,$4) \
             ON CONFLICT (version) DO UPDATE SET evidence=EXCLUDED.evidence WHERE parlay_models.status <> 'champion'", &[&v, &cand, &version, &Json(&ev)]).await.map_err(|e| dberr(&e))?;
