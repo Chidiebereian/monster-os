@@ -37,6 +37,7 @@ mod autopilot;
 mod team_engine;
 mod lines;
 mod picks;
+mod governance;
 mod validation;
 mod parlay;
 mod parlay_store;
@@ -660,9 +661,11 @@ async fn main() -> std::io::Result<()> {
         nflverse_url: std::env::var("NFLVERSE_PLAYER_STATS_URL").ok().filter(|v| !v.is_empty())
             .unwrap_or_else(|| NFLVERSE_PLAYER_STATS.to_string()),
     });
-    println!("projection-service listening on 0.0.0.0:{port}");
+    // loopback only (the gateway and every local caller reach it there); BIND_ADDR overrides, e.g. for a test
+    let bind = std::env::var("BIND_ADDR").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "127.0.0.1".into());
+    println!("projection-service listening on {bind}:{port}");
     autopilot::spawn(state.clone());
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
             .route("/healthz", web::get().to(healthz))
@@ -735,7 +738,16 @@ async fn main() -> std::io::Result<()> {
             .route("/parlays/record", web::get().to(parlay_store::record_http))
             .route("/parlays/validation", web::get().to(parlay_store::validation_http))
             .route("/parlays/learn", web::post().to(parlay_store::learn_http))
-            .route("/parlays/model/rollback", web::post().to(parlay_store::rollback_http))
+            .route("/parlays/model/rollback", web::post().to(governance::gone))
+            .route("/parlays/model/promote", web::post().to(governance::gone))
+            .route("/governance/whoami", web::get().to(governance::whoami))
+            .route("/governance/publication", web::get().to(governance::get_publication))
+            .route("/governance/publication", web::post().to(governance::set_publication))
+            .route("/governance/promotion-requests", web::get().to(governance::list_requests))
+            .route("/governance/promotion-requests", web::post().to(governance::create_request))
+            .route("/governance/promotion-requests/{id}/approve", web::post().to(governance::approve))
+            .route("/governance/promotion-requests/{id}/reject", web::post().to(governance::reject))
+            .route("/governance/promotion-requests/{id}/cancel", web::post().to(governance::cancel))
             .route("/parlays/tickets", web::get().to(parlay_store::list_http))
             .route("/parlays/tickets", web::post().to(parlay_store::save_http))
             .route("/parlays/tickets/{id}", web::get().to(parlay_store::get_http))
@@ -755,8 +767,8 @@ async fn main() -> std::io::Result<()> {
             .route("/learning/{sport}/candidates", web::post().to(learning::register))
             .route("/learning/{sport}/evaluate", web::post().to(learning::evaluate_candidate))
             .route("/learning/{sport}/scorecard", web::get().to(learning::scorecard_http))
-            .route("/learning/{sport}/promote", web::post().to(learning::promote))
-            .route("/learning/{sport}/rollback", web::post().to(learning::rollback))
+            .route("/learning/{sport}/promote", web::post().to(governance::gone))
+            .route("/learning/{sport}/rollback", web::post().to(governance::gone))
             .route("/sim/sessions", web::get().to(sim_sessions::list))
             .route("/sim/sessions/{id}", web::get().to(sim_sessions::get))
             .route("/sim/sessions/{id}/events", web::get().to(sim_sessions::events))
@@ -789,8 +801,9 @@ async fn main() -> std::io::Result<()> {
             .route("/hub/{sport}/game/{id}", web::get().to(game_hub::game))
             .route("/hub/{sport}/game/{id}/brief", web::get().to(game_hub::game_brief))
             .route("/hub/{sport}/game/{id}/live", web::get().to(game_hub::live))
-    })
-    .bind(("0.0.0.0", port))?
-    .run()
-    .await
+    });
+    let mut server = server.bind((bind.as_str(), port))?;
+    // IPv6 loopback as well, so "localhost" resolving to ::1 still connects
+    if bind == "127.0.0.1" && std::net::TcpListener::bind(("::1", 0)).is_ok() { server = server.bind(("::1", port))?; }
+    server.run().await
 }

@@ -25,15 +25,16 @@ if (Test-Path $envFile) {
         [Environment]::SetEnvironmentVariable($k.Trim(), $v.Trim().TrimEnd("`r"), "Process")
     }
 }
-# the live local stack (see docs: Postgres on 5434)
-$env:DATABASE_URL = "postgres://monster:monster@localhost:5434/monsteros"
+# services run as monster_app (migration 0039), never as the database owner; the URL lives in .env
+if (-not $env:APP_DATABASE_URL) { throw "APP_DATABASE_URL is not set in .env: run python scripts/ops/rotate_research_password.py --role monster_app" }
+$env:DATABASE_URL = $env:APP_DATABASE_URL
 $env:PORT = "8121"
 
 while ($true) {
     # Postgres (Docker) may start after logon
     $tries = 0
-    while (-not (Test-NetConnection -ComputerName localhost -Port 5434 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-        if ($tries % 20 -eq 0) { Note "waiting for Postgres on localhost:5434" }
+    while (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port 5434 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+        if ($tries % 20 -eq 0) { Note "waiting for Postgres on 127.0.0.1:5434" }
         $tries++
         Start-Sleep -Seconds 15
     }

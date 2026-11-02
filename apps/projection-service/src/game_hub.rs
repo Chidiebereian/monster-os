@@ -351,7 +351,7 @@ async fn schedule_inner(state: &State, sport: &str, q: &ScheduleQ) -> Result<Val
 }
 
 async fn pick_counts(db: &tokio_postgres::Client, sport: &str, gids: &[String]) -> Result<HashMap<String, i64>, String> {
-    let rows = db.query(&format!("SELECT game_id, count(*) FROM ai_picks WHERE sport=$1 AND game_id = ANY($2) AND tier <> 'hidden' AND {} GROUP BY 1", crate::picks::NOT_HELD),
+    let rows = db.query(&format!("SELECT game_id, count(*) FROM ai_picks WHERE sport=$1 AND game_id = ANY($2) AND tier <> 'hidden' AND {} GROUP BY 1", crate::governance::VISIBLE),
         &[&sport, &gids]).await.map_err(|e| dberr(&e))?;
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
@@ -505,7 +505,7 @@ async fn game_inner(state: &State, sport: &str, id: &str) -> Result<Value, Strin
     // picks
     let picks: Vec<Value> = state.db.query(
         &format!("SELECT id, kind, market, subject_name, side, line, book, price, p_model, p_market, edge, ev, grade, tier, writeup, link, projection, published_at \
-           FROM ai_picks WHERE sport=$1 AND game_id=$2 AND {} ORDER BY (tier='hidden'), edge DESC LIMIT 40", crate::picks::NOT_HELD), &[&sport, &gid]).await.map_err(|e| dberr(&e))?
+           FROM ai_picks WHERE sport=$1 AND game_id=$2 AND {} ORDER BY (tier='hidden'), edge DESC LIMIT 40", crate::governance::VISIBLE), &[&sport, &gid]).await.map_err(|e| dberr(&e))?
         .iter().map(|r| json!({ "id": r.get::<_, i64>(0), "kind": r.get::<_, String>(1), "market": r.get::<_, String>(2), "subject": r.get::<_, String>(3),
             "side": r.get::<_, String>(4), "line": r.get::<_, Option<f64>>(5), "book": r.get::<_, String>(6), "price": r.get::<_, i32>(7),
             "p_model": r.get::<_, f64>(8), "p_market": r.get::<_, f64>(9), "edge": r.get::<_, f64>(10), "ev": r.get::<_, f64>(11),

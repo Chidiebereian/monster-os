@@ -204,6 +204,8 @@ pub(crate) async fn mark(db: &tokio_postgres::Client, job: &str, ok: bool, detai
 // ---------------------------------------------------------------------------
 
 pub async fn tick(state: &State) -> Value {
+    // promotion requests nobody decided in time expire (they never execute on their own)
+    if let Err(e) = crate::governance::expire(&state.db).await { eprintln!("projection-service: expiring promotion requests: {e}"); }
     let db = &state.db;
     let today = today_et();
     let mut errors: Vec<Value> = Vec::new();
@@ -335,7 +337,13 @@ pub async fn live_paired(db: &tokio_postgres::Client, engine: &str, a: &str, b: 
     Ok((games.len() as i64, d))
 }
 
-/// Promote, reject or roll back based on paired live forecasts.
+/// Compare each shadow with the champion on paired live forecasts. Policy
+/// (2026-11-01): the autopilot never changes a production model. A shadow that
+/// clears the live gate is marked `promotion_recommended`; a previous champion
+/// that beats the current one is marked `rollback_recommended`; either files a
+/// promotion request (governance.rs) that only an authenticated admin can approve.
+/// Rejecting a failing shadow and retiring an old rollback reference stay
+/// automatic: neither touches the champion.
 async fn guard(state: &State, engine: &str) -> Result<Vec<Value>, String> {
     let db = &state.db;
     let (champ, _) = learning::champion(db, engine).await?;
@@ -355,21 +363,26 @@ async fn guard(state: &State, engine: &str) -> Result<Vec<Value>, String> {
                 learning::audit(db, engine, "shadow_reject", Some(&v), json!({ "reason": "worse than the champion on live forecasts", "live": live })).await;
                 out.push(json!({ "engine": engine, "action": "shadow_reject", "version": v }));
             } else if games >= need && worse.is_empty() {
-                // the champion stays running as a shadow: the rollback reference
-                learning::swap_to(db, engine, &champ, &v, "shadow").await?;
-                db.execute("UPDATE model_registry SET evidence = coalesce(evidence,'{}'::jsonb) || jsonb_build_object('live', $3::jsonb) WHERE sport=$1 AND version=$2",
-                    &[&engine, &v, &Json(&live)]).await.map_err(|e| dberr(&e))?;
-                learning::audit(db, engine, "auto_promote", Some(&v), json!({ "from": champ, "live": live,
-                    "rule": format!("{need}+ paired live games and no market worse by 2 SE; the backtest search and holdout gates were passed before shadowing") })).await;
-                out.push(json!({ "engine": engine, "action": "auto_promote", "version": v, "from": champ }));
-                return Ok(out); // the champion changed; remaining shadows are compared next tick
+                // recommend once; the champion is not touched
+                let fresh = db.execute("UPDATE model_registry SET evidence = coalesce(evidence,'{}'::jsonb) || jsonb_build_object('live', $3::jsonb, 'promotion_recommended', now()) \
+                    WHERE sport=$1 AND version=$2 AND NOT (coalesce(evidence,'{}'::jsonb) ? 'promotion_recommended')", &[&engine, &v, &Json(&live)]).await.map_err(|e| dberr(&e))?;
+                if fresh > 0 {
+                    learning::audit(db, engine, "promotion_recommended", Some(&v), json!({ "champion": champ, "live": live, "needs": "human approval of the promotion request: scripts/ops/governance.py approve <id> --as <admin>",
+                        "rule": format!("{need}+ paired live games and no market worse by 2 SE; the backtest search and holdout gates were passed before shadowing") })).await;
+                    let req = crate::governance::propose(db, "engine", engine, "promote", &v, "autopilot").await.unwrap_or_else(|e| json!({ "error": e }));
+                    out.push(json!({ "engine": engine, "action": "promotion_recommended", "version": v, "champion": champ, "request": req }));
+                }
             }
         } else if !better.is_empty() {
-            // the previous champion beats the current one on live forecasts
-            learning::swap_to(db, engine, &champ, &v, "rejected").await?;
-            learning::audit(db, engine, "auto_rollback", Some(&v), json!({ "from": champ, "reason": "previous champion better on live forecasts by 2 SE", "live": live })).await;
-            out.push(json!({ "engine": engine, "action": "auto_rollback", "to": v, "from": champ }));
-            return Ok(out);
+            // the previous champion beats the current one on live forecasts: recommend a rollback once
+            let fresh = db.execute("UPDATE model_registry SET evidence = coalesce(evidence,'{}'::jsonb) || jsonb_build_object('live', $3::jsonb, 'rollback_recommended', now()) \
+                WHERE sport=$1 AND version=$2 AND NOT (coalesce(evidence,'{}'::jsonb) ? 'rollback_recommended')", &[&engine, &v, &Json(&live)]).await.map_err(|e| dberr(&e))?;
+            if fresh > 0 {
+                learning::audit(db, engine, "rollback_recommended", Some(&v), json!({ "champion": champ, "reason": "previous champion better on live forecasts by 2 SE",
+                    "live": live, "needs": "human approval of the rollback request: scripts/ops/governance.py approve <id> --as <admin>" })).await;
+                let req = crate::governance::propose(db, "engine", engine, "rollback", &v, "autopilot").await.unwrap_or_else(|e| json!({ "error": e }));
+                out.push(json!({ "engine": engine, "action": "rollback_recommended", "to": v, "champion": champ, "request": req }));
+            }
         } else if games >= 2 * need {
             db.execute("UPDATE model_registry SET status='retired', retired_at=now() WHERE sport=$1 AND version=$2", &[&engine, &v]).await.map_err(|e| dberr(&e))?;
             learning::audit(db, engine, "watch_end", Some(&v), json!({ "champion": champ, "games": games, "reason": "new champion held up; rollback reference retired" })).await;

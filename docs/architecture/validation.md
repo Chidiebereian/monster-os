@@ -119,8 +119,9 @@ decision stores a snapshot of it). Public reads leave them out: `/picks`,
 `/picks/{id}`, `/picks/meta` (which lists the holds) and the Games hub; internal
 callers pass `include_held=true`, where held picks show as "suspended". The
 scorecard marks held markets ("on hold" in AI Picks > Models). A hold is lifted
-only by a new `release` decision with a named decider, a reason and `--confirm`
-(`scripts/ops/release_hold.py`); there is no HTTP path that writes holds.
+only by an authenticated admin decision (`scripts/ops/governance.py publish`,
+see governance.md); since migration 0038 holds are one state of the general
+publication state.
 
 Current holds (2026-11-01, `phase-2a-audit`): nhl_team team_total_away,
 team_total_home, moneyline_1h, team_total_away_1h; nba_team moneyline_1h. Their

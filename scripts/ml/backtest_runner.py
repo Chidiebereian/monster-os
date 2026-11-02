@@ -88,14 +88,14 @@ def main():
         state["games_done"] += r["games_done"]
         state.update({"last": r, "status": "running", "updated": dt.datetime.now()})
         checkpoint(a.engine, state)
-        log(a.engine, f"batch {state['batches']}: +{r['games_done']} games in {time.time() - t0:.0f}s, "
-                      f"{r['games_skipped_existing']} already stored, {r['games_remaining']} remaining, free {free:.1f} GB")
+        log(a.engine, f"batch {state['batches']}: +{r['games_done']} stored, +{r['games_skipped_now']} without forecast in {time.time() - t0:.0f}s; "
+                      f"expected {r['expected_games']} = stored {r['stored_games']} + no forecast {r['no_forecast_games']} + remaining {r['games_remaining']}; free {free:.1f} GB")
         if r["complete"]:
             state["status"] = "complete"
             checkpoint(a.engine, state)
             log(a.engine, "complete")
             return 0
-        if r["games_done"] == 0 and r["games_without_forecast"] == 0:
+        if r["games_done"] == 0 and r["games_skipped_now"] == 0:
             log(a.engine, "no progress in this batch; stopping")
             return 2
     state["status"] = "batch_limit"

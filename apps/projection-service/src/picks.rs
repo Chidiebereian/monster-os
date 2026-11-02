@@ -59,11 +59,9 @@ pub(crate) const NFL_PROPS: [&str; 15] = ["pass_yds", "rush_yds", "rec_yds", "re
     "carries", "targets", "rush_td", "rec_td", "rush_rec_yds", "pass_rush_yds", "tds"];
 pub const GRADES: [&str; 8] = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
 
-/// Public AI Picks leave out every engine x market under a publication hold
-/// (migration 0037, `publication_holds_active`), whatever its evidence tier.
-/// Picks are still built and settled underneath; internal callers pass
-/// `include_held=true`.
-pub(crate) const NOT_HELD: &str = "NOT EXISTS (SELECT 1 FROM publication_holds_active h WHERE h.engine = ai_picks.engine AND h.market = ai_picks.market)";
+// Public visibility comes from governance::public_filter (publication state x
+// tier); picks are still built and settled for every market; internal callers
+// pass include_held=true.
 
 // ---------------------------------------------------------------------------
 // Distributions and pricing (pure)
@@ -894,6 +892,8 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
         withdrawn += db.execute("UPDATE ai_picks SET tier=$2, grade=$3, risk_flags = risk_flags || $4, updated_at=now() WHERE id=$1",
             &[&r.get::<_, i64>(0), &t, &cap(g, t), &Json(&flag)]).await.map_err(|e| dberr(&e))?;
     }
+    // publication safety rule: a published market whose tier fell below the bar is suspended (never the reverse)
+    let suspended = crate::governance::safety_sweep(db, sport, |e, m| tier_of(e, m).0).await?;
     // existing picks (for latest_* updates)
     // the implausibility guard looks at the RAW model: a blend can shrink a broken forecast into a plausible-looking edge
     let qualifies = |c: &Cand| c.edge >= min_edge && c.ev > 0.0 && (c.p_raw - c.p_market) <= max_edge;
@@ -1079,7 +1079,7 @@ pub(crate) async fn build(state: &State, sport: &str) -> Result<Value, String> {
     let _ = by_selection;
     let rewritten = rewrite_writeups(state, sport).await;
     Ok(json!({ "sport": sport, "quotes": rows.len(), "selections_priced": considered, "lines_recorded": recorded, "qualifying": keep.len(), "published": published, "updated": updated,
-        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch, "outlier_quotes": outliers, "quarantined_feeds": quarantined.len() }, "regraded_or_voided": withdrawn, "llm_rewritten": rewritten,
+        "suppressed": { "implausible_edge": implausible, "rotation_mismatch": rotation_mismatch, "outlier_quotes": outliers, "quarantined_feeds": quarantined.len() }, "regraded_or_voided": withdrawn, "publication_suspended": suspended, "llm_rewritten": rewritten,
         "orientation_check": { "checked": checked, "agree": agree, "ok": orientation_ok } }))
 }
 
@@ -1397,8 +1397,11 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     if let Some(e) = q.min_edge { f.add("edge >= ?", Box::new(e)); }
     if let Some(m) = q.min_prob { f.add("p_model >= ?", Box::new(m)); }
     if let Some(s) = &q.q { if !s.trim().is_empty() { f.add("(subject_name ILIKE ? OR game_label ILIKE ?)", Box::new(format!("%{}%", s.trim()))); } }
-    if !q.include_hidden { f.raw("tier IN ('proven','baseline')"); }
-    if !q.include_held { f.raw(NOT_HELD); }
+    if q.include_held {
+        if !q.include_hidden { f.raw("tier IN ('proven','baseline')"); }
+    } else {
+        f.raw(&crate::governance::public_filter(q.include_hidden));
+    }
     let (w, p) = (f.w, f.p);
     let order = match q.sort.as_deref().unwrap_or("grade") {
         "edge" => "edge DESC", "ev" => "ev DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
@@ -1448,7 +1451,7 @@ pub struct GetQ { #[serde(default)] include_held: bool }
 
 pub async fn get(state: web::Data<State>, path: web::Path<i64>, q: web::Query<GetQ>) -> impl Responder {
     let id = path.into_inner();
-    let held = if q.include_held { "TRUE" } else { NOT_HELD };
+    let held = if q.include_held { "TRUE" } else { crate::governance::VISIBLE };
     let row = match state.db.query_opt(&format!("SELECT {PICK_COLS}, facts FROM ai_picks WHERE id=$1 AND {held}"), &[&id]).await {
         Ok(Some(r)) => r, Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "no such pick" })), Err(e) => return internal(dberr(&e)),
     };
@@ -1512,9 +1515,11 @@ pub struct MetaQ { sport: Option<String> }
 pub async fn meta(state: web::Data<State>, q: web::Query<MetaQ>) -> impl Responder {
     let db = &state.db;
     let sport = q.sport.clone().filter(|s| s != "all");
-    let opts = db.query(&format!("SELECT DISTINCT 'market', market, market FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD} \
-        UNION SELECT DISTINCT 'game', game_id, game_label || ' · ' || to_char(starts_at AT TIME ZONE 'America/New_York', 'MM/DD HH12:MI AM') FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD} \
-        UNION SELECT DISTINCT 'book', book, book FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD}"), &[&sport]).await;
+    // menus and counts follow what the public may see at all (published or leans-only)
+    let vis = crate::governance::VISIBLE;
+    let opts = db.query(&format!("SELECT DISTINCT 'market', market, market FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {vis} \
+        UNION SELECT DISTINCT 'game', game_id, game_label || ' · ' || to_char(starts_at AT TIME ZONE 'America/New_York', 'MM/DD HH12:MI AM') FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {vis} \
+        UNION SELECT DISTINCT 'book', book, book FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {vis}"), &[&sport]).await;
     let mut markets = Vec::new(); let mut games = Vec::new(); let mut books = Vec::new();
     if let Ok(rows) = opts {
         for r in rows {
@@ -1530,7 +1535,7 @@ pub async fn meta(state: web::Data<State>, q: web::Query<MetaQ>) -> impl Respond
         json!({ "provider": r.get::<_, String>(0), "requests": r.get::<_, i32>(1), "units": r.get::<_, i32>(2) })).collect::<Vec<_>>()).unwrap_or_default();
     let fresh = db.query("SELECT source, sport, max(observed_at), count(*) FROM market_lines WHERE observed_at > now() - interval '1 day' GROUP BY 1,2 ORDER BY 1,2", &[]).await
         .map(|rows| rows.iter().map(|r| json!({ "source": r.get::<_, String>(0), "sport": r.get::<_, String>(1), "last": r.get::<_, DateTime<Utc>>(2), "rows": r.get::<_, i64>(3) })).collect::<Vec<_>>()).unwrap_or_default();
-    let hidden = db.query_one(&format!("SELECT count(*) FILTER (WHERE tier NOT IN ('proven','baseline')), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {NOT_HELD}"), &[&sport]).await
+    let hidden = db.query_one(&format!("SELECT count(*) FILTER (WHERE tier NOT IN ('proven','baseline')), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {vis}"), &[&sport]).await
         .map(|r| json!({ "hidden": r.get::<_, i64>(0), "total": r.get::<_, i64>(1) })).unwrap_or(Value::Null);
     let holds = db.query("SELECT engine, market, reason, decided_at FROM publication_holds_active ORDER BY engine, market", &[]).await
         .map(|rows| rows.iter().map(|r| json!({ "engine": r.get::<_, String>(0), "market": r.get::<_, String>(1), "reason": r.get::<_, String>(2),

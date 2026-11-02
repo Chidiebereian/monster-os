@@ -315,22 +315,17 @@ pub(crate) async fn champion(db: &tokio_postgres::Client, sport: &str) -> Result
             return Ok((old, c.0));
         }
         // The engine code changed (new MODEL_VERSION): the champion's
-        // configuration carries over under a version that names the new
-        // engine, so ledger rows never attribute new code to an old version.
-        // One statement; the single-champion constraint is checked at its end.
+        // configuration carries over, unchanged, under a version that names the
+        // new engine, so ledger rows never attribute new code to an old version.
+        // gov_engine_upgrade (migration 0039) does it and writes the audit row;
+        // this service's role cannot change a champion itself.
         let v = version_for(sport, &c.0);
-        db.execute("WITH old AS (UPDATE model_registry SET status='retired', retired_at=now() WHERE sport=$1 AND version=$2 RETURNING config) \
-                    INSERT INTO model_registry (sport, version, engine, config, status, parent, notes, promoted_at) \
-                    SELECT $1, $3, $4, config, 'champion', $2, 'engine upgrade: champion configuration on the new engine', now() FROM old \
-                    ON CONFLICT (sport, version) DO UPDATE SET status='champion', promoted_at=now(), retired_at=NULL",
-            &[&sport, &old, &v, &engine_of(sport)]).await.map_err(|e| dberr(&e))?;
-        audit(db, sport, "engine_upgrade", Some(&v), json!({ "from": old, "from_engine": engine, "engine": engine_of(sport) })).await;
+        db.query_one("SELECT gov_engine_upgrade($1, $2, $3)", &[&sport, &v, &engine_of(sport)]).await.map_err(|e| dberr(&e))?;
         return Ok((v, c.0));
     }
+    // an empty model line: the engine defaults become the first champion (gov_register_initial audits it)
     let v = version_for(sport, &json!({}));
-    let n = db.execute("INSERT INTO model_registry (sport, version, engine, config, status, notes, promoted_at) VALUES ($1,$2,$3,'{}','champion',$4, now()) ON CONFLICT (sport, version) DO NOTHING",
-        &[&sport, &v, &engine_of(sport), &"initial champion: engine defaults"]).await.map_err(|e| dberr(&e))?;
-    if n > 0 { audit(db, sport, "register", Some(&v), json!({ "status": "champion", "reason": "registry was empty; engine defaults become the first champion" })).await; }
+    db.query_one("SELECT gov_register_initial($1, $2, $3)", &[&sport, &v, &engine_of(sport)]).await.map_err(|e| dberr(&e))?;
     Ok((v, json!({})))
 }
 
@@ -774,61 +769,6 @@ pub(crate) fn gate(paired: &BTreeMap<String, Vec<f64>>) -> (serde_json::Map<Stri
     }).collect();
     (markets, improves, degrades)
 }
-
-#[derive(Deserialize)]
-pub struct PromoteQuery { version: String, reason: Option<String> }
-
-/// POST /learning/{sport}/promote?version= — only a candidate whose stored
-/// evaluation passed the gate, against the current champion, can be promoted.
-pub async fn promote(state: web::Data<State>, path: web::Path<String>, q: web::Query<PromoteQuery>) -> impl Responder {
-    let sport = path.into_inner();
-    if let Err(r) = check_sport(&sport) { return r; }
-    let db = &state.db;
-    let (champ, _) = match champion(db, &sport).await { Ok(c) => c, Err(e) => return internal(e) };
-    let Some(row) = (match db.query_opt("SELECT status, evidence FROM model_registry WHERE sport=$1 AND version=$2", &[&sport, &q.version]).await {
-        Ok(r) => r, Err(e) => return internal(dberr(&e)) }) else { return bad_request("unknown version") };
-    let (status, ev): (String, Option<Json<Value>>) = (row.get(0), row.get(1));
-    if status != "candidate" && status != "shadow" { return bad_request(format!("{} is {status}", q.version)); }
-    let Some(ev) = ev.map(|e| e.0) else { return unprocessable("no evaluation on record; POST /learning/{sport}/evaluate first") };
-    if ev["champion"].as_str() != Some(champ.as_str()) { return unprocessable(format!("evaluation was against {}, but the champion is now {champ}; re-evaluate", ev["champion"])); }
-    if ev["gate"]["pass"].as_bool() != Some(true) {
-        let _ = db.execute("UPDATE model_registry SET status='rejected', retired_at=now() WHERE sport=$1 AND version=$2", &[&sport, &q.version]).await;
-        audit(db, &sport, "reject", Some(&q.version), json!({ "champion": champ, "gate": ev["gate"] })).await;
-        return unprocessable(format!("{} failed the promotion gate and was rejected", q.version));
-    }
-    if let Err(e) = swap_to(db, &sport, &champ, &q.version, "retired").await { return internal(e); }
-    audit(db, &sport, "promote", Some(&q.version), json!({ "from": champ, "reason": q.reason, "gate": ev["gate"] })).await;
-    HttpResponse::Ok().json(json!({ "sport": sport, "champion": q.version, "retired": champ }))
-}
-
-/// `to` becomes champion; `from` (the champion) gets `old_status`: retired,
-/// rejected (after a rollback), or shadow (kept running as the rollback
-/// reference). One statement: the single-champion constraint is checked at its end.
-pub(crate) async fn swap_to(db: &tokio_postgres::Client, sport: &str, from: &str, to: &str, old_status: &str) -> Result<(), String> {
-    db.execute("UPDATE model_registry SET status = CASE WHEN version=$2 THEN $4 ELSE 'champion' END, \
-                    retired_at = CASE WHEN version=$2 THEN now() ELSE NULL END, \
-                    promoted_at = CASE WHEN version=$3 THEN now() ELSE promoted_at END \
-                WHERE sport=$1 AND version IN ($2, $3)", &[&sport, &from, &to, &old_status]).await.map_err(|e| dberr(&e))?;
-    Ok(())
-}
-
-/// POST /learning/{sport}/rollback?reason= — restore the most recently retired champion.
-pub async fn rollback(state: web::Data<State>, path: web::Path<String>, q: web::Query<RollbackQuery>) -> impl Responder {
-    let sport = path.into_inner();
-    if let Err(r) = check_sport(&sport) { return r; }
-    let db = &state.db;
-    let (champ, _) = match champion(db, &sport).await { Ok(c) => c, Err(e) => return internal(e) };
-    let prev: Option<String> = match db.query_opt("SELECT version FROM model_registry WHERE sport=$1 AND status IN ('retired','shadow') AND promoted_at IS NOT NULL AND engine=$2 ORDER BY retired_at DESC NULLS LAST LIMIT 1", &[&sport, &engine_of(&sport)]).await {
-        Ok(r) => r.map(|r| r.get(0)), Err(e) => return internal(dberr(&e)) };
-    // (a champion retired by an engine upgrade ran code that no longer exists)
-    let Some(prev) = prev else { return unprocessable("no previous champion on the current engine to roll back to") };
-    if let Err(e) = swap_to(db, &sport, &champ, &prev, "retired").await { return internal(e); }
-    audit(db, &sport, "rollback", Some(&prev), json!({ "from": champ, "reason": q.reason })).await;
-    HttpResponse::Ok().json(json!({ "sport": sport, "champion": prev, "retired": champ }))
-}
-
-#[derive(Deserialize)]
-pub struct RollbackQuery { reason: Option<String> }
 
 #[cfg(test)]
 mod tests {

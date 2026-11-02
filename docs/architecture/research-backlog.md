@@ -7,9 +7,9 @@ backtests, publication holds; see `validation.md`).
 
 | # | Deliverable | Status | Done when |
 |---|---|---|---|
-| R1 | NBA player-prop experiments on research-only forecasts | blocked on R3 | `experiment.py --sport nba --source backtest --markets pts,reb,...` recorded; every record labelled "(vs naive model, no market prices)" and verdict at most inconclusive (enforced in code and by test) |
+| R1 | NBA player-prop experiments on research-only forecasts | ready (R3 complete), not run | `experiment.py --sport nba --source backtest --markets pts,reb,...` recorded; every record labelled "(vs naive model, no market prices)" and verdict at most inconclusive (enforced in code and by test) |
 | R2 | NFL simulator backtest | not started | `backtest_runner.py --engine nfl` complete (research mode); per-season row counts in this table |
-| R3 | NBA simulator backtest | running | `backtest_runner.py --engine nba` reports complete; stored games = season games with a forecast |
+| R3 | NBA simulator backtest | complete (2026-11-01): 4,132 games = 4,123 stored (1,463,194 rows) + 9 without an evaluation (the All-Star games: 2023 1, 2024 1, 2025 3, 2026 4), 0 duplicates; per season stored 1,030 / 1,031 / 1,031 / 1,031 (2023-2026) | `backtest_runner.py --engine nba` reports complete; stored games = season games with a forecast |
 | R4 | Historical ESPN injury reports | not started | a snapshotter stores every ESPN injury report as published (observed_at = fetch time) into `feature_snapshots` (quality observed); no back-fill of the past |
 | R5 | NFL injury / depth-chart timestamps | not started | a source with publication times is found, or the weekly tables are stored as quality 'inferred' and kept out of experiments |
 | R6 | NHL starting-goalie confirmation | not started | a confirmed-starter source captured before puck drop; today `goalie_confirmed` is always 0 at freeze |

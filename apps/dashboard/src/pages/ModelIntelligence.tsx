@@ -195,14 +195,20 @@ function Registry({ sport }: { sport?: string }) {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["learning-registry", sport], queryFn: () => learningApi.registry(sport) });
   const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const refresh = () => { qc.invalidateQueries({ queryKey: ["learning-registry"] }); qc.invalidateQueries({ queryKey: ["learning-audit"] }); };
   const act = useMutation({
     mutationFn: async (a: { kind: "evaluate" | "promote" | "rollback"; row: RegistryRow }) => {
       if (a.kind === "evaluate") return learningApi.evaluate(a.row.sport, a.row.version);
-      if (a.kind === "promote") return learningApi.promote(a.row.sport, a.row.version, "promoted from Model Intelligence");
-      return learningApi.rollback(a.row.sport, "rolled back from Model Intelligence");
+      // the dashboard only files a request; production changes need an admin approval (scripts/ops/governance.py)
+      if (a.kind === "promote") return learningApi.requestPromotion(a.row.sport, a.row.version);
+      return learningApi.requestRollback(a.row.sport);
     },
-    onSuccess: () => { setErr(null); refresh(); },
+    onSuccess: (v) => {
+      setErr(null);
+      if (v && typeof v === "object" && "request_id" in v) setNote(`Promotion request #${v.request_id} is ${v.status ?? "open"}: approve it with scripts/ops/governance.py (admin token required).`);
+      refresh();
+    },
     onError: (e) => { setErr((e as Error).message); refresh(); },
   });
   const rows = q.data?.registry ?? [];
@@ -213,6 +219,7 @@ function Registry({ sport }: { sport?: string }) {
       {q.isLoading && <Msg>Loading registry…</Msg>}
       {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
       {err && <Msg tone="error">{err}</Msg>}
+      {note && <Msg>{note}</Msg>}
       {act.isPending && <Msg>{act.variables?.kind === "evaluate" ? "Running a paired walk-forward evaluation (champion vs candidate on the same games and seeds)… this takes several minutes." : "Working…"}</Msg>}
       {rows.length > 0 && (
         <Table head={<tr><Th>Sport</Th><Th>Version</Th><Th>Status</Th><Th>Config</Th><Th>Evidence</Th><Th>Actions</Th></tr>}>

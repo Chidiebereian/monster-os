@@ -125,9 +125,12 @@ def test_no_game_in_train_and_test_and_runs_are_deterministic(sport, markets, so
 
 
 def test_builders_are_idempotent():
+    # the first run may add newly settled games; an immediate second run must add nothing
     for script in ("dataset.py", "features.py"):
+        subprocess.run([sys.executable, os.path.join(HERE, script)], capture_output=True, text=True, timeout=900)
         out = subprocess.run([sys.executable, os.path.join(HERE, script)], capture_output=True, text=True, timeout=900).stdout
-        assert "0 new" in out or "inserted 0 new" in out, (script, out[-400:])
+        new = [int(x) for x in __import__("re").findall(r"(\d+) new", out)]
+        assert new and all(n == 0 for n in new), (script, out[-400:])
 
 
 def test_unchanged_experiment_is_not_recorded_twice():
@@ -212,9 +215,15 @@ def test_held_markets_never_reach_public_picks():
 
 def test_held_picks_stay_available_internally():
     n_internal = q("SELECT count(*) FROM ai_picks WHERE (engine, market) IN (SELECT engine, market FROM publication_holds_active)")[0][0]
-    st, d = http("/picks?status=all&limit=1000&include_hidden=true&include_held=true")
-    shown = sum((p["engine"], p["market"]) in HELD for p in d["picks"])
-    assert st == 200 and shown == min(n_internal, shown) and (n_internal == 0 or shown > 0)
+    # one request per held market: a single 1,000-row page of the whole table (4,500+ picks, sorted by
+    # grade) can leave every held pick on a later page
+    shown = 0
+    for market in sorted({m for _, m in HELD}):
+        st, d = http(f"/picks?status=all&limit=1000&include_hidden=true&include_held=true&market={market}")
+        assert st == 200 and len(d["picks"]) < 1000, market  # the page holds the whole market
+        shown += sum((p["engine"], p["market"]) in HELD for p in d["picks"])
+    # every held pick is still served on the internal view
+    assert shown == n_internal
 
 
 def test_holds_do_not_change_evidence_or_unrelated_markets():

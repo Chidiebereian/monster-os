@@ -129,16 +129,18 @@ async fn season_obs(state: &State, engine: &str, season: i32, cfg: &Value, out: 
     let games = learning::season_games(state, engine, season).await?;
     let mut used = 0;
     for id in &games {
-        if game_obs(state, engine, season, id, cfg, Some(&mut *out)).await { used += 1; }
+        if let Ok(Some(_)) = game_obs(state, engine, season, id, cfg, Some(&mut *out)).await { used += 1; }
     }
     Ok(used)
 }
 
 /// Evaluate one game (inputs strictly before it), store its forecasts in the ML
-/// dataset, and add them to `out` when the caller aggregates evidence.
-async fn game_obs(state: &State, engine: &str, season: i32, id: &str, cfg: &Value, out: Option<&mut Obs>) -> bool {
+/// dataset, and add them to `out` when the caller aggregates evidence. Ok(None) =
+/// the engine has nothing to evaluate (missing inputs or outcome); Ok(Some(n)) = n
+/// scorable forecasts stored; Err = the evaluation failed (never recorded as a skip).
+async fn game_obs(state: &State, engine: &str, season: i32, id: &str, cfg: &Value, out: Option<&mut Obs>) -> Result<Option<usize>, String> {
     let seed = learning::fnv(&[engine, id, "evidence"]);
-    let Ok(Some(ge)) = learning::evaluate(state, engine, id, cfg, SIMS, DRAWS, seed).await else { return false };
+    let Some(ge) = learning::evaluate(state, engine, id, cfg, SIMS, DRAWS, seed).await? else { return Ok(None) };
     // a moneyline compared with "the market" needs that game's real spread
     let has_line = ge.forecasts.iter().any(|f| f.market == "home_cover");
     let mut keep = Vec::new();
@@ -152,7 +154,7 @@ async fn game_obs(state: &State, engine: &str, season: i32, id: &str, cfg: &Valu
             "kind": if f.subject == "game" { "game" } else { "prop" }, "features": { "forecast_market": f.market, "baseline": f.baseline, "stat": f.stat } }));
     }
     save_examples(state, engine, season, id, &keep).await;
-    true
+    Ok(Some(keep.len()))
 }
 
 /// Every backtest forecast also goes to the immutable ML dataset (migration
@@ -244,22 +246,38 @@ pub(crate) async fn research_batch(state: &State, engine: &str, max_games: usize
     let (_, cfg) = learning::champion(db, engine).await?;
     let code = learning::engine_of(engine);
     let started = Utc::now();
-    let (mut done, mut skipped, mut failed, mut remaining) = (0usize, 0usize, 0usize, 0usize);
+    // every season game ends up stored (has forecast rows) or skipped (no evaluation / nothing scorable), once
+    let (mut expected, mut stored, mut no_forecast, mut done, mut skipped_now, mut remaining) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut per_season = Vec::new();
     for season in seasons(engine, (Utc::now() - chrono::Duration::hours(5)).date_naive()) {
         let games = learning::season_games(state, engine, season).await?;
         let have: std::collections::HashSet<String> = db.query("SELECT DISTINCT game_id FROM ml_examples WHERE source='backtest' AND engine=$1 AND engine_version=$2 AND season=$3",
             &[&engine, &code, &season]).await.map_err(|e| dberr(&e))?.iter().map(|r| r.get(0)).collect();
-        let (mut d, mut s) = (0, 0);
+        let skip: std::collections::HashSet<String> = db.query("SELECT game_id FROM research_backtest_skips WHERE engine=$1 AND engine_version=$2 AND season=$3",
+            &[&engine, &code, &season]).await.map_err(|e| dberr(&e))?.iter().map(|r| r.get(0)).collect();
+        let (mut st, mut sk, mut rem) = (0, 0, 0);
         for id in &games {
-            if have.contains(id) { skipped += 1; s += 1; continue; }
-            if done + failed >= max_games { remaining += 1; continue; }
-            if game_obs(state, engine, season, id, &cfg, None).await { done += 1; d += 1; } else { failed += 1; }
+            if have.contains(id) { st += 1; continue; }
+            if skip.contains(id) { sk += 1; continue; }
+            if done + skipped_now >= max_games { rem += 1; continue; }
+            match game_obs(state, engine, season, id, &cfg, None).await {
+                Ok(Some(n)) if n > 0 => { done += 1; st += 1; }
+                // a failed evaluation stops the batch and records nothing: the next run retries the game
+                Err(e) => return Err(format!("game {id} (season {season}): evaluation failed: {e}; not recorded as a skip, rerun to retry")),
+                Ok(other) => {
+                    let reason = if other.is_none() { "no evaluation (missing inputs or outcome)" } else { "evaluated, no scorable forecast" };
+                    db.execute("INSERT INTO research_backtest_skips (engine, engine_version, season, game_id, reason) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+                        &[&engine, &code, &season, id, &reason]).await.map_err(|e| dberr(&e))?;
+                    skipped_now += 1; sk += 1;
+                }
+            }
         }
-        per_season.push(json!({ "season": season, "games": games.len(), "stored_before": s, "stored_now": d }));
+        expected += games.len(); stored += st; no_forecast += sk; remaining += rem;
+        per_season.push(json!({ "season": season, "expected": games.len(), "stored": st, "no_forecast": sk, "remaining": rem }));
     }
-    Ok(json!({ "engine": engine, "engine_version": code, "mode": "research", "evidence_rows_written": 0, "games_done": done, "games_skipped_existing": skipped,
-        "games_without_forecast": failed, "games_remaining": remaining, "complete": remaining == 0, "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
+    Ok(json!({ "engine": engine, "engine_version": code, "mode": "research", "evidence_rows_written": 0, "games_done": done, "games_skipped_now": skipped_now,
+        "expected_games": expected, "stored_games": stored, "no_forecast_games": no_forecast, "games_remaining": remaining, "complete": remaining == 0,
+        "seasons": per_season, "secs": (Utc::now() - started).num_seconds() }))
 }
 
 fn research_lock() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {

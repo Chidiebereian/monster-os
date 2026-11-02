@@ -4,7 +4,9 @@ No credential lives in tracked files. A script asks for a variable by name:
 
   ML_DATABASE_URL    research role (monster_research): read everything, insert into
                      the research tables only. Set by scripts/ops/rotate_research_password.py.
-  OPS_DATABASE_URL   owner role, for operations such as publication decisions.
+  APP_DATABASE_URL   service role (monster_app, migration 0039): what every running service
+                     uses. Set by `scripts/ops/rotate_research_password.py --role monster_app`.
+  OPS_DATABASE_URL   owner role: migrations, admin-token management and break-glass only.
 
 The value comes from the process environment first, then from KEY=value lines in
 the repository's .env. Values are never printed; a missing variable stops the
@@ -17,7 +19,8 @@ ENV_FILE = os.path.join(ROOT, ".env")
 
 HELP = {
     "ML_DATABASE_URL": "run `python scripts/ops/rotate_research_password.py` once (it sets the research role's password and writes ML_DATABASE_URL to .env)",
-    "OPS_DATABASE_URL": "add OPS_DATABASE_URL=postgresql://<owner>:<password>@localhost:5434/monsteros to .env or the environment",
+    "APP_DATABASE_URL": "run `python scripts/ops/rotate_research_password.py --role monster_app` once (apply migration 0039 first)",
+    "OPS_DATABASE_URL": "add OPS_DATABASE_URL=postgresql://<owner>:<password>@127.0.0.1:5434/monsteros to .env or the environment",
 }
 
 

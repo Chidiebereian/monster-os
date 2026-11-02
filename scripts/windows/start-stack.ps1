@@ -27,7 +27,9 @@ if (Test-Path $envFile) {
         [Environment]::SetEnvironmentVariable($k.Trim(), $v.Trim().TrimEnd("`r"), "Process")
     }
 }
-$env:DATABASE_URL = "postgres://monster:monster@localhost:5434/monsteros"
+# services run as monster_app (migration 0039), never as the database owner; the URL lives in the git-ignored .env
+if (-not $env:APP_DATABASE_URL) { throw "APP_DATABASE_URL is not set in .env: run python scripts/ops/rotate_research_password.py --role monster_app" }
+$env:DATABASE_URL = $env:APP_DATABASE_URL
 # MonsterGPT: extra selectable chat model (fast, weaker) next to LLM_MODEL from .env
 if (-not $env:MONSTER_GPT_MODELS) { $env:MONSTER_GPT_MODELS = "qwen2.5:0.5b" }
 $env:CLICKHOUSE_USER = "monster"

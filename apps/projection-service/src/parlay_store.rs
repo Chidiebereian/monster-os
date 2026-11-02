@@ -304,11 +304,13 @@ pub async fn learn(state: &State) -> Result<Value, String> {
     if cand == current { return Ok(json!({ "outcome": "kept", "version": version, "evidence": ev })); }
     let v = format!("{}+dep{:.2}", parlay::ENGINE, cand);
     if ev["pass"].as_bool().unwrap_or(false) {
-        db.execute("UPDATE parlay_models SET status='retired', retired_at=now() WHERE status='champion'", &[]).await.map_err(|e| dberr(&e))?;
-        db.execute("INSERT INTO parlay_models (version, dep_weight, status, parent, evidence, promoted_at) VALUES ($1,$2,'champion',$3,$4,now()) \
-            ON CONFLICT (version) DO UPDATE SET status='champion', parent=EXCLUDED.parent, evidence=EXCLUDED.evidence, promoted_at=now(), retired_at=NULL",
+        // policy: recommend only; an admin-approved promotion request makes it the champion
+        db.execute("INSERT INTO parlay_models (version, dep_weight, status, parent, evidence) VALUES ($1,$2,'candidate',$3,$4) \
+            ON CONFLICT (version) DO UPDATE SET evidence=EXCLUDED.evidence WHERE parlay_models.status <> 'champion'",
             &[&v, &cand, &version, &Json(&ev)]).await.map_err(|e| dberr(&e))?;
-        Ok(json!({ "outcome": "promoted", "version": v, "evidence": ev }))
+        let req = crate::governance::propose(db, "parlay", "parlay", "promote", &v, "autopilot").await.unwrap_or_else(|e| json!({ "error": e }));
+        crate::learning::audit(db, "parlay", "promotion_recommended", Some(&v), json!({ "champion": version, "evidence": ev, "request": req })).await;
+        Ok(json!({ "outcome": "recommended", "version": v, "evidence": ev, "request": req }))
     } else {
         db.execute("INSERT INTO parlay_models (version, dep_weight, status, parent, evidence) VALUES ($1,$2,'rejected',$3,$4) \
             ON CONFLICT (version) DO UPDATE SET evidence=EXCLUDED.evidence WHERE parlay_models.status <> 'champion'", &[&v, &cand, &version, &Json(&ev)]).await.map_err(|e| dberr(&e))?;
@@ -487,19 +489,6 @@ pub async fn validation_http(state: web::Data<State>) -> impl Responder {
 
 pub async fn learn_http(state: web::Data<State>) -> impl Responder {
     match learn(&state).await { Ok(v) => HttpResponse::Ok().json(v), Err(e) => internal(e) }
-}
-
-/// Restore the most recently retired champion.
-pub async fn rollback_http(state: web::Data<State>) -> impl Responder {
-    let db = &state.db;
-    let prev = match db.query_opt("SELECT version FROM parlay_models WHERE status='retired' ORDER BY retired_at DESC NULLS LAST LIMIT 1", &[]).await {
-        Ok(Some(r)) => r.get::<_, String>(0), Ok(None) => return HttpResponse::Conflict().json(json!({ "error": "no earlier champion to restore" })), Err(e) => return internal(dberr(&e)),
-    };
-    let r = async {
-        db.execute("UPDATE parlay_models SET status='retired', retired_at=now() WHERE status='champion'", &[]).await?;
-        db.execute("UPDATE parlay_models SET status='champion', promoted_at=now(), retired_at=NULL WHERE version=$1", &[&prev]).await
-    }.await;
-    match r { Ok(_) => HttpResponse::Ok().json(json!({ "champion": prev })), Err(e) => internal(dberr(&e)) }
 }
 
 #[cfg(test)]

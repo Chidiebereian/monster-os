@@ -100,13 +100,14 @@ export const learningApi = {
     req<{ version: string }>(`/learning/${sport}/candidates`, { method: "POST", body: JSON.stringify({ config, notes }) }),
   evaluate: (sport: string, version: string, games = 300) =>
     req<EvalReport>(`/learning/${sport}/evaluate?${qs({ version, games })}`, { method: "POST" }),
-  promote: (sport: string, version: string, reason?: string) =>
-    req<{ champion: string }>(`/learning/${sport}/promote?${qs({ version, reason })}`, { method: "POST" }),
+  /** Files a promotion request; an admin approves it with scripts/ops/governance.py (the dashboard cannot). */
+  requestPromotion: (sport: string, version: string) =>
+    req<PromotionRequestResult>(`/governance/promotion-requests`, { method: "POST", body: JSON.stringify({ kind: "engine", engine: sport, action: "promote", candidate_version: version }) }),
   autopilot: () => req<Autopilot>(`/learning/autopilot`),
   setPaused: (paused: boolean) => req<Autopilot>(`/learning/autopilot?paused=${paused}`, { method: "POST" }),
   runTick: () => req<{ frozen: number; forecasts_scored: number; errors: unknown[] }>(`/learning/autopilot/run?job=tick`, { method: "POST" }),
-  rollback: (sport: string, reason?: string) =>
-    req<{ champion: string }>(`/learning/${sport}/rollback?${qs({ reason })}`, { method: "POST" }),
+  requestRollback: (sport: string) =>
+    req<PromotionRequestResult>(`/governance/promotion-requests`, { method: "POST", body: JSON.stringify({ kind: "engine", engine: sport, action: "rollback" }) }),
 };
 
 /** "beats" / "worse" only when the paired difference is at least two standard errors. */
@@ -115,3 +116,5 @@ export function verdict(diff: number, se: number): "beats" | "worse" | "even" {
   if (diff > 2 * se) return "worse";
   return "even";
 }
+
+export interface PromotionRequestResult { created: boolean; request_id: number | null; status: string | null; candidate?: string; champion?: string; artifact_hash?: string; note?: string }

@@ -49,10 +49,10 @@ The whole cache can be dropped; it refills on the next view.
 
 ## Running it
 
-whale-tracker needs only `DATABASE_URL` and `PORT=8116`:
+whale-tracker needs only `DATABASE_URL` (the service role, `APP_DATABASE_URL` in `.env`) and `PORT=8116`:
 
 ```
-DATABASE_URL=postgres://monster:monster@localhost:5434/monsteros PORT=8116 ./target/debug/whale-tracker.exe
+DATABASE_URL="$APP_DATABASE_URL" PORT=8116 ./target/debug/whale-tracker.exe
 ```
 
 Its older routes (`/ingest`, `/trades`, `/candles`, …) still need ClickHouse.

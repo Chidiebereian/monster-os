@@ -11,7 +11,11 @@ Runs, in order, and fails closed (exit 1) on the first broken guarantee:
   4. rust            cargo test for projection-service and monster-gpt
   5. dashboard       TypeScript check
   6. e2e (--e2e)     MonsterGPT end-to-end tests (needs monster-gpt running)
-  7. secrets         tracked, staged and to-be-added files plus git history: database URLs
+  7. governance      admin authentication, database privileges, promotion lifecycle and
+                     publication control (scripts/ops/test_governance.py): read-only checks
+                     against production, everything that writes on a scratch instance that
+                     connects as monster_app
+  8. secrets         tracked, staged and to-be-added files plus git history: database URLs
                      with passwords, the live .env credentials, private keys, API-key shapes.
                      Files that already carried the local owner login before this gate
                      existed are listed as pre-existing; anything else fails. No value is printed.
@@ -73,7 +77,7 @@ def secrets_scan():
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import dbenv
     live = []
-    for k in ("ML_DATABASE_URL", "OPS_DATABASE_URL"):
+    for k in ("ML_DATABASE_URL", "APP_DATABASE_URL", "OPS_DATABASE_URL"):
         v = dbenv.read_env_file(k)
         m = re.match(r"postgres(?:ql)?://[^:]+:([^@]+)@", v or "")
         if m and len(m.group(1)) >= 12:  # the short local owner password is covered by the URL pattern
@@ -112,7 +116,8 @@ def main():
     py = sys.executable
     steps = [("migrations", migrations),
              ("ml-unit", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ml/test_experiment.py"])),
-             ("integrity", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ml/test_integrity.py"] + (["-m", "not slow"] if a.fast else [])))]
+             ("integrity", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ml/test_integrity.py"] + (["-m", "not slow"] if a.fast else []))),
+             ("governance", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ops/test_governance.py"]))]
     if not a.fast:
         steps.append(("rust", lambda: run(["cargo", "test", "-p", "projection-service", "-p", "monster-gpt", "-j", "2", "--bins"], timeout=7200)))
     steps.append(("dashboard", lambda: run("npx tsc --noEmit -p .", cwd=os.path.join(ROOT, "apps", "dashboard"))))
