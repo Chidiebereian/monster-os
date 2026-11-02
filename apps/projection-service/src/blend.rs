@@ -92,9 +92,11 @@ pub fn weights(rows: &[Evidence], default_w: f64) -> Weights {
         (Some((x, n)), _) if n as usize >= LINES_MIN_FIT => (x, "lines", n),
         (_, Some((x, n))) => (x, "backtest", n),
         (Some((x, n)), None) if n > 0 => {
-            // too few recorded lines to stand alone: shrink their fit toward the default
+            // too few recorded lines to stand alone: shrink their fit toward 0, not toward the
+            // default. Once real market prices exist the model earns its weight from them; a
+            // model that adds nothing over the market (fit 0) moves no price.
             let k = n as f64 / LINES_MIN_FIT as f64;
-            (k * x + (1.0 - k) * default_w, "lines_partial", n)
+            (k * x, "lines_partial", n)
         }
         _ => (default_w, "default", 0),
     };
@@ -111,7 +113,7 @@ pub fn source_text(w: &Weights) -> String {
     match w.market_source {
         "lines" => format!("fitted on {} settled real lines", w.market_n),
         "backtest" => format!("fitted on {} games of closing lines in backtests", w.market_n),
-        "lines_partial" => format!("provisional: {} settled real lines so far", w.market_n),
+        "lines_partial" => format!("provisional: {} settled real lines so far, scaled down until {LINES_MIN_FIT}", w.market_n),
         _ => "default (not fitted yet)".into(),
     }
 }
@@ -245,7 +247,11 @@ mod tests {
         assert_eq!(weights(&[bt, row("lines", "market", 100, 0.4)], 0.5).w_market, 0.2);
         let p = weights(&[row("lines", "market", 150, 0.1)], 0.5);
         assert_eq!(p.market_source, "lines_partial");
-        assert!((p.w_market - 0.3).abs() < 1e-9);
+        assert!((p.w_market - 0.05).abs() < 1e-9); // half of 300 lines: half the fit, never the default
+        // a model that adds nothing over the market on real lines moves no price, however few lines
+        assert_eq!(weights(&[row("lines", "market", 80, 0.0)], 0.5).w_market, 0.0);
+        // the shrunk weight never exceeds what the lines support
+        assert!(weights(&[row("lines", "market", 299, 0.9)], 0.5).w_market <= 0.9);
         assert_eq!(weights(&[row("backtest", "baseline", 9000, 0.6)], 0.5).w_naive, Some(0.6));
     }
 }
