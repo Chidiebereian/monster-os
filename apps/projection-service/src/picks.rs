@@ -203,8 +203,22 @@ pub(crate) fn price(payload: &Value, team: bool, market: &str, subject: &str, si
 
 pub(crate) fn decimal(american: i32) -> f64 { if american > 0 { 1.0 + american as f64 / 100.0 } else { 1.0 + 100.0 / (-american as f64) } }
 pub(crate) fn implied(american: i32) -> f64 { 1.0 / decimal(american) }
-/// De-vigged probability of side a from a two-way pair.
-pub(crate) fn novig(a: i32, b: i32) -> f64 { let (x, y) = (implied(a), implied(b)); x / (x + y) }
+/// De-vigged probability of side a from a two-way pair (power method).
+pub(crate) fn novig(a: i32, b: i32) -> f64 { devig(implied(a), implied(b)) }
+
+/// Fair probability of side x from a two-way pair of implied probabilities, power
+/// method: p = x^k with k such that x^k + y^k = 1. Unlike dividing by the sum, it
+/// takes more of the margin from the longshot, which books overprice (research R10:
+/// sides the proportional method put at 15% won 10.9%; power 11.9%).
+pub(crate) fn devig(x: f64, y: f64) -> f64 {
+    if !(x > 0.0 && y > 0.0 && x < 1.0 && y < 1.0) { return x / (x + y); }
+    let (mut lo, mut hi) = (0.01_f64, 50.0_f64); // x^k + y^k falls as k grows
+    for _ in 0..60 {
+        let k = (lo + hi) / 2.0;
+        if x.powf(k) + y.powf(k) > 1.0 { lo = k; } else { hi = k; }
+    }
+    x.powf((lo + hi) / 2.0)
+}
 
 /// A quote whose no-vig probability is this far from the median of 3+ books at the same line is dropped.
 pub(crate) const OUTLIER_GAP: f64 = 0.15;
@@ -1622,7 +1636,9 @@ mod tests {
         assert!((decimal(-110) - 1.909090909).abs() < 1e-6);
         assert!((decimal(150) - 2.5).abs() < 1e-12);
         assert!((novig(-110, -110) - 0.5).abs() < 1e-12);
-        assert!((novig(-150, 130) - 0.6 / (0.6 + 100.0 / 230.0)).abs() < 1e-12); // 0.5798
+        // power method: the favourite keeps more than the proportional 0.5798
+        let (f, d) = (novig(-150, 130), novig(130, -150));
+        assert!((f + d - 1.0).abs() < 1e-9 && f > 0.6 / (0.6 + 100.0 / 230.0) && f < 0.6);
     }
 
     #[test]
@@ -1679,6 +1695,16 @@ mod tests {
         assert!((price(&p, false, "total_1h", "game", "over", Some(1.5)).unwrap().win - 0.6).abs() < 1e-12);
         assert!((price(&p, true, "team_total_away_1h", "game", "over", Some(0.5)).unwrap().win - 0.2).abs() < 1e-12);
         assert!(price(&json!({}), false, "total_1h", "game", "over", Some(1.5)).is_none());
+    }
+
+    #[test]
+    fn power_devig_sums_to_one_and_takes_more_from_the_longshot() {
+        let (fav, dog) = (novig(-300, 240), novig(240, -300));
+        assert!((fav + dog - 1.0).abs() < 1e-9);
+        let (x, y) = (implied(240), implied(-300));
+        assert!(dog < x / (x + y), "power gives the longshot less than proportional");
+        assert!((novig(-110, -110) - 0.5).abs() < 1e-9);
+        assert!((devig(0.4, 0.6) - 0.4).abs() < 1e-9, "a fair pair is left alone");
     }
 
     #[test]

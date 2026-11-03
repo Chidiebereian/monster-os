@@ -28,6 +28,15 @@ A sportsbook's price, with its margin (vig) removed, is itself a probability, an
 at kick-off (the closing line) is the hardest one to beat. Monster OS compares every model
 with it:
 
+- **Removing the margin.** The two sides' implied probabilities add up to more than 100%;
+  the excess is the book's margin (about 6.5% on average in Monster OS's stored quotes).
+  Monster OS removes it with the power method: each implied probability is raised to the
+  same power so the two add up to 100%. That takes more of the margin from the longshot
+  than dividing by the total does, and it fits the results better: on 16,319 settled
+  selections, sides that the proportional method put at 0-20% won 10.9% of the time; the
+  proportional method said 15.1%, the power method 11.9%. Books build more margin into
+  longshots, so a proportional de-vig leaves fake value on the underdog.
+
 - **Edge** = model probability minus the de-vigged market probability. It means something
   only if the model has beaten the market before, on games it had not seen.
 - **Blend weight.** A pick's price is a blend: `final = market + w x (model - market)`. The
@@ -44,8 +53,8 @@ with it:
   test Monster OS uses is the expected value of the price actually taken at the closing fair
   (de-vigged) probability: positive means the bet was +EV, negative means the vig won.
   Measured on 2,916 settled picks (October-November 2026, quarantined feeds removed): 38.8%
-  beat the close, but the average expected value at the closing fair price was -5.3%, and
-  only 9.3% of picks were +EV at the close. Results that look better than that over a few
+  beat the close, but the average expected value at the closing fair price was -5.5% (power
+  de-vig; -5.3% with the proportional method), and only 9.6% of picks were +EV at the close. Results that look better than that over a few
   weeks are mostly luck.
 - **Where models can win.** Major markets (NFL sides, NBA totals) are very efficient. Edges
   are more likely in thinner markets (player props, smaller leagues) and in pricing a line

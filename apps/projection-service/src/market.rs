@@ -183,7 +183,7 @@ pub(crate) async fn fetch_games(state: &State, sport: &str) -> Result<Vec<Value>
         let sp_m = book_pick(&odds["points-home-game-sp-home"]);
         let ou_o = book_pick(&odds["points-all-game-ou-over"]);
         let ou_u = book_pick(&odds["points-all-game-ou-under"]);
-        let novig_home = match (ml_h, ml_a) { (Some(h), Some(a)) => { let (ih, ia) = (implied(h), implied(a)); Some(ih / (ih + ia)) } _ => None };
+        let novig_home = match (ml_h, ml_a) { (Some(h), Some(a)) => Some(crate::picks::devig(implied(h), implied(a))), _ => None };
         out.push(json!({
             "home": home, "away": away, "starts_at": ev["status"]["startsAt"],
             "ml_home_odds": ml_h, "ml_away_odds": ml_a, "novig_home_win": novig_home.map(|x| (x*1000.0).round()/1000.0),
@@ -275,7 +275,7 @@ pub(crate) async fn recorded_games(db: &tokio_postgres::Client, sport: &str) -> 
     let block = |mk: &HashMap<String, Book>, sfx: &str| -> Value {
         let g = |m: &str| pick(mk.get(&format!("{m}{sfx}")));
         let (ml, sp, tot, th, ta) = (g("moneyline"), g("spread"), g("total"), g("team_total_home"), g("team_total_away"));
-        let novig = ml.map(|((_, h), (_, a))| { let (ih, ia) = (implied(h as f64), implied(a as f64)); (ih / (ih + ia) * 1000.0).round() / 1000.0 });
+        let novig = ml.map(|((_, h), (_, a))| (crate::picks::devig(implied(h as f64), implied(a as f64)) * 1000.0).round() / 1000.0);
         json!({ "ml_home_odds": ml.map(|x| x.0 .1), "ml_away_odds": ml.map(|x| x.1 .1), "novig_home_win": novig,
             "spread": sp.and_then(|x| x.0 .0), "spread_home_odds": sp.map(|x| x.0 .1), "spread_away_odds": sp.map(|x| x.1 .1),
             "total": tot.and_then(|x| x.0 .0), "over_odds": tot.map(|x| x.0 .1), "under_odds": tot.map(|x| x.1 .1),

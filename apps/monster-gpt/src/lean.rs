@@ -27,7 +27,14 @@ pub struct Lean {
 }
 
 fn implied(a: i64) -> f64 { 1.0 / crate::card::decimal(a) }
-fn novig(a: i64, b: i64) -> f64 { let (x, y) = (implied(a), implied(b)); x / (x + y) }
+/// Power-method de-vig, as projection-service picks::devig (research R10).
+fn novig(a: i64, b: i64) -> f64 {
+    let (x, y) = (implied(a), implied(b));
+    if !(x > 0.0 && y > 0.0 && x < 1.0 && y < 1.0) { return x / (x + y); }
+    let (mut lo, mut hi) = (0.01_f64, 50.0_f64);
+    for _ in 0..60 { let k = (lo + hi) / 2.0; if x.powf(k) + y.powf(k) > 1.0 { lo = k; } else { hi = k; } }
+    x.powf((lo + hi) / 2.0)
+}
 fn odds_s(p: i64) -> String { if p > 0 { format!("+{p}") } else { p.to_string() } }
 fn signed(x: f64) -> String { if x > 0.0 { format!("+{x}") } else { format!("{x}") } }
 fn r1(x: f64) -> f64 { (x * 10.0).round() / 10.0 }

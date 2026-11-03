@@ -220,7 +220,7 @@ fn p_over(family: Family, mean: f64, sd: f64, dispersion: Option<f64>, line: f64
 /// De-vigged implied probability of the over.
 fn novig_over(over: Option<f64>, under: Option<f64>) -> Option<f64> {
     match (over, under) {
-        (Some(o), Some(u)) => { let (io, iu) = (market::implied(o), market::implied(u)); Some(io / (io + iu)) }
+        (Some(o), Some(u)) => Some(crate::picks::devig(market::implied(o), market::implied(u))),
         (Some(o), None) => Some(market::implied(o)),
         _ => None,
     }
