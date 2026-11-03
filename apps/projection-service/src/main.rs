@@ -691,6 +691,7 @@ async fn main() -> std::io::Result<()> {
             .route("/fit/nhl/sim", web::post().to(nhl_game::fit))
             .route("/nhl/sim/games", web::get().to(nhl_game::games))
             .route("/nhl/simulate/{game_id}", web::get().to(nhl_game::simulate))
+            .route("/nhl/research/empty-net", web::get().to(nhl_game::empty_net_research))
             .route("/backtest/nhl/sim", web::get().to(nhl_game::backtest))
             .route("/ingest/nhl", web::post().to(nhl::ingest_nhl))
             .route("/ingest/nhl/goalies", web::post().to(nhl::ingest_goalies))

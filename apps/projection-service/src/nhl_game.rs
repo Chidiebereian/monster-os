@@ -215,6 +215,7 @@ pub async fn fit(state: web::Data<State>) -> impl Responder {
             en_goal_pct: rate(en_goals, en_unblocked, 0.3),
             sixv5_att60: rate(six_att, pull_time / 60.0, 1.8) * 60.0,
             home_edge: (home_att / away_att.max(1.0)).sqrt(),
+            pull_shift: [0.0; 2], en_scale: 1.0,
         };
         let key = format!("nhl:sim:{season}");
         if let Err(e) = db.execute("INSERT INTO sim_model_params (key, params, source) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET params = EXCLUDED.params, source = EXCLUDED.source, fitted_at = now()",
@@ -270,6 +271,9 @@ crate::learning::tuning!(Tuning {
     accuracy_prior: 40.0, 5.0, 400.0, "attempts of league-average prior on a skater's share of attempts on net";
     accuracy_weight: 1.0, 0.0, 1.0, "how much of a skater's own on-net share to use (0 = league rate for everyone, as in v3)";
     goal_odds: 1.0, 0.8, 1.25, "league-wide odds multiplier on a goal from a shot on goal (calibration; empty nets excluded)";
+    pull_earlier_secs: 0.0, 0.0, 240.0, "seconds before the fitted time that a team down 1 pulls its goalie (the fit dates a pull from the first 6-skater attempt, which comes after it)";
+    pull_earlier_down2_secs: 0.0, 0.0, 240.0, "extra seconds earlier when down 2";
+    en_scoring: 1.0, 0.5, 2.0, "multiplier on the goal rate of shots on an empty net";
 });
 
 fn norm_name(s: &str) -> String {
@@ -307,7 +311,9 @@ pub struct Built { pub game: GameInput, pub meta: Value }
 pub async fn build(state: &State, g: &GameRef, o: &Opts) -> Result<Built, String> {
     let db = &state.db;
     let params_season = if g.game_type == 3 { g.season } else { g.season - 10001 };
-    let (league, params_key) = load_league(db, params_season).await?;
+    let (mut league, params_key) = load_league(db, params_season).await?;
+    league.pull_shift = [o.tune.pull_earlier_secs, o.tune.pull_earlier_secs + o.tune.pull_earlier_down2_secs];
+    league.en_scale = o.tune.en_scoring;
     let today = chrono::Local::now().date_naive();
     let injuries = if o.mode == LineupMode::Confirmed && g.date >= today { espn_injuries(&state.http).await } else { HashMap::new() };
     let actual: HashMap<i64, (bool, i32)> = if o.mode == LineupMode::Actual || g.completed {
@@ -811,4 +817,90 @@ pub async fn parlay_samples(state: &State, id: &str, lineup: &str, cfg: &Value, 
         v
     })).await.map_err(|e| e.to_string())?;
     Ok(crate::parlay::Samples::from_rows(rows, found, missing, t0.elapsed().as_millis() as u64))
+}
+
+// ---------------------------------------------------------------------------
+// Research R8: empty-net calibration (read-only diagnostics)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct EmptyNetQ { games: Option<i64>, n: Option<usize>, pull_earlier_secs: Option<f64>, pull_earlier_down2_secs: Option<f64>, en_scoring: Option<f64> }
+
+/// GET /nhl/research/empty-net?games=200&n=2000 — the simulator vs real results on
+/// the most recent completed regular-season games (projected lineups, league
+/// parameters from the season before): 2+ goal margins with and without
+/// empty-net goals, empty-net goals per game, and goalie pulls by deficit.
+/// Real pulls use the fit's proxy (first 6-skater attempt in the 3rd). Writes nothing.
+pub async fn empty_net_research(state: web::Data<State>, q: web::Query<EmptyNetQ>) -> impl Responder {
+    let (limit, n) = (q.games.unwrap_or(200).clamp(20, 600), q.n.unwrap_or(2000).clamp(200, 20000));
+    let ids: Vec<i64> = match state.db.query("SELECT g.game_id FROM nhl_games_api g WHERE g.completed AND g.game_type = 2 \
+        AND EXISTS (SELECT 1 FROM nhl_shots_api s WHERE s.game_id = g.game_id) ORDER BY g.game_date DESC, g.game_id DESC LIMIT $1", &[&limit]).await {
+        Ok(r) => r.iter().map(|x| x.get(0)).collect(), Err(e) => return internal(dberr(&e)),
+    };
+    // real: final margin, margin without empty-net goals, empty-net goals, first 6-skater attempt per team
+    let real = match state.db.query("SELECT g.game_id, g.home_score - g.away_score, \
+            count(*) FILTER (WHERE s.kind = 'goal' AND s.empty_net AND s.team = g.home) - count(*) FILTER (WHERE s.kind = 'goal' AND s.empty_net AND s.team = g.away), \
+            count(*) FILTER (WHERE s.kind = 'goal' AND s.empty_net), g.last_period, \
+            count(*) FILTER (WHERE s.kind = 'goal' AND s.period = 3 AND s.skaters LIKE '6%' AND NOT s.empty_net) \
+        FROM nhl_games_api g JOIN nhl_shots_api s USING (game_id) WHERE g.game_id = ANY($1) GROUP BY g.game_id", &[&ids]).await {
+        Ok(r) => r, Err(e) => return internal(dberr(&e)),
+    };
+    let pulls = match state.db.query("SELECT game_id, team, min(sec) FROM nhl_shots_api WHERE game_id = ANY($1) AND period = 3 \
+        AND COALESCE(period_type, 'REG') = 'REG' AND skaters LIKE '6%' GROUP BY 1, 2", &[&ids]).await {
+        Ok(r) => r.len(), Err(e) => return internal(dberr(&e)),
+    };
+    let (mut r2, mut r2_no_en, mut r_en, mut r_ot, mut r_six) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for r in &real {
+        let (m, en_diff, en): (i32, i64, i64) = (r.get(1), r.get(2), r.get(3));
+        r_ot += matches!(r.get::<_, Option<String>>(4).as_deref(), Some("OT" | "SO")) as i32 as f64;
+        r_six += r.get::<_, i64>(5) as f64;
+        r2 += (m.abs() >= 2) as i32 as f64;
+        r2_no_en += ((m as i64 - en_diff).abs() >= 2) as i32 as f64;
+        r_en += en as f64;
+    }
+    let nr = real.len().max(1) as f64;
+    // simulated
+    let (mut s2, mut s2_no_en, mut s_en, mut s_pull, mut s_en_after_pull, mut games) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0_f64);
+    let (mut s_ot, mut s_six) = (0.0, 0.0);
+    let mut pull_secs: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    let mut errors = Vec::new();
+    let mut tune = Tuning::default();
+    if let Some(v) = q.pull_earlier_secs { tune.pull_earlier_secs = v.clamp(0.0, 240.0); }
+    if let Some(v) = q.pull_earlier_down2_secs { tune.pull_earlier_down2_secs = v.clamp(0.0, 240.0); }
+    if let Some(v) = q.en_scoring { tune.en_scoring = v.clamp(0.5, 2.0); }
+    let tuning = json!({ "pull_earlier_secs": tune.pull_earlier_secs, "pull_earlier_down2_secs": tune.pull_earlier_down2_secs, "en_scoring": tune.en_scoring });
+    let o = Opts { mode: LineupMode::Projected, out: HashSet::new(), force_in: HashSet::new(), away_goalie: None, home_goalie: None, tune };
+    for id in &ids {
+        let gref = match game_ref(&state.db, *id).await { Ok(g) => g, Err(e) => { errors.push(json!({ "game": id, "error": e })); continue } };
+        let Built { game, .. } = match build(&state, &gref, &o).await { Ok(b) => b, Err(e) => { errors.push(json!({ "game": id, "error": e })); continue } };
+        let seed = sim::derive_seed(0x656e, &[&id.to_string()]);
+        let res = match web::block(move || sim::sample(&game, n, 50, seed, &|r: &sim::GameResult| (r.score, r.en_goals, r.pull, r.overtime, r.six_goals[0] + r.six_goals[1]))).await {
+            Ok(v) => v, Err(e) => { errors.push(json!({ "game": id, "error": e.to_string() })); continue }
+        };
+        let k = res.len().max(1) as f64;
+        for (score, en, pull, ot, six) in &res {
+            s_ot += *ot as i32 as f64 / k;
+            s_six += *six as f64 / k;
+            let m = score[1] - score[0];
+            s2 += (m.abs() >= 2) as i32 as f64 / k;
+            s2_no_en += ((m - (en[1] - en[0])).abs() >= 2) as i32 as f64 / k;
+            s_en += (en[0] + en[1]) as f64 / k;
+            let pulled = pull.iter().filter(|p| p.0 >= 0).count();
+            s_pull += pulled as f64 / k;
+            if pulled > 0 { s_en_after_pull += (en[0] + en[1] > 0) as i32 as f64 / k; }
+            for p in pull.iter().filter(|p| p.0 >= 0) { if (1..=2).contains(&p.1) && pull_secs[(p.1 - 1) as usize].len() < 200_000 { pull_secs[(p.1 - 1) as usize].push(p.0 as f64); } }
+        }
+        games += 1.0;
+    }
+    let g = games.max(1.0);
+    let mean = |v: &Vec<f64>| if v.is_empty() { Value::Null } else { json!(r3(v.iter().sum::<f64>() / v.len() as f64)) };
+    HttpResponse::Ok().json(json!({
+        "games": ids.len(), "simulated": games, "sims_per_game": n, "tuning": tuning,
+        "real": { "margin_2plus": r4(r2 / nr), "margin_2plus_without_en_goals": r4(r2_no_en / nr), "en_goals_per_game": r3(r_en / nr),
+                  "pulls_per_game_proxy": r3(pulls as f64 / nr), "overtime": r4(r_ot / nr), "six_skater_goals_per_game": r3(r_six / nr) },
+        "sim": { "margin_2plus": r4(s2 / g), "margin_2plus_without_en_goals": r4(s2_no_en / g), "en_goals_per_game": r3(s_en / g),
+                 "pulls_per_game": r3(s_pull / g), "overtime": r4(s_ot / g), "six_skater_goals_per_game": r3(s_six / g), "share_of_games_with_a_pull_and_an_en_goal": r4(s_en_after_pull / g),
+                 "mean_secs_left_at_pull": { "down_1": mean(&pull_secs[0]), "down_2": mean(&pull_secs[1]) } },
+        "errors": errors.into_iter().take(10).collect::<Vec<_>>(),
+    }))
 }

@@ -70,6 +70,12 @@ pub struct League {
     pub en_goal_pct: f64,          // goals per unblocked attempt on an empty net
     pub sixv5_att60: f64,          // attempts per 60 by the team with six skaters
     pub home_edge: f64,            // attempt-rate multiplier for the home team
+    /// seconds earlier than the drawn time that a team down 1 / down 2 pulls (tuning; research R8)
+    #[serde(default)]
+    pub pull_shift: [f64; 2],
+    /// multiplier on the goal rate of shots on an empty net (tuning; 1 = as fitted)
+    #[serde(default = "one")]
+    pub en_scale: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -208,6 +214,12 @@ pub struct GameResult {
     pub shootout: bool,
     /// [away, home] score after the 1st period
     pub seg: [i32; 2],
+    /// goals each team scored into an empty net (diagnostics: research R8)
+    pub en_goals: [i32; 2],
+    /// seconds left in the 3rd when each team first pulled its goalie (-1: never) and its deficit then
+    pub pull: [(i32, i32); 2],
+    /// goals each team scored with its own goalie pulled
+    pub six_goals: [i32; 2],
 }
 
 struct Pen { team: usize, left: f64, minor: bool }
@@ -224,6 +236,9 @@ struct G<'a> {
     pens: Vec<Pen>,
     pulled: [bool; 2],
     pull_at: [f64; 2],
+    en_goals: [i32; 2],
+    first_pull: [(i32, i32); 2],
+    six_goals: [i32; 2],
     events: Option<&'a mut Vec<Event>>,
 }
 
@@ -309,7 +324,7 @@ impl<'a> G<'a> {
         self.stats[t][si][SOG] += 1;
         self.shots[t] += 1;
         let (goal, xg) = if en {
-            let p = lg.en_goal_pct;
+            let p = (lg.en_goal_pct * lg.en_scale).min(0.95);
             (self.rng.f64() < p, p)
         } else {
             let xg = lg.xg.p(xy.0 as f64, xy.1 as f64, xy.2 as usize, s == PP);
@@ -323,6 +338,8 @@ impl<'a> G<'a> {
         }
         self.stats[t][si][GOALS] += 1;
         self.score[t] += 1;
+        if en { self.en_goals[t] += 1; }
+        if self.pulled[t] { self.six_goals[t] += 1; }
         let mates: Vec<usize> = (0..ot.skaters.len()).filter(|&i| i != si && ot.skaters[i].p_active > 0.5).collect();
         let mut a1 = None;
         let mut a2 = None;
@@ -385,8 +402,10 @@ impl<'a> G<'a> {
             // pull the goalie when trailing by 1-2 at the drawn time
             for t in 0..2 {
                 let deficit = self.score[1 - t] - self.score[t];
-                if self.period == 3 && !self.pulled[t] && (1..=2).contains(&deficit) && self.pull_at[t] > 0.0 && self.clock <= self.pull_at[t] {
+                let shift = if (1..=2).contains(&deficit) { self.g.league.pull_shift[(deficit - 1) as usize] } else { 0.0 };
+                if self.period == 3 && !self.pulled[t] && (1..=2).contains(&deficit) && self.pull_at[t] > 0.0 && self.clock <= self.pull_at[t] + shift {
                     self.pulled[t] = true;
+                    if self.first_pull[t].0 < 0 { self.first_pull[t] = (self.clock.round() as i32, deficit); }
                     self.emit("goalie_pulled", t, None, None, None, None, "", None, 0.0, false, 0);
                 }
                 if self.pulled[t] && deficit <= 0 { self.pulled[t] = false; }
@@ -397,7 +416,10 @@ impl<'a> G<'a> {
             // the next state change: penalty expiry, pull time, period end
             let mut horizon = self.clock;
             for p in &self.pens { horizon = horizon.min(p.left); }
-            for t in 0..2 { if self.period == 3 && !self.pulled[t] && self.pull_at[t] > 0.0 && self.pull_at[t] < self.clock { horizon = horizon.min(self.clock - self.pull_at[t]); } }
+            for t in 0..2 {
+                let at = self.pull_at[t] + self.g.league.pull_shift[1];  // the earliest a pull can come
+                if self.period == 3 && !self.pulled[t] && self.pull_at[t] > 0.0 && at < self.clock { horizon = horizon.min(self.clock - at); }
+            }
             if next >= horizon {
                 self.advance(horizon.max(1e-6));
                 continue;
@@ -414,7 +436,7 @@ impl<'a> G<'a> {
 pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) -> GameResult {
     let n = [g.teams[0].skaters.len(), g.teams[1].skaters.len()];
     let mut s = G { g, rng, period: 1, clock: 1200.0, score: [0, 0], shots: [0, 0], saves: [0, 0],
-        stats: [vec![[0; NST]; n[0]], vec![[0; NST]; n[1]]], pens: Vec::new(), pulled: [false, false], pull_at: [-1.0, -1.0], events };
+        stats: [vec![[0; NST]; n[0]], vec![[0; NST]; n[1]]], pens: Vec::new(), pulled: [false, false], pull_at: [-1.0, -1.0], en_goals: [0, 0], first_pull: [(-1, 0); 2], six_goals: [0, 0], events };
     let mut shootout = false;
     let mut first = [0, 0];
     for p in 1..=3 {
@@ -464,7 +486,7 @@ pub fn play_game(g: &GameInput, rng: &mut Rng, events: Option<&mut Vec<Event>>) 
     s.clock = 0.0;
     s.emit("game_end", 0, None, None, None, None, "", None, 0.0, false, 0);
     let active = [0, 1].map(|t| g.teams[t].skaters.iter().map(|k| k.p_active > 0.5).collect::<Vec<_>>());
-    GameResult { score: s.score, stats: s.stats, active, shots: s.shots, saves: s.saves, overtime: s.period >= 4, shootout, seg: first }
+    GameResult { score: s.score, stats: s.stats, active, shots: s.shots, saves: s.saves, overtime: s.period >= 4, shootout, seg: first, en_goals: s.en_goals, pull: s.first_pull, six_goals: s.six_goals }
 }
 
 pub fn single_game(g: &GameInput, seed: u64) -> (GameResult, Vec<Event>) {
@@ -613,7 +635,7 @@ mod tests {
         let lg = League { season: 2026, att60: [55.0, 95.0, 20.0], blocked: [0.25, 0.15, 0.3], missed: [0.22, 0.22, 0.2], pen60: 3.0,
             pen_durations: vec![2, 2, 2, 2, 4, 5], xg: Xg { b0: -1.2, dist: -0.055, angle: -0.6, pp: 0.25, types: [0.0, 0.05, 0.0, -0.1, 0.2, 0.2, -0.3, 0.0] },
             p_assist1: [0.88, 0.95, 0.75], p_assist2: [0.70, 0.82, 0.5], ot3_att60: 80.0, so_pct: 0.32, pull_secs_left: vec![90, 100, 110, 120, 140],
-            pull_rate: 0.8, en_att60: 60.0, en_goal_pct: 0.3, sixv5_att60: 110.0, home_edge: 1.03 };
+            pull_rate: 0.8, en_att60: 60.0, en_goal_pct: 0.3, sixv5_att60: 110.0, home_edge: 1.03, pull_shift: [0.0; 2], en_scale: 1.0 };
         let team = |abbr: &str| Team { abbr: abbr.into(),
             skaters: (0..18).map(|i| Skater { id: i, name: format!("S{i}"), pos: if i < 12 { "F".into() } else { "D".into() }, p_active: 1.0,
                 att_share: [1.0 / 18.0; 3], ast_share: [1.0 / 18.0; 3], finish: 1.0, accuracy: 1.0, block_share: if i < 12 { 0.03 } else { 0.1 },
@@ -642,6 +664,19 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn earlier_pulls_mean_more_empty_net_goals() {
+        let en = |shift: f64, scale: f64| {
+            let mut g = toy(false);
+            g.league.pull_shift = [shift, shift + 30.0 * (shift > 0.0) as i32 as f64];
+            g.league.en_scale = scale;
+            sample(&g, 6000, 20, 11, &|r: &GameResult| r.en_goals[0] + r.en_goals[1]).iter().sum::<i32>()
+        };
+        let base = en(0.0, 1.0);
+        assert!(en(60.0, 1.0) > base, "pulling earlier gives more empty-net goals");
+        assert!(en(0.0, 1.5) > base, "a higher empty-net goal rate gives more");
+    }
+
     #[test]
     fn realistic() {
         let e = simulate(&toy(false), 20000, 50, 7);
