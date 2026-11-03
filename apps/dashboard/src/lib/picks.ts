@@ -29,6 +29,20 @@ export interface Pick {
   validation_status?: MarketStatus;
   qualification?: Qualification;
   feed_quarantined?: boolean;
+  /** the four evaluation steps: projection, probability vs the current price, trust, and what to recheck */
+  evaluation?: Evaluation;
+}
+
+export interface Check { key: string; ok: boolean | null; text: string }
+export interface Evaluation {
+  projection: { value: number | null; line: number | null; engine: string; model_version: string; ledger_id: number; published_at: string };
+  price: {
+    p_model: number; p_market: number; implied: number; price: number; line: number | null; edge: number; ev: number; grade: string; moved: boolean;
+    published: { price: number; line: number | null; p_market: number; edge: number; ev: number; grade: string };
+    fair_price: number | null; playable_price: number | null;
+  };
+  trust: { tier: Tier; cap: string; grade: string; model_quality?: string; validation_status?: MarketStatus };
+  checks: Check[]; checks_ok: number; checks_total: number; all_clear: boolean;
 }
 
 export type MarketStatus = "verified" | "model_only" | "no_signal" | "losing" | "insufficient_data";

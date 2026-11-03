@@ -1437,6 +1437,10 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
                 let want: Vec<&str> = want.split(',').collect();
                 picks.retain(|p| p["qualification"].as_str().map(|s| want.contains(&s)).unwrap_or(false));
             }
+            if q.sort.as_deref() == Some("price") {
+                let ev = |p: &Value| p["ev_now"].as_f64().unwrap_or(f64::MIN);
+                picks.sort_by(|a, b| ev(b).total_cmp(&ev(a)));
+            }
             HttpResponse::Ok().json(json!({ "count": picks.len(), "picks": picks }))
         }
         Err(e) => internal(dberr(&e)),
@@ -1449,9 +1453,14 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
 fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
     let key = (v["engine"].as_str().unwrap_or("").to_string(), v["market"].as_str().unwrap_or("").to_string());
     let (quality, status) = st.get(&key).cloned().unwrap_or_else(|| ("I".into(), "insufficient_data".into()));
-    // EV at the latest price when the line has moved, else at the published one
-    let ev_now = match (v["latest"]["price"].as_i64(), v["latest"]["line"].as_f64().or(v["line"].as_f64()) == v["line"].as_f64()) {
-        (Some(p), true) => { let pm = v["p_model"].as_f64().unwrap_or(0.0); pm * (decimal(p as i32) - 1.0) - (1.0 - pm) }
+    // EV at the latest price: at the published line with the published probability; after a line
+    // move with the probability at the new line (latest edge + latest market probability)
+    let l = &v["latest"];
+    let same_line = l["line"].as_f64().or(v["line"].as_f64()) == v["line"].as_f64();
+    let ev_at = |pm: f64, p: i64| pm * (decimal(p as i32) - 1.0) - (1.0 - pm);
+    let ev_now = match (l["price"].as_i64(), same_line, l["edge"].as_f64(), l["p_market"].as_f64()) {
+        (Some(p), true, _, _) => ev_at(v["p_model"].as_f64().unwrap_or(0.0), p),
+        (Some(p), false, Some(e), Some(m)) => ev_at(e + m, p),
         _ => v["ev"].as_f64().unwrap_or(0.0),
     };
     let feed_bad = st.contains_key(&(format!("q:{}", v["sport"].as_str().unwrap_or("")), format!("{}|{}", key.1, v["book"].as_str().unwrap_or(""))));
@@ -1467,7 +1476,62 @@ fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
     v["opportunity_grade"] = json!(crate::validation::opportunity_grade(ev_now));
     v["ev_now"] = json!(r3(ev_now));
     v["qualification"] = json!(crate::validation::qualification(&status, ev_now, suspended, v["edge"].as_f64().unwrap_or(0.0)));
+    v["evaluation"] = evaluation(v, Utc::now());
 }
+
+/// The four steps of evaluating a pick (the "How it works" tab): a current
+/// projection, its probability against the price, the case and the trust behind
+/// it, and what to recheck before acting. The price grade follows the current
+/// price; the official `grade` stays capped by the market's track record.
+pub(crate) fn evaluation(v: &Value, now: DateTime<Utc>) -> Value {
+    let f = |k: &str| v[k].as_f64();
+    let latest = &v["latest"];
+    let flag = |c: &str| v["risk_flags"].as_array().map(|a| a.iter().any(|x| x["code"] == c)).unwrap_or(false);
+    let open = v["status"] == "open";
+    let time = |x: &Value| x.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&Utc));
+    let started = !open || time(&v["starts_at"]).map(|t| t <= now).unwrap_or(false);
+    let moved = latest["line"].as_f64().is_some() && latest["line"].as_f64() != f("line");
+    let price_now = latest["price"].as_i64().or(v["price"].as_i64()).unwrap_or(0) as i32;
+    let ev_now = f("ev_now").unwrap_or_else(|| f("ev").unwrap_or(0.0));
+    let seen = time(&latest["updated_at"]).or_else(|| time(&v["published_at"]));
+    let seen_min = seen.map(|t| (now - t).num_minutes());
+    let tier = v["tier"].as_str().unwrap_or("unproven");
+
+    let mut checks = vec![
+        json!({ "key": "not_started", "ok": !started, "text": if started { "The game has started: this is no longer a pick".to_string() } else { "The game has not started".to_string() } }),
+        json!({ "key": "value_now", "ok": ev_now > 0.0, "text": format!("{} EV per unit at the current price", if ev_now >= 0.0 { format!("+{:.1}%", ev_now * 100.0) } else { format!("{:.1}%", ev_now * 100.0) }) }),
+    ];
+    match (v["playable_now"].as_bool(), moved) {
+        (Some(ok), _) => checks.push(json!({ "key": "playable", "ok": ok, "text": if ok { format!("Best price still at or better than the playable {}", fmt_odds(v["playable_price"].as_i64())) }
+            else { format!("Price now worse than the playable {}", fmt_odds(v["playable_price"].as_i64())) } })),
+        (None, true) if open => checks.push(json!({ "key": "playable", "ok": null, "text": "The line moved since publishing: re-check the new number" })),
+        _ => {}
+    }
+    if let Some(m) = seen_min { if open { checks.push(json!({ "key": "price_fresh", "ok": m <= 90, "text": format!("Price last seen {}", if m < 1 { "just now".to_string() } else { format!("{m} min ago") }) })); } }
+    let news = flag("news_changed");
+    checks.push(json!({ "key": "news", "ok": !news, "text": if news { "A player's injury status changed after the price was set" } else { "No injury status change since the price was set" } }));
+    if flag("projected_lineup") { checks.push(json!({ "key": "lineup", "ok": false, "text": "Priced on projected lineups: confirm the lineup" })); }
+    if v["feed_quarantined"] == json!(true) { checks.push(json!({ "key": "feed", "ok": false, "text": "This book's odds feed is quarantined for this market" })); }
+    let ok = checks.iter().filter(|c| c["ok"] == json!(true)).count();
+    let total = checks.len();
+
+    json!({
+        "projection": { "value": f("projection"), "line": f("line"), "engine": v["engine"], "model_version": v["model_version"], "ledger_id": v["ledger_id"], "published_at": v["published_at"] },
+        "price": {
+            // after a line move, the model's probability at the new line (latest edge + latest market probability)
+            "p_model": match (moved, latest["edge"].as_f64(), latest["p_market"].as_f64()) { (true, Some(e), Some(m)) => Some(e + m), _ => f("p_model") },
+            "p_market": latest["p_market"].as_f64().or(f("p_market")), "implied": implied(price_now),
+            "price": price_now, "line": latest["line"].as_f64().or(f("line")), "edge": latest["edge"].as_f64().or(f("edge")), "ev": ev_now,
+            "grade": crate::validation::opportunity_grade(ev_now), "moved": moved,
+            "published": { "price": v["price"], "line": v["line"], "p_market": v["p_market"], "edge": v["edge"], "ev": v["ev"], "grade": crate::validation::opportunity_grade(f("ev").unwrap_or(0.0)) },
+            "fair_price": v["fair_price"], "playable_price": v["playable_price"],
+        },
+        "trust": { "tier": tier, "cap": tier_cap(tier), "grade": v["grade"], "model_quality": v["model_quality"], "validation_status": v["validation_status"] },
+        "checks": checks, "checks_ok": ok, "checks_total": total, "all_clear": ok == total,
+    })
+}
+
+fn fmt_odds(p: Option<i64>) -> String { p.map(|p| if p > 0 { format!("+{p}") } else { p.to_string() }).unwrap_or_else(|| "price".into()) }
 
 #[derive(Deserialize)]
 pub struct GetQ { #[serde(default)] include_held: bool }
@@ -1479,6 +1543,8 @@ pub async fn get(state: web::Data<State>, path: web::Path<i64>, q: web::Query<Ge
         Ok(Some(r)) => r, Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "no such pick" })), Err(e) => return internal(dberr(&e)),
     };
     let mut v = pick_json(&row, true);
+    let st = crate::validation::statuses(&state).await;
+    qualify(&mut v, &st);
     let facts: Json<Value> = row.get("facts");
     v["facts"] = facts.0;
     // every book's current quote for the same selection
@@ -1639,6 +1705,31 @@ mod tests {
         // power method: the favourite keeps more than the proportional 0.5798
         let (f, d) = (novig(-150, 130), novig(130, -150));
         assert!((f + d - 1.0).abs() < 1e-9 && f > 0.6 / (0.6 + 100.0 / 230.0) && f < 0.6);
+    }
+
+    #[test]
+    fn evaluation_follows_the_current_price_and_lists_what_to_recheck() {
+        let now = Utc::now();
+        let mut v = json!({
+            "status": "open", "starts_at": (now + chrono::Duration::hours(3)).to_rfc3339(), "published_at": (now - chrono::Duration::hours(2)).to_rfc3339(),
+            "line": 5.5, "price": 120, "p_model": 0.52, "p_market": 0.45, "edge": 0.07, "ev": 0.144, "ev_now": 0.064, "projection": 6.1,
+            "tier": "losing", "grade": "C", "playable_now": true, "playable_price": 105, "fair_price": -108, "risk_flags": [],
+            "latest": { "line": 5.5, "price": 105, "p_market": 0.47, "edge": 0.05, "updated_at": (now - chrono::Duration::minutes(10)).to_rfc3339() },
+        });
+        let e = evaluation(&v, now);
+        // the price grade follows the price now (+105), not the published +120; the official grade stays capped
+        assert_eq!(e["price"]["grade"], "A-");
+        assert_eq!(e["price"]["published"]["grade"], "A+");
+        assert_eq!(e["price"]["price"], 105);
+        assert_eq!(e["trust"]["cap"], "C");
+        assert_eq!(e["all_clear"], true);
+        v["risk_flags"] = json!([{ "code": "news_changed" }]);
+        v["latest"]["updated_at"] = json!((now - chrono::Duration::minutes(200)).to_rfc3339());
+        let e = evaluation(&v, now);
+        assert_eq!(e["all_clear"], false);
+        assert_eq!(e["checks_ok"].as_u64().unwrap() + 2, e["checks_total"].as_u64().unwrap());
+        v["starts_at"] = json!((now - chrono::Duration::minutes(1)).to_rfc3339());
+        assert_eq!(evaluation(&v, now)["checks"][0]["ok"], false);
     }
 
     #[test]

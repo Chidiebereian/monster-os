@@ -22,8 +22,8 @@ const SPORTS = [
 ];
 const KINDS = [{ key: "all", label: "All" }, { key: "prop", label: "Player Props" }, { key: "game", label: "Game Lines" }];
 const SIDES = [{ key: "all", label: "All" }, { key: "over", label: "Over" }, { key: "under", label: "Under" }];
-const SORTS = [{ key: "grade", label: "Grade" }, { key: "ev", label: "EV" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
-const TABS = [{ key: "picks", label: "Picks" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }, { key: "models", label: "Models" }];
+const SORTS = [{ key: "grade", label: "Rated" }, { key: "price", label: "Price now" }, { key: "ev", label: "EV" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
+const TABS = [{ key: "picks", label: "Picks" }, { key: "how", label: "How it works" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }, { key: "models", label: "Models" }];
 const QUALS = [{ key: "all", label: "Any status" }, ...QUALIFICATIONS.filter((q) => q.key !== "suspended").map((q) => ({ key: q.key, label: q.label }))];
 const qualTone: Record<Qualification, string> = {
   verified_edge: "text-emerald-light border-emerald/40", watchlist: "text-violet border-violet/40", high_uncertainty: "text-amber border-amber/40",
@@ -68,7 +68,7 @@ export function AiPicks() {
           </>
         }
       />
-      {tab === "picks" ? <Feed search={search} bankroll={bankroll} /> : tab === "edges" ? <StaleLines bankroll={bankroll} /> : tab === "models" ? <Models /> : <Record />}
+      {tab === "picks" ? <Feed search={search} bankroll={bankroll} /> : tab === "how" ? <HowItWorks /> : tab === "edges" ? <StaleLines bankroll={bankroll} /> : tab === "models" ? <Models /> : <Record />}
     </div>
   );
 }
@@ -250,34 +250,86 @@ function StakeChip({ stake, bankroll }: { stake: number | null; bankroll: number
   return <Chip tone="plain"><span title="Fractional Kelly on the blended probability, scaled by track record">Stake {pct(stake, 1)} · {money(stake * bankroll)}</span></Chip>;
 }
 
+const priceTone = (g: string) => (g === "F" ? "bg-crimson/10 text-crimson-light border-crimson/40" : gradeTone(g));
+
+/** Price grade (is the current price worth it?) beside the rated grade (capped by the market's track record). */
+function GradePair({ p, large }: { p: Pick; large?: boolean }) {
+  const e = p.evaluation;
+  const size = large ? "px-2 py-0.5 text-sm" : "px-1.5 py-0.5 text-xs";
+  return (
+    <span className="flex items-center gap-1.5">
+      {e && (
+        <span className={clsx("rounded border font-semibold", size, priceTone(e.price.grade))}
+          title={`Price grade: EV per unit at the current price (${signedPct(e.price.ev)}). It changes when the price moves.`}>
+          Price {e.price.grade}
+        </span>
+      )}
+      <span className={clsx("rounded border font-semibold", size, gradeTone(p.grade))}
+        title={`Rated grade: the edge grade capped by this market's track record (${p.tier}: at most ${e?.trust.cap ?? "?"}). ${TIER_TEXT[p.tier]}`}>
+        Rated {p.grade}
+      </span>
+    </span>
+  );
+}
+
+/** Step 4 at a glance: how many of the recheck items pass right now. */
+function ChecksChip({ p }: { p: Pick }) {
+  const e = p.evaluation;
+  if (!e) return null;
+  const bad = e.checks.filter((c) => c.ok !== true);
+  return (
+    <Chip tone="plain">
+      <span className={e.all_clear ? "text-emerald-light" : "text-amber"} title={bad.length ? bad.map((c) => c.text).join("\n") : "All recheck items pass right now"}>
+        {e.all_clear ? "✓" : "▲"} Recheck {e.checks_ok}/{e.checks_total}
+      </span>
+    </Chip>
+  );
+}
+
 function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: () => void }) {
   const title = p.kind === "prop" ? p.subject_name : p.game_label;
+  const e = p.evaluation;
+  const price = e?.price.price ?? p.price;
   return (
     <div onClick={onOpen} className="cursor-pointer rounded-xl border border-glass bg-surface/60 p-4 space-y-3 hover:border-violet/40 transition-colors flex flex-col">
       <div className="flex items-center gap-2">
         <Avatar p={p} />
-        <span className={clsx("rounded border px-1.5 py-0.5 text-xs font-semibold", gradeTone(p.grade))}>{p.grade}</span>
+        <GradePair p={p} />
         <span className="rounded bg-white/5 px-1.5 py-0.5 text-[11px] uppercase text-gray-400">{p.sport}</span>
-        {p.tier !== "proven" && <span className={clsx("text-[10px]", tierTone[p.tier])} title={TIER_TEXT[p.tier]}>{p.tier}</span>}
-        {p.qualification && <QualBadge q={p.qualification} />}
         <span className="ml-auto text-xs text-gray-400">{p.book_title}</span>
-        <span className="font-mono text-violet">{odds(p.price)}</span>
+        <span className="font-mono text-violet">{odds(price)}</span>
       </div>
       <div>
         <div className="font-semibold leading-tight">{title}</div>
-        <div className="text-sm text-gray-300">{p.label}</div>
+        <div className="text-sm text-gray-300">{p.label}{e?.price.moved && <span className="text-amber"> · now {num(e.price.line)}</span>}</div>
         <div className="text-xs text-gray-500 mt-0.5">{p.away} @ {p.home} · {startLabel(p.starts_at)}</div>
+      </div>
+      {/* step 2: model probability against the price */}
+      <div className="grid grid-cols-4 gap-1.5 text-center">
+        <Stat k="Model" v={pct(e?.price.p_model ?? p.p_model, 1)} />
+        <Stat k="Market" v={pct(e?.price.p_market ?? p.p_market, 1)} />
+        <Stat k="Edge" v={signedPct(e?.price.edge ?? p.edge)} tone={(e?.price.edge ?? p.edge) > 0 ? "pos" : "neg"} />
+        <Stat k="EV now" v={signedPct(e?.price.ev ?? p.ev)} tone={(e?.price.ev ?? p.ev) > 0 ? "pos" : "neg"} />
       </div>
       <div className="flex flex-wrap gap-1.5">
         <ProjChip p={p} />
-        <Chip>Prob {pct(p.p_model)}</Chip>
-        <Chip tone="pos">Edge {signedPct(p.edge)}</Chip>
+        {p.qualification && <QualBadge q={p.qualification} />}
+        <span className={clsx("self-center text-[10px]", tierTone[p.tier])} title={TIER_TEXT[p.tier]}>track record: {p.tier}</span>
         <StakeChip stake={p.stake} bankroll={bankroll} />
         <PlayableChip p={p} />
-        <GradesChip p={p} />
+        <ChecksChip p={p} />
       </div>
       <p className="text-xs text-gray-400 line-clamp-2 flex-1">{splitWriteup(p.writeup).case_for}</p>
       <BetButton p={p} />
+    </div>
+  );
+}
+
+function Stat({ k, v, tone }: { k: string; v: ReactNode; tone?: "pos" | "neg" }) {
+  return (
+    <div className="rounded-md border border-glass bg-white/[0.02] py-1">
+      <div className="text-[10px] uppercase text-gray-500">{k}</div>
+      <div className={clsx("font-mono text-sm", tone === "pos" ? "text-emerald-light" : tone === "neg" ? "text-crimson-light" : "text-gray-200")}>{v}</div>
     </div>
   );
 }
@@ -344,33 +396,47 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
   const f = p.facts;
   const moved = p.latest && p.latest.line != null && p.line != null && p.latest.line !== p.line;
   const w = splitWriteup(p.writeup);
+  const e = p.evaluation;
   return (
     <>
       <div className="flex items-center gap-4">
         <Avatar p={p} size={64} />
         <div className="space-y-1">
           <div className="flex items-center gap-2">
-            <span className={clsx("rounded border px-2 py-0.5 text-sm font-semibold", gradeTone(p.grade))}>{p.grade}</span>
+            <GradePair p={p} large />
             <span className="rounded bg-white/5 px-1.5 py-0.5 text-xs uppercase text-gray-400">{p.sport}</span>
-            <span className={clsx("text-xs", tierTone[p.tier])}>{TIER_TEXT[p.tier]}</span>
+            {p.qualification && <QualBadge q={p.qualification} />}
           </div>
           <div className="text-xl font-semibold">{p.kind === "prop" ? p.subject_name : p.game_label}</div>
           <div className="text-sm text-gray-400">{p.label} · {p.away} @ {p.home} · {startLabel(p.starts_at)}</div>
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
-        <Box><span className="text-gray-400 text-xs">{p.book_title}</span> <span className="font-mono text-violet text-lg">{odds(p.price)}</span></Box>
-        <Box tone="violet"><span className="text-xs text-gray-400">MODEL PROB</span> <span className="font-mono text-lg">{pct(p.p_model, 1)}</span></Box>
-        <Box><span className="text-xs text-gray-400">MARKET (NO-VIG)</span> <span className="font-mono text-lg">{pct(p.p_market, 1)}</span></Box>
-        <Box tone="pos"><span className="text-xs text-gray-400">EDGE</span> <span className="font-mono text-lg text-emerald-light">{signedPct(p.edge)}</span></Box>
-        <Box><span className="text-xs text-gray-400">EV / UNIT</span> <span className="font-mono text-lg">{signedPct(p.ev)}</span></Box>
-        {p.projection != null && !p.market.startsWith("moneyline") && (
-          <Box tone="violet"><span className="text-xs text-gray-400">{p.market.startsWith("spread") ? "PROJ MARGIN (HOME)" : "PROJ"}</span> <span className="font-mono text-lg">{num(p.projection, 2)}</span>
-            {p.line != null && !p.market.startsWith("spread") && <span className="text-xs text-gray-500"> / {num(p.line)}</span>}</Box>
-        )}
-      </div>
+      <Step n={1} title="Current projection" note={`${p.engine} · ${p.model_version} · frozen before the game (ledger #${p.ledger_id})`}>
+        <div className="flex flex-wrap gap-2">
+          {p.projection != null && !p.market.startsWith("moneyline") && (
+            <Box tone="violet"><span className="text-xs text-gray-400">{p.market.startsWith("spread") ? "PROJ MARGIN (HOME)" : "PROJECTION"}</span> <span className="font-mono text-lg">{num(p.projection, 2)}</span>
+              {p.line != null && !p.market.startsWith("spread") && <span className="text-xs text-gray-500"> vs line {num(p.line)}</span>}</Box>
+          )}
+          {f.q10 != null && <Box><span className="text-xs text-gray-400">MEDIAN · 80% RANGE</span> <span className="font-mono">{num(f.q50)} · {num(f.q10)}–{num(f.q90)}</span></Box>}
+          <Box><span className="text-xs text-gray-400">LINEUPS</span> <span className="text-sm">{f.lineup_mode ?? "—"}</span></Box>
+        </div>
+      </Step>
 
+      <Step n={2} title="Probability vs price" note={e?.price.moved ? "the line has moved: numbers below are at the current line and price" : "numbers below are at the current price"}>
+        <div className="flex flex-wrap gap-2">
+          <Box><span className="text-gray-400 text-xs">{p.book_title}</span> <span className="font-mono text-violet text-lg">{odds(e?.price.price ?? p.price)}</span>
+            {e && e.price.price !== p.price && <span className="text-xs text-gray-500"> published {odds(p.price)}</span>}</Box>
+          <Box tone="violet"><span className="text-xs text-gray-400">MODEL PROB</span> <span className="font-mono text-lg">{pct(e?.price.p_model ?? p.p_model, 1)}</span></Box>
+          <Box><span className="text-xs text-gray-400">MARKET (NO-VIG)</span> <span className="font-mono text-lg">{pct(e?.price.p_market ?? p.p_market, 1)}</span></Box>
+          <Box tone="pos"><span className="text-xs text-gray-400">EDGE</span> <span className="font-mono text-lg text-emerald-light">{signedPct(e?.price.edge ?? p.edge)}</span></Box>
+          <Box><span className="text-xs text-gray-400">EV / UNIT</span> <span className="font-mono text-lg">{signedPct(e?.price.ev ?? p.ev)}</span></Box>
+          {e && <Box><span className="text-xs text-gray-400">PRICE GRADE</span> <span className="font-mono text-lg">{e.price.grade}</span>
+            {e.price.published.grade !== e.price.grade && <span className="text-xs text-gray-500"> was {e.price.published.grade}</span>}</Box>}
+        </div>
+      </Step>
+
+      <Step n={3} title="The case and the risk" note="why the model likes it, what could make it wrong, and how far to trust this market">
       <section className="space-y-2">
         <h3 className="text-xs uppercase tracking-wide text-gray-400">MonsterGPT analysis <span className="normal-case text-gray-600">· {p.writeup_source === "template" ? "written from the facts below" : `${p.writeup_source.replace("llm:", "")}, every number checked against the facts`}</span></h3>
         <div className="rounded-lg border border-glass bg-surface/60 p-4 text-sm leading-relaxed text-gray-200">{w.case_for}</div>
@@ -392,12 +458,30 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
         </section>
       )}
 
+      <section className="rounded-lg border border-glass bg-surface/60 p-4 space-y-1 text-sm">
+        <div className="flex items-center gap-2"><span className="text-xs uppercase tracking-wide text-gray-400">Trust</span>
+          <span className={tierTone[p.tier]}>track record: {p.tier}</span><span className="text-gray-500">· grades capped at {e?.trust.cap ?? "—"}</span><GradesChip p={p} /></div>
+        <div className="text-gray-300">{TIER_TEXT[p.tier]}. The rated grade is {p.grade}; the current price on its own grades {e?.price.grade ?? "—"}.</div>
+      </section>
+      </Step>
+
+      <Step n={4} title="Recheck before acting" note="odds, injuries and lineups can move after a pick is generated; confirm the live market and your own risk limit">
+        {e && (
+          <ul className="space-y-1 text-sm">
+            {e.checks.map((c) => (
+              <li key={c.key} className="flex gap-2">
+                <span className={c.ok === true ? "text-emerald-light" : c.ok === false ? "text-crimson-light" : "text-amber"}>{c.ok === true ? "✓" : c.ok === false ? "✗" : "?"}</span>
+                <span className="text-gray-300">{c.text}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Step>
+
       <section className="grid gap-4 md:grid-cols-2">
         <Card className="space-y-2">
           <div className="text-xs uppercase tracking-wide text-gray-400">Model</div>
           <Row k="Engine" v={`${p.engine} · ${p.model_version}`} />
-          <Row k="Lineups" v={f.lineup_mode ?? "—"} />
-          {f.q10 != null && <Row k="Median · 80% range" v={`${num(f.q50)} · ${num(f.q10)}–${num(f.q90)}`} />}
           {f.p_raw != null && <Row k="Engine alone · blended" v={`${pct(f.p_raw, 1)} · ${pct(p.p_model, 1)}`} />}
           {f.p_naive != null && <Row k="Own prior frequency" v={`${pct(f.p_naive, 1)} (naive baseline${f.w_naive != null ? `, model weight ${f.w_naive.toFixed(2)}` : ""})`} />}
           {f.w_market != null && <Row k="Trust vs market" v={`${f.w_market.toFixed(2)} · ${f.blend_text ?? ""}`} />}
@@ -452,6 +536,72 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
       )}
       <BetButton p={p} />
     </>
+  );
+}
+
+function Step({ n, title, note, children }: { n: number; title: string; note?: string; children: ReactNode }) {
+  return (
+    <section className="space-y-2">
+      <h3 className="flex items-baseline gap-2">
+        <span className="rounded-full border border-violet/40 bg-violet/10 px-2 text-xs font-mono text-violet">{n}</span>
+        <span className="font-medium">{title}</span>
+        {note && <span className="text-xs text-gray-500">{note}</span>}
+      </h3>
+      <div className="space-y-3">{children}</div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// How it works
+// ---------------------------------------------------------------------------
+
+function HowItWorks() {
+  const q = useQuery({ queryKey: ["picks-record", undefined, 3650], queryFn: () => picksApi.record(undefined, 3650) });
+  const all = q.data?.rows.find((r) => r.kind == null && r.sport == null);
+  const tiers = q.data?.tiers ?? [];
+  const count = (t: Tier) => tiers.filter((x) => x.tier === t).length;
+  const steps: [string, string][] = [
+    ["Start with a current projection", "Each sport's champion model simulates the game 100,000 times before it starts, from the data available then (teams, players, lineups), and the prediction is frozen with a hash so it cannot be edited later. A pick is only made from a projection for a game that has not started, and no new pick is made in the last two hours, when lines have mostly settled."],
+    ["Compare probability with price", "The model's probability for a side is read straight from the simulated outcomes. The market's probability comes from the book's two prices with the margin removed (power method). The model is then blended with the market, with a weight it has to earn on settled lines; a model that has never beaten the market cannot move the price. Edge is the blended probability minus the market's; EV is what the current price pays on that probability."],
+    ["Read the case and the risk", "Every pick carries a written case for it and a case against it, both limited to the numbers above, plus risk flags (push chance, projected lineups, a stale price). The track record says how far to trust the market: proven markets may grade up to A+, markets that beat only a naive model up to B+, unproven ones C+, and markets losing to their comparison C."],
+    ["Recheck before acting", "Odds, injuries and lineups move after a pick is published. Each pick lists what to recheck: has the game started, is there still value at the current price, is the price above its playable floor, was it seen recently, did a player's injury status change. A status change suspends the pick automatically. Confirm the live price and stay within your own risk limit."],
+  ];
+  return (
+    <div className="space-y-4 max-w-4xl">
+      <p className="text-sm text-gray-300">
+        A prediction estimates what may happen. A pick asks whether the current price offers enough value to consider. The same prediction can be worth a bet at one price and not
+        at the next, so every pick shows the model probability, the market probability, the price, the edge, two grades and the reasoning, in this order.
+      </p>
+      <div className="grid gap-3 md:grid-cols-2">
+        {steps.map(([t, d], i) => (
+          <Card key={t} className="space-y-1.5">
+            <div className="flex items-baseline gap-2"><span className="text-xs font-mono text-violet">STEP {String(i + 1).padStart(2, "0")}</span><span className="font-medium">{t}</span></div>
+            <p className="text-sm text-gray-400 leading-relaxed">{d}</p>
+          </Card>
+        ))}
+      </div>
+      <Card className="space-y-2">
+        <div className="font-medium">Two grades on every pick</div>
+        <div className="text-sm text-gray-400 space-y-1.5">
+          <p><span className="text-gray-200">Price grade</span> (A+ to F) is the expected value per unit at the current price: A+ at 10% or more, A at 7%, A− at 5%, B+ 4%, B 3%, B− 2%, C+ 1%, C above 0, F at or below 0. It changes whenever the price changes.</p>
+          <p><span className="text-gray-200">Rated grade</span> is the edge grade capped by the market's track record. A big edge in a market that has never beaten the closing line is far more often model error than value, so it is rated no higher than the record allows. Caps lift automatically once a market proves itself on settled picks.</p>
+        </div>
+      </Card>
+      <Card className="space-y-2">
+        <div className="font-medium">Track record today</div>
+        {q.error && <Msg tone="error">{(q.error as Error).message}</Msg>}
+        {all ? (
+          <div className="text-sm text-gray-400 space-y-1.5">
+            <p>{all.graded.toLocaleString()} settled picks · {all.wins}-{all.losses}-{all.pushes} · ROI {signedPct(all.roi)} at the published prices
+              {all.clv_n ? ` · average CLV ${signedPct(all.clv_mean)} over ${all.clv_n.toLocaleString()} picks with a closing price` : ""}.</p>
+            <p>Markets by track record: {count("proven")} proven, {count("baseline")} beat a naive model only, {count("unproven")} unproven, {count("losing")} losing to their comparison.
+              {count("proven") === 0 && " No market is proven right now, so no pick can be rated above B+, whatever its price grade."}</p>
+          </div>
+        ) : q.isLoading ? <Msg>Loading…</Msg> : <p className="text-sm text-gray-500">No settled picks yet.</p>}
+        <p className="text-xs text-gray-500">AI picks are estimates, not guarantees: injuries, lineups, weather, price moves, model assumptions and ordinary variance can change the result. See the Track record and Models tabs for the evidence behind every number.</p>
+      </Card>
+    </div>
   );
 }
 
