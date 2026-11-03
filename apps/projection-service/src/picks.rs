@@ -1443,7 +1443,10 @@ fn qualify(v: &mut Value, st: &HashMap<(String, String), (String, String)>) {
     let feed_bad = st.contains_key(&(format!("q:{}", v["sport"].as_str().unwrap_or("")), format!("{}|{}", key.1, v["book"].as_str().unwrap_or(""))));
     let held = st.contains_key(&(format!("h:{}", key.0), key.1.clone()));
     if held { v["publication_hold"] = json!(true); }
-    let suspended = v["status"] != "open" || v["playable_now"] == json!(false) || feed_bad || held;
+    // news circuit breaker (injury_snap.rs): a player's status changed after the price was set
+    let news = v["risk_flags"].as_array().map(|a| a.iter().any(|f| f["code"] == "news_changed")).unwrap_or(false);
+    if news { v["news_changed"] = json!(true); }
+    let suspended = v["status"] != "open" || v["playable_now"] == json!(false) || feed_bad || held || news;
     if feed_bad { v["feed_quarantined"] = json!(true); }
     v["model_quality"] = json!(quality);
     v["validation_status"] = json!(status);
