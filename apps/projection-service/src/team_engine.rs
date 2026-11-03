@@ -30,13 +30,68 @@ tuning!(Tuning {
     halflife_days: 120.0, 15.0, 1500.0, "recency half-life of past games, days";
     ridge: 2.0, 0.05, 50.0, "ridge prior pulling team ratings toward the league";
     lookback_days: 730.0, 120.0, 2200.0, "games older than this are ignored";
+    elo_weight: 0.0, 0.0, 1.0, "NFL only: share of the projected home margin taken from margin Elo (research R7) instead of the points model; the total is unchanged";
 });
+
+/// Margin Elo (research R7 step 2, `scripts/ml/r7_ratings.py`): ratings move after
+/// every game by K x a margin-of-victory factor x (result - expected); between
+/// seasons each rating keeps 2/3 of its distance from the mean; 25 Elo points
+/// are one point of margin.
+const ELO_K: f64 = 20.0;
+const ELO_SCALE: f64 = 25.0;
+const ELO_HFA: f64 = 48.0;
+const ELO_KEEP: f64 = 2.0 / 3.0;
+
+struct EloGame { season: i32, home: String, away: String, margin: f64 }
+
+/// Ratings after every game in order; returns (home rating, away rating, projected home margin) for the target.
+fn elo_margin(games: &[EloGame], season: i32, home: &str, away: &str) -> (f64, f64, f64) {
+    let mut r: HashMap<String, f64> = HashMap::new();
+    let mut cur: Option<i32> = None;
+    let regress = |r: &mut HashMap<String, f64>| {
+        if r.is_empty() { return; }
+        let mean = r.values().sum::<f64>() / r.len() as f64;
+        for v in r.values_mut() { *v = mean + ELO_KEEP * (*v - mean); }
+    };
+    for g in games {
+        if cur != Some(g.season) { if cur.is_some() { regress(&mut r); } cur = Some(g.season); }
+        let h = *r.get(&g.home).unwrap_or(&1500.0);
+        let a = *r.get(&g.away).unwrap_or(&1500.0);
+        let diff = h + ELO_HFA - a;
+        let expected = 1.0 / (1.0 + 10f64.powf(-diff / 400.0));
+        let result = if g.margin > 0.0 { 1.0 } else if g.margin < 0.0 { 0.0 } else { 0.5 };
+        let mov = (g.margin.abs() + 1.0).ln() * (2.2 / ((if result == 1.0 { diff } else { -diff }) * 0.001 + 2.2));
+        let delta = ELO_K * mov * (result - expected);
+        r.insert(g.home.clone(), h + delta);
+        r.insert(g.away.clone(), a - delta);
+    }
+    if cur.is_some() && cur != Some(season) { regress(&mut r); }
+    let (h, a) = (*r.get(home).unwrap_or(&1500.0), *r.get(away).unwrap_or(&1500.0));
+    (h, a, (h + ELO_HFA - a) / ELO_SCALE)
+}
+
+/// Every completed NFL game before the date since 2010, in order (the ratings need the long history).
+async fn elo_games(db: &tokio_postgres::Client, before: NaiveDate) -> Result<Vec<EloGame>, String> {
+    let rows = db.query("SELECT season, home_team, away_team, home_score - away_score FROM sports_games \
+                         WHERE sport = 'nfl' AND home_score IS NOT NULL AND away_score IS NOT NULL AND season >= 2010 AND game_date < $1 \
+                         ORDER BY game_date, game_id", &[&before]).await.map_err(|e| dberr(&e))?;
+    Ok(rows.iter().map(|r| EloGame { season: r.get(0), home: r.get(1), away: r.get(2), margin: r.get::<_, i32>(3) as f64 }).collect())
+}
+
+/// Move the projected margin toward Elo's, keeping the projected total.
+fn blend_margin(m: &mut Means, elo: f64, w: f64) {
+    if w <= 0.0 { return; }
+    let (t, own) = (m.mu_home + m.mu_away, m.mu_home - m.mu_away);
+    let margin = (1.0 - w) * own + w * elo;
+    m.mu_home = ((t + margin) / 2.0).max(0.5);
+    m.mu_away = ((t - margin) / 2.0).max(0.5);
+}
 
 /// Sport-specific defaults (NFL teams play 17 games a year, so they need a longer memory).
 fn defaults(sport: &str) -> Tuning {
     match sport {
-        "nfl" => Tuning { halflife_days: 365.0, ridge: 2.0, lookback_days: 1100.0 },
-        "nhl" => Tuning { halflife_days: 150.0, ridge: 2.0, lookback_days: 730.0 },
+        "nfl" => Tuning { halflife_days: 365.0, ridge: 2.0, lookback_days: 1100.0, elo_weight: 0.0 },
+        "nhl" => Tuning { halflife_days: 150.0, ridge: 2.0, lookback_days: 730.0, elo_weight: 0.0 },
         _ => Tuning::default(),
     }
 }
@@ -44,13 +99,15 @@ fn defaults(sport: &str) -> Tuning {
 pub fn tuning_for(sport: &str, cfg: &Value) -> Tuning {
     let d = defaults(sport);
     let g = |k: &str, v: f64| cfg.get(k).and_then(|x| x.as_f64()).unwrap_or(v);
-    Tuning { halflife_days: g("halflife_days", d.halflife_days), ridge: g("ridge", d.ridge), lookback_days: g("lookback_days", d.lookback_days) }
+    Tuning { halflife_days: g("halflife_days", d.halflife_days), ridge: g("ridge", d.ridge), lookback_days: g("lookback_days", d.lookback_days),
+             elo_weight: if sport == "nfl" { g("elo_weight", d.elo_weight) } else { 0.0 } }
 }
 
 pub fn tunables(sport: &str) -> Value {
     let mut v = Tuning::default().describe();
     let d = defaults(sport);
     for (k, x) in [("halflife_days", d.halflife_days), ("ridge", d.ridge), ("lookback_days", d.lookback_days)] { v[k]["default"] = json!(x); }
+    if sport != "nfl" { if let Some(o) = v.as_object_mut() { o.remove("elo_weight"); } }
     v
 }
 
@@ -220,20 +277,30 @@ fn game_forecasts(sport: &str, t: &Target, sims: &[(f64, f64)]) -> Vec<Forecast>
     }
 }
 
-async fn run(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64) -> Result<(Target, Means, Vec<(f64, f64)>, crate::segments::Joint), String> {
+/// The Elo side of an NFL projection: (home rating, away rating, Elo margin, weight used).
+type EloInfo = Option<(f64, f64, f64, f64)>;
+
+async fn run(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64) -> Result<(Target, Means, Vec<(f64, f64)>, crate::segments::Joint, EloInfo), String> {
     let tune = tuning_for(sport, cfg);
     let t = target(&state.db, sport, id).await?;
     let games = past(&state.db, sport, t.date, tune.lookback_days as i32).await?;
     if games.len() < 100 { return Err(format!("only {} completed games before {}", games.len(), t.date)); }
+    let elo_hist = if sport == "nfl" && tune.elo_weight > 0.0 { Some(elo_games(&state.db, t.date).await?) } else { None };
+    let season = crate::nfl_game::season_of(t.date);
     let (sport_s, tune2) = (sport.to_string(), tune.clone());
-    let (t, m, sims, h1) = actix_web::web::block(move || {
-        let m = fit_means(&games, &t, &tune2)?;
+    let (t, m, sims, h1, elo) = actix_web::web::block(move || {
+        let mut m = fit_means(&games, &t, &tune2)?;
+        let elo = elo_hist.map(|eg| {
+            let (h, a, margin) = elo_margin(&eg, season, &t.home, &t.away);
+            blend_margin(&mut m, margin, tune2.elo_weight);
+            (h, a, margin, tune2.elo_weight)
+        });
         let sims = simulate(&sport_s, &m, n, seed);
         let h1 = fit_means_h1(&games, &t, &tune2).map(|m1| simulate_h1(&sport_s, &m1, n, seed))
             .unwrap_or_else(|| crate::segments::Joint::for_sport(&sport_s));
-        Ok::<_, String>((t, m, sims, h1))
+        Ok::<_, String>((t, m, sims, h1, elo))
     }).await.map_err(|e| e.to_string())??;
-    Ok((t, m, sims, h1))
+    Ok((t, m, sims, h1, elo))
 }
 
 /// Integer distribution of simulated values: {"pmf_offset": min, "pmf": [P(min), P(min+1), ...]}.
@@ -248,7 +315,7 @@ fn int_dist(xs: impl Iterator<Item = f64>) -> Value {
 
 /// Production prediction for the ledger.
 pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u64, n: usize) -> Result<Prediction, String> {
-    let (t, m, sims, h1) = run(state, sport, id, cfg, n, seed).await?;
+    let (t, m, sims, h1, elo) = run(state, sport, id, cfg, n, seed).await?;
     let fc = forecasts(sport, &t, &sims, &h1);
     let nn = sims.len().max(1) as f64;
     let mean = |f: fn(&(f64, f64)) -> f64| sims.iter().map(f).sum::<f64>() / nn;
@@ -263,6 +330,7 @@ pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u6
         "market": { "spread": t.spread, "total": t.total },
         "forecasts": fc.iter().map(|f| json!({ "market": f.market, "line": f.line, "p": f.p_model })).collect::<Vec<_>>(),
         "fit": { "games": m.games, "teams": m.teams, "tuning": tuning_for(sport, cfg).describe() },
+        "elo": elo.map(|(h, a, margin, w)| json!({ "home": h.round(), "away": a.round(), "margin_home": (margin * 10.0).round() / 10.0, "weight": w })),
         "note": "team-points model refit on games strictly before the game date; no players or lineups",
     });
     Ok(Prediction { payload, forecasts: fc, date: t.date, start: t.start, engine: engine(sport), n: sims.len() })
@@ -271,7 +339,7 @@ pub async fn predict(state: &State, sport: &str, id: &str, cfg: &Value, seed: u6
 /// Walk-forward evaluation of one completed game.
 pub async fn evaluate(state: &State, sport: &str, id: &str, cfg: &Value, n: usize, seed: u64, outcomes: Option<Outcomes>) -> Result<Option<GameEval>, String> {
     let Some(o) = outcomes else { return Ok(None) };
-    let (t, _m, sims, h1) = match run(state, sport, id, cfg, n, seed).await { Ok(x) => x, Err(_) => return Ok(None) };
+    let (t, _m, sims, h1, _elo) = match run(state, sport, id, cfg, n, seed).await { Ok(x) => x, Err(_) => return Ok(None) };
     let fc = forecasts(sport, &t, &sims, &h1);
     let nn = sims.len().max(1) as f64;
     let sim_total = sims.iter().map(|x| x.1).sum::<f64>() / nn;
@@ -365,6 +433,20 @@ mod tests {
         // covering -8.5 is harder than winning
         assert!(p("home_cover") < p("home_win"));
         assert!(sims.iter().all(|x| x.0.abs() > 0.5), "NBA games always have a winner");
+    }
+
+    #[test]
+    fn elo_favours_the_team_that_keeps_winning_and_blending_keeps_the_total() {
+        let mut eg = Vec::new();
+        for s in 2020..2023 { for _ in 0..8 { eg.push(EloGame { season: s, home: "A".into(), away: "B".into(), margin: 10.0 }); eg.push(EloGame { season: s, home: "B".into(), away: "A".into(), margin: -7.0 }); } }
+        let (h, a, margin) = elo_margin(&eg, 2023, "A", "B");
+        assert!(h > a + 100.0 && margin > 4.0, "{h} {a} {margin}");
+        // a neutral pair gets just the home edge
+        let (_, _, even) = elo_margin(&eg, 2023, "C", "D");
+        assert!((even - ELO_HFA / ELO_SCALE).abs() < 1e-9);
+        let mut m = Means { mu_home: 24.0, mu_away: 20.0, dispersion: 10.0, games: 1, teams: 2 };
+        blend_margin(&mut m, -2.0, 0.5);
+        assert!((m.mu_home + m.mu_away - 44.0).abs() < 1e-9 && (m.mu_home - m.mu_away - 1.0).abs() < 1e-9);
     }
 
     #[test]
