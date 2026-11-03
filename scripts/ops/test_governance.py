@@ -226,7 +226,9 @@ def test_publication_state_in_production(production_unchanged):
 def test_every_public_reader_uses_the_shared_filter():
     src = {f: open(os.path.join(ROOT, "apps", "projection-service", "src", f), encoding="utf-8").read() for f in ("picks.rs", "game_hub.rs", "governance.rs")}
     # the picks list, pick detail, menus and the Games hub read ai_picks through governance::{public_filter, VISIBLE}
-    assert "governance::public_filter(q.include_hidden)" in src["picks.rs"]
+    assert "governance::public_filter()" in src["picks.rs"]
+    # every tier is visible since 2026-11-03 (picks are graded on price); only the publication state hides
+    assert "tier" not in src["governance.rs"].split("fn public_filter")[1].split("}")[0]
     assert src["picks.rs"].count("crate::governance::VISIBLE") >= 2 and src["game_hub.rs"].count("crate::governance::VISIBLE") >= 2
     # MonsterGPT only reads /picks (never the internal include_held view, never the database's ai_picks)
     gpt = "".join(open(os.path.join(ROOT, "apps", "monster-gpt", "src", f), encoding="utf-8").read()
@@ -528,11 +530,11 @@ def test_new_markets_stay_private_until_an_admin_publishes(scratch):
                                                               "decided_by": "mallory"}, tok=TOK["approver"])
     assert st == 200 and d["decided_by"] == "selftest" and d["previous"] == "unpublished"
     assert "brand_new_market" in visible() and "brand_new_market" in menus() and call(SCRATCH, "GET", f"/picks/{pid}")[0] == 200
-    # a routine tier change moves eligibility, never the publication state
+    # a routine tier change never changes the publication state, and no longer hides the pick
     n = owner_sql("SELECT count(*) FROM publication_holds")[0][0]
     with psycopg.connect(S_APP, autocommit=True) as cx:
         cx.execute("UPDATE ai_picks SET tier='unproven' WHERE id=%s", (pid,))
-        assert "brand_new_market" not in visible() and "brand_new_market" in visible("&include_hidden=true")
+        assert "brand_new_market" in visible()
         cx.execute("UPDATE ai_picks SET tier='baseline' WHERE id=%s", (pid,))
     assert "brand_new_market" in visible() and owner_sql("SELECT count(*) FROM publication_holds")[0][0] == n
 
