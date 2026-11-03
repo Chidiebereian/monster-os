@@ -5,7 +5,7 @@ import clsx from "clsx";
 import { ExternalLink, X } from "lucide-react";
 import { Card, Msg, PageTitle, Pills, Table, Td, Th } from "../components/ui";
 import {
-  BANKROLL_KEY, GRADES, QUALIFICATIONS, TIER_TEXT, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
+  BANKROLL_KEY, GRADES, QUALIFICATIONS, money, num, odds, pct, picksApi, readBankroll, signedPct, splitWriteup, startLabel, teamLogo,
   type Edge, type Experiment, type MarketStatus, type Pick, type PickDetail, type PickFilters, type Qualification, type ScoreMarket, type Scorecard, type Tier,
 } from "../lib/picks";
 
@@ -22,7 +22,7 @@ const SPORTS = [
 ];
 const KINDS = [{ key: "all", label: "All" }, { key: "prop", label: "Player Props" }, { key: "game", label: "Game Lines" }];
 const SIDES = [{ key: "all", label: "All" }, { key: "over", label: "Over" }, { key: "under", label: "Under" }];
-const SORTS = [{ key: "grade", label: "Rated" }, { key: "price", label: "Price now" }, { key: "ev", label: "EV" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
+const SORTS = [{ key: "grade", label: "Grade" }, { key: "ev", label: "EV" }, { key: "edge", label: "Edge" }, { key: "prob", label: "Prob" }, { key: "odds", label: "Odds" }];
 const TABS = [{ key: "picks", label: "Picks" }, { key: "how", label: "How it works" }, { key: "edges", label: "Stale lines" }, { key: "record", label: "Track record" }, { key: "models", label: "Models" }];
 const QUALS = [{ key: "all", label: "Any status" }, ...QUALIFICATIONS.filter((q) => q.key !== "suspended").map((q) => ({ key: q.key, label: q.label }))];
 const qualTone: Record<Qualification, string> = {
@@ -252,25 +252,20 @@ function StakeChip({ stake, bankroll }: { stake: number | null; bankroll: number
 
 const priceTone = (g: string) => (g === "F" ? "bg-crimson/10 text-crimson-light border-crimson/40" : gradeTone(g));
 
-/** Price grade (is the current price worth it?) beside the rated grade (capped by the market's track record). */
-function GradePair({ p, large }: { p: Pick; large?: boolean }) {
+/** The grade: EV per unit at the current price (track record and calibration live in the Track record and Models tabs). */
+function PriceGrade({ p, large }: { p: Pick; large?: boolean }) {
   const e = p.evaluation;
-  const size = large ? "px-2 py-0.5 text-sm" : "px-1.5 py-0.5 text-xs";
+  if (!e) return null;
   return (
-    <span className="flex items-center gap-1.5">
-      {e && (
-        <span className={clsx("rounded border font-semibold", size, priceTone(e.price.grade))}
-          title={`Price grade: EV per unit at the current price (${signedPct(e.price.ev)}). It changes when the price moves.`}>
-          Price {e.price.grade}
-        </span>
-      )}
-      <span className={clsx("rounded border font-semibold", size, gradeTone(p.grade))}
-        title={`Rated grade: the edge grade capped by this market's track record (${p.tier}: at most ${e?.trust.cap ?? "?"}). ${TIER_TEXT[p.tier]}`}>
-        Rated {p.grade}
-      </span>
+    <span className={clsx("rounded border font-semibold", large ? "px-2 py-0.5 text-sm" : "px-1.5 py-0.5 text-xs", priceTone(e.price.grade))}
+      title={`Grade: EV per unit at the current price (${signedPct(e.price.ev)}). It changes when the price moves.`}>
+      {e.price.grade}
     </span>
   );
 }
+
+/** Only price-related statuses on the feed: value gone, or suspended (started, price gone, news, feed). */
+const showQual = (q?: Qualification) => q === "no_value" || q === "suspended";
 
 /** Step 4 at a glance: how many of the recheck items pass right now. */
 function ChecksChip({ p }: { p: Pick }) {
@@ -294,7 +289,7 @@ function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: 
     <div onClick={onOpen} className="cursor-pointer rounded-xl border border-glass bg-surface/60 p-4 space-y-3 hover:border-violet/40 transition-colors flex flex-col">
       <div className="flex items-center gap-2">
         <Avatar p={p} />
-        <GradePair p={p} />
+        <PriceGrade p={p} />
         <span className="rounded bg-white/5 px-1.5 py-0.5 text-[11px] uppercase text-gray-400">{p.sport}</span>
         <span className="ml-auto text-xs text-gray-400">{p.book_title}</span>
         <span className="font-mono text-violet">{odds(price)}</span>
@@ -313,8 +308,7 @@ function PickCard({ p, bankroll, onOpen }: { p: Pick; bankroll: number; onOpen: 
       </div>
       <div className="flex flex-wrap gap-1.5">
         <ProjChip p={p} />
-        {p.qualification && <QualBadge q={p.qualification} />}
-        <span className={clsx("self-center text-[10px]", tierTone[p.tier])} title={TIER_TEXT[p.tier]}>track record: {p.tier}</span>
+        {showQual(p.qualification) && <QualBadge q={p.qualification!} />}
         <StakeChip stake={p.stake} bankroll={bankroll} />
         <PlayableChip p={p} />
         <ChecksChip p={p} />
@@ -337,18 +331,6 @@ function Stat({ k, v, tone }: { k: string; v: ReactNode; tone?: "pos" | "neg" })
 function QualBadge({ q }: { q: Qualification }) {
   const d = QUALIFICATIONS.find((x) => x.key === q);
   return <span className={clsx("rounded border px-1.5 py-0.5 text-[10px]", qualTone[q])} title={d?.text}>{d?.label ?? q}</span>;
-}
-
-/** Model quality (is the engine reliable here?) and opportunity (is this price worth it?), graded apart. */
-function GradesChip({ p }: { p: Pick }) {
-  if (!p.model_quality || !p.opportunity_grade) return null;
-  return (
-    <Chip tone="plain">
-      <span title="Model quality: the engine's validated reliability on this market (track record, calibration)">Model {p.model_quality}</span>
-      <span className="text-gray-600"> · </span>
-      <span title={`Opportunity: EV at the current price${p.ev_now != null ? ` (${signedPct(p.ev_now)})` : ""}`}>Price {p.opportunity_grade}</span>
-    </Chip>
-  );
 }
 
 /** Price sensitivity: how far the price can drift before the pick is no longer worth it. */
@@ -403,9 +385,9 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
         <Avatar p={p} size={64} />
         <div className="space-y-1">
           <div className="flex items-center gap-2">
-            <GradePair p={p} large />
+            <PriceGrade p={p} large />
             <span className="rounded bg-white/5 px-1.5 py-0.5 text-xs uppercase text-gray-400">{p.sport}</span>
-            {p.qualification && <QualBadge q={p.qualification} />}
+            {showQual(p.qualification) && <QualBadge q={p.qualification!} />}
           </div>
           <div className="text-xl font-semibold">{p.kind === "prop" ? p.subject_name : p.game_label}</div>
           <div className="text-sm text-gray-400">{p.label} · {p.away} @ {p.home} · {startLabel(p.starts_at)}</div>
@@ -431,12 +413,12 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
           <Box><span className="text-xs text-gray-400">MARKET (NO-VIG)</span> <span className="font-mono text-lg">{pct(e?.price.p_market ?? p.p_market, 1)}</span></Box>
           <Box tone="pos"><span className="text-xs text-gray-400">EDGE</span> <span className="font-mono text-lg text-emerald-light">{signedPct(e?.price.edge ?? p.edge)}</span></Box>
           <Box><span className="text-xs text-gray-400">EV / UNIT</span> <span className="font-mono text-lg">{signedPct(e?.price.ev ?? p.ev)}</span></Box>
-          {e && <Box><span className="text-xs text-gray-400">PRICE GRADE</span> <span className="font-mono text-lg">{e.price.grade}</span>
+          {e && <Box><span className="text-xs text-gray-400">GRADE</span> <span className="font-mono text-lg">{e.price.grade}</span>
             {e.price.published.grade !== e.price.grade && <span className="text-xs text-gray-500"> was {e.price.published.grade}</span>}</Box>}
         </div>
       </Step>
 
-      <Step n={3} title="The case and the risk" note="why the model likes it, what could make it wrong, and how far to trust this market">
+      <Step n={3} title="The case and the risk" note="why the model likes it and what could make it wrong">
       <section className="space-y-2">
         <h3 className="text-xs uppercase tracking-wide text-gray-400">MonsterGPT analysis <span className="normal-case text-gray-600">· {p.writeup_source === "template" ? "written from the facts below" : `${p.writeup_source.replace("llm:", "")}, every number checked against the facts`}</span></h3>
         <div className="rounded-lg border border-glass bg-surface/60 p-4 text-sm leading-relaxed text-gray-200">{w.case_for}</div>
@@ -458,11 +440,6 @@ function Detail({ p, bankroll }: { p: PickDetail; bankroll: number }) {
         </section>
       )}
 
-      <section className="rounded-lg border border-glass bg-surface/60 p-4 space-y-1 text-sm">
-        <div className="flex items-center gap-2"><span className="text-xs uppercase tracking-wide text-gray-400">Trust</span>
-          <span className={tierTone[p.tier]}>track record: {p.tier}</span><span className="text-gray-500">· grades capped at {e?.trust.cap ?? "—"}</span><GradesChip p={p} /></div>
-        <div className="text-gray-300">{TIER_TEXT[p.tier]}. The rated grade is {p.grade}; the current price on its own grades {e?.price.grade ?? "—"}.</div>
-      </section>
       </Step>
 
       <Step n={4} title="Recheck before acting" note="odds, injuries and lineups can move after a pick is generated; confirm the live market and your own risk limit">
@@ -564,7 +541,7 @@ function HowItWorks() {
   const steps: [string, string][] = [
     ["Start with a current projection", "Each sport's champion model simulates the game 100,000 times before it starts, from the data available then (teams, players, lineups), and the prediction is frozen with a hash so it cannot be edited later. A pick is only made from a projection for a game that has not started, and no new pick is made in the last two hours, when lines have mostly settled."],
     ["Compare probability with price", "The model's probability for a side is read straight from the simulated outcomes. The market's probability comes from the book's two prices with the margin removed (power method). The model is then blended with the market, with a weight it has to earn on settled lines; a model that has never beaten the market cannot move the price. Edge is the blended probability minus the market's; EV is what the current price pays on that probability."],
-    ["Read the case and the risk", "Every pick carries a written case for it and a case against it, both limited to the numbers above, plus risk flags (push chance, projected lineups, a stale price). The track record says how far to trust the market: proven markets may grade up to A+, markets that beat only a naive model up to B+, unproven ones C+, and markets losing to their comparison C."],
+    ["Read the case and the risk", "Every pick carries a written case for it and a case against it, both limited to the numbers above, plus risk flags (push chance, projected lineups, a stale price). How well each model is doing, and how it keeps learning and recalibrating, is on the Track record and Models tabs."],
     ["Recheck before acting", "Odds, injuries and lineups move after a pick is published. Each pick lists what to recheck: has the game started, is there still value at the current price, is the price above its playable floor, was it seen recently, did a player's injury status change. A status change suspends the pick automatically. Confirm the live price and stay within your own risk limit."],
   ];
   return (
@@ -582,10 +559,10 @@ function HowItWorks() {
         ))}
       </div>
       <Card className="space-y-2">
-        <div className="font-medium">Two grades on every pick</div>
+        <div className="font-medium">The grade</div>
         <div className="text-sm text-gray-400 space-y-1.5">
-          <p><span className="text-gray-200">Price grade</span> (A+ to F) is the expected value per unit at the current price: A+ at 10% or more, A at 7%, A− at 5%, B+ 4%, B 3%, B− 2%, C+ 1%, C above 0, F at or below 0. It changes whenever the price changes.</p>
-          <p><span className="text-gray-200">Rated grade</span> is the edge grade capped by the market's track record. A big edge in a market that has never beaten the closing line is far more often model error than value, so it is rated no higher than the record allows. Caps lift automatically once a market proves itself on settled picks.</p>
+          <p>Each pick's grade (A+ to F) is the expected value per unit at the current price: A+ at 10% or more, A at 7%, A− at 5%, B+ 4%, B 3%, B− 2%, C+ 1%, C above 0, F at or below 0. It changes whenever the price changes, and picks are sorted by it.</p>
+          <p>The grade takes the model's probability as given. Whether the models have earned that trust (backtests, settled results, calibration and the continuous learning loop) is shown on the Track record and Models tabs.</p>
         </div>
       </Card>
       <Card className="space-y-2">
@@ -596,7 +573,7 @@ function HowItWorks() {
             <p>{all.graded.toLocaleString()} settled picks · {all.wins}-{all.losses}-{all.pushes} · ROI {signedPct(all.roi)} at the published prices
               {all.clv_n ? ` · average CLV ${signedPct(all.clv_mean)} over ${all.clv_n.toLocaleString()} picks with a closing price` : ""}.</p>
             <p>Markets by track record: {count("proven")} proven, {count("baseline")} beat a naive model only, {count("unproven")} unproven, {count("losing")} losing to their comparison.
-              {count("proven") === 0 && " No market is proven right now, so no pick can be rated above B+, whatever its price grade."}</p>
+</p>
           </div>
         ) : q.isLoading ? <Msg>Loading…</Msg> : <p className="text-sm text-gray-500">No settled picks yet.</p>}
         <p className="text-xs text-gray-500">AI picks are estimates, not guarantees: injuries, lineups, weather, price moves, model assumptions and ordinary variance can change the result. See the Track record and Models tabs for the evidence behind every number.</p>

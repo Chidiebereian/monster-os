@@ -193,7 +193,7 @@ export const BANKROLL_KEY = "aiPicks.bankroll";
 export const readBankroll = () => { try { const v = Number(localStorage.getItem(BANKROLL_KEY)); return v > 0 ? v : 1000; } catch { return 1000; } };
 export const money = (x: number) => `$${x >= 100 ? Math.round(x).toLocaleString() : x.toFixed(2)}`;
 
-export const GRADES = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C"];
+export const GRADES = ["A+", "A", "A-", "B+", "B", "B-", "C+", "C", "F"];
 
 export const odds = (p: number | null | undefined) => (p == null ? "—" : p > 0 ? `+${p}` : `${p}`);
 export const pct = (x: number | null | undefined, d = 0) => (x == null ? "—" : `${(x * 100).toFixed(d)}%`);

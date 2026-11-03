@@ -1410,7 +1410,6 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     if let Some(s) = &q.sport { if s != "all" { f.add("sport = ?", Box::new(s.clone())); } }
     if let Some(k) = &q.kind { if k == "prop" || k == "game" { f.add("kind = ?", Box::new(k.clone())); } }
     if let Some(s) = &q.side { if s == "over" || s == "under" { f.add("side = ?", Box::new(s.clone())); } }
-    if let Some(g) = &q.grades { let gs: Vec<String> = g.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(); if !gs.is_empty() { f.add("grade = ANY(?)", Box::new(gs)); } }
     if let Some(m) = &q.market { if !m.is_empty() && m != "all" { f.add("market = ?", Box::new(m.clone())); } }
     if let Some(g) = &q.game { if !g.is_empty() && g != "all" { f.add("game_id = ?", Box::new(g.clone())); } }
     if let Some(b) = &q.book { if !b.is_empty() && b != "all" { f.add("book = ?", Box::new(b.clone())); } }
@@ -1425,7 +1424,9 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     let (w, p) = (f.w, f.p);
     let order = match q.sort.as_deref().unwrap_or("grade") {
         "edge" => "edge DESC", "ev" => "ev DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
-        _ => "array_position(ARRAY['A+','A','A-','B+','B','B-','C+','C'], grade), edge DESC",
+        // the grade shown is the price grade (EV at the current price), computed per pick below:
+        // fetch the newest picks and sort them after
+        _ => "published_at DESC",
     };
     let sql = format!("SELECT {PICK_COLS} FROM ai_picks {} ORDER BY {order} LIMIT {}", if w.is_empty() { String::new() } else { format!("WHERE {}", w.join(" AND ")) }, q.limit.unwrap_or(300).clamp(1, 1000));
     let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = p.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
@@ -1437,7 +1438,14 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
                 let want: Vec<&str> = want.split(',').collect();
                 picks.retain(|p| p["qualification"].as_str().map(|s| want.contains(&s)).unwrap_or(false));
             }
-            if q.sort.as_deref() == Some("price") {
+            // grades are price grades (EV at the current price); the track-record cap stays on the
+            // stored `grade` for the public filter, stakes and ranking elsewhere
+            let price_grade = |p: &Value| p["evaluation"]["price"]["grade"].as_str().unwrap_or("F").to_string();
+            if let Some(g) = q.grades.as_deref().filter(|g| !g.trim().is_empty()) {
+                let want: Vec<&str> = g.split(',').map(|x| x.trim()).collect();
+                picks.retain(|p| want.contains(&price_grade(p).as_str()));
+            }
+            if matches!(q.sort.as_deref(), None | Some("grade") | Some("price")) {
                 let ev = |p: &Value| p["ev_now"].as_f64().unwrap_or(f64::MIN);
                 picks.sort_by(|a, b| ev(b).total_cmp(&ev(a)));
             }
