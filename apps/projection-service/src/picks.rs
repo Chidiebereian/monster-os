@@ -1337,7 +1337,7 @@ pub async fn run_http(state: web::Data<State>, q: web::Query<RunQ>) -> impl Resp
 pub struct ListQ {
     sport: Option<String>, kind: Option<String>, side: Option<String>, grades: Option<String>, market: Option<String>, game: Option<String>,
     book: Option<String>, min_edge: Option<f64>, min_prob: Option<f64>, sort: Option<String>, q: Option<String>,
-    #[serde(default)] include_hidden: bool, status: Option<String>, limit: Option<i64>, qualification: Option<String>,
+    status: Option<String>, limit: Option<i64>, qualification: Option<String>,
     #[serde(default)] include_held: bool,
 }
 
@@ -1416,11 +1416,8 @@ pub async fn list(state: web::Data<State>, q: web::Query<ListQ>) -> impl Respond
     if let Some(e) = q.min_edge { f.add("edge >= ?", Box::new(e)); }
     if let Some(m) = q.min_prob { f.add("p_model >= ?", Box::new(m)); }
     if let Some(s) = &q.q { if !s.trim().is_empty() { f.add("(subject_name ILIKE ? OR game_label ILIKE ?)", Box::new(format!("%{}%", s.trim()))); } }
-    if q.include_held {
-        if !q.include_hidden { f.raw("tier IN ('proven','baseline')"); }
-    } else {
-        f.raw(&crate::governance::public_filter(q.include_hidden));
-    }
+    // every tier is visible (graded on price); an old include_hidden parameter is ignored
+    if !q.include_held { f.raw(&crate::governance::public_filter()); }
     let (w, p) = (f.w, f.p);
     let order = match q.sort.as_deref().unwrap_or("grade") {
         "edge" => "edge DESC", "ev" => "ev DESC", "prob" => "p_model DESC", "odds" => "price DESC", "start" => "starts_at ASC",
@@ -1632,7 +1629,8 @@ pub async fn meta(state: web::Data<State>, q: web::Query<MetaQ>) -> impl Respond
         json!({ "provider": r.get::<_, String>(0), "requests": r.get::<_, i32>(1), "units": r.get::<_, i32>(2) })).collect::<Vec<_>>()).unwrap_or_default();
     let fresh = db.query("SELECT source, sport, max(observed_at), count(*) FROM market_lines WHERE observed_at > now() - interval '1 day' GROUP BY 1,2 ORDER BY 1,2", &[]).await
         .map(|rows| rows.iter().map(|r| json!({ "source": r.get::<_, String>(0), "sport": r.get::<_, String>(1), "last": r.get::<_, DateTime<Utc>>(2), "rows": r.get::<_, i64>(3) })).collect::<Vec<_>>()).unwrap_or_default();
-    let hidden = db.query_one(&format!("SELECT count(*) FILTER (WHERE tier NOT IN ('proven','baseline')), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1) AND {vis}"), &[&sport]).await
+    // hidden = open picks in a suspended or unpublished market (a governance decision), not by tier
+    let hidden = db.query_one(&format!("SELECT count(*) FILTER (WHERE NOT {vis}), count(*) FROM ai_picks WHERE status='open' AND starts_at > now() AND ($1::text IS NULL OR sport=$1)"), &[&sport]).await
         .map(|r| json!({ "hidden": r.get::<_, i64>(0), "total": r.get::<_, i64>(1) })).unwrap_or(Value::Null);
     let holds = db.query("SELECT engine, market, reason, decided_at FROM publication_holds_active ORDER BY engine, market", &[]).await
         .map(|rows| rows.iter().map(|r| json!({ "engine": r.get::<_, String>(0), "market": r.get::<_, String>(1), "reason": r.get::<_, String>(2),

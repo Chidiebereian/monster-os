@@ -112,16 +112,15 @@ pub async fn whoami(req: HttpRequest, state: web::Data<State>) -> impl Responder
 // Publication
 // ---------------------------------------------------------------------------
 
-/// Default feed: the market is published (eligibility by tier is applied by the caller).
-pub(crate) const PUBLISHED: &str = "EXISTS (SELECT 1 FROM publication_state s WHERE s.engine = ai_picks.engine AND s.market = ai_picks.market AND s.status = 'published')";
 /// Anything public at all: published, or leans-only (shown with "include unproven").
 pub(crate) const VISIBLE: &str = "EXISTS (SELECT 1 FROM publication_state s WHERE s.engine = ai_picks.engine AND s.market = ai_picks.market AND s.status IN ('published', 'leans_only'))";
 pub(crate) const ELIGIBLE_TIERS: [&str; 2] = ["proven", "baseline"];
 
-/// The one public filter for ai_picks: default feed, or with lower tiers as leans.
-pub(crate) fn public_filter(include_lower_tiers: bool) -> String {
-    if include_lower_tiers { VISIBLE.to_string() } else { format!("tier IN ('proven','baseline') AND {PUBLISHED}") }
-}
+/// The one public filter for ai_picks: every pick in a market that is public at all
+/// (published or leans-only), whatever its track-record tier. Picks are graded on price;
+/// the track record is proven on the Track record and Models tabs. Suspended and
+/// unpublished markets stay hidden (that is a governance decision).
+pub(crate) fn public_filter() -> String { VISIBLE.to_string() }
 
 /// Safety rule (pure): a published market whose evidence tier is no longer eligible is suspended.
 pub(crate) fn safety_suspensions<'a>(published: &'a [(String, String)], tier: impl Fn(&str, &str) -> &'static str) -> Vec<(&'a str, &'a str, &'static str)> {
@@ -305,9 +304,9 @@ mod tests {
 
     #[test]
     fn public_filter_never_shows_unpublished_markets() {
-        let f = public_filter(false);
-        assert!(f.contains("tier IN ('proven','baseline')") && f.contains("status = 'published'"));
-        assert!(public_filter(true).contains("status IN ('published', 'leans_only')"));
+        let f = public_filter();
+        assert!(f.contains("status IN ('published', 'leans_only')"));
+        assert!(!f.contains("tier"), "every tier is visible: picks are graded on price");
     }
 
     #[test]

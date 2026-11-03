@@ -65,6 +65,7 @@ mod nhl_game;
 mod nhl_sim;
 mod nhl_teams;
 mod injury_snap;
+mod ops_status;
 mod proj_sync;
 mod segments;
 mod screen;
@@ -670,6 +671,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(state.clone())
             .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(ops_status::readyz))
+            .route("/ops/status", web::get().to(ops_status::ops_status))
             .route("/ingest/nfl", web::post().to(ingest_nfl))
             .route("/stats/nfl", web::get().to(list_stats))
             .route("/projections/nfl/{stat}", web::get().to(list_stat))

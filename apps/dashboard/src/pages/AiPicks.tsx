@@ -97,7 +97,6 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
   const [minEdge, setMinEdge] = useState(0);
   const [minProb, setMinProb] = useState(0);
   const [sort, setSort] = useState("grade");
-  const [hidden, setHidden] = useState(url.get("hidden") === "1");
   const [qual, setQual] = useState(url.get("qualification") ?? "all");
   const [open, setOpen] = useState<number | null>(url.get("pick") ? Number(url.get("pick")) : null);
   const q = useDebounced(search);
@@ -108,7 +107,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
   const filters: PickFilters = {
     sport: s, kind: kind === "all" ? undefined : kind, side: side === "all" ? undefined : side,
     grades: grades.length ? grades.join(",") : undefined, market, game, book,
-    min_edge: edge > 0 ? edge / 100 : undefined, min_prob: prob > 0 ? prob / 100 : undefined, sort, q, include_hidden: hidden,
+    min_edge: edge > 0 ? edge / 100 : undefined, min_prob: prob > 0 ? prob / 100 : undefined, sort, q,
     qualification: qual === "all" ? undefined : qual,
   };
   const picks = useQuery({ queryKey: ["picks", filters], queryFn: () => picksApi.list(filters), refetchInterval: 60_000 });
@@ -145,10 +144,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
           <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">Sort <Pills options={SORTS} value={sort} onChange={setSort} /></div>
         </div>
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-gray-500">
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={hidden} onChange={(e) => setHidden(e.target.checked)} className="accent-violet-500" />
-            Include unproven models{m?.counts ? ` (${m.counts.hidden} of ${m.counts.total} open picks are hidden)` : ""}
-          </label>
+          {m?.counts && <span>{m.counts.total - m.counts.hidden} open picks{m.counts.hidden > 0 ? ` · ${m.counts.hidden} held back: their market is suspended` : ""}</span>}
           <span>·</span>
           <Freshness meta={m} />
           <span>·</span>
@@ -166,9 +162,7 @@ function Feed({ search, bankroll }: { search: string; bankroll: number }) {
       {picks.data && picks.data.picks.length === 0 && (
         <Msg>
           No picks match.{" "}
-          {!hidden && m?.counts && m.counts.hidden > 0
-            ? `${m.counts.hidden} picks come from engines without a track record on their market and are hidden; tick "Include unproven models" to see them as leans.`
-            : "Picks appear when a champion engine has frozen a forecast for a game and a book's line disagrees with it by at least the minimum edge."}
+          Picks appear when a champion engine has frozen a forecast for a game and a book's line disagrees with it by at least the minimum edge.
           {s && <WhyNone sport={s} kind={kind === "all" ? undefined : kind} />}
         </Msg>
       )}

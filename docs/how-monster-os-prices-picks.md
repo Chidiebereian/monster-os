@@ -69,9 +69,16 @@ de-vigged market 36.2%, 89 games). Those markets are shown only as leans.
 - **Evidence tier** (proven / baseline / unproven / losing) summarises how an engine did on
   a market in backtests and on real lines.
 - **Publication state** (published / leans only / suspended / unpublished) is a separate,
-  human decision. A market reaches the default AI Picks feed only when it is published and
-  its tier qualifies. A new market starts unpublished. A safety rule suspends a published
-  market whose tier falls; only an admin restores it.
+  human decision. Since 2026-11-03 every pick in a published or leans-only market is in
+  the AI Picks feed whatever its tier: picks are graded on price (expected value per unit
+  at the current price, A+ to F), and the tier is shown on the Track record and Models
+  tabs instead. A tier still sets the stake (section 4) and how far the model may move the
+  price from the market. A new market starts unpublished. A safety rule suspends a
+  published market whose tier falls; only an admin restores it, and suspended or
+  unpublished markets stay out of the feed.
+- **Reading a high grade from a losing market:** a price grade says the price is good if
+  the model's probability is right. In a market whose tier is losing, large edges have
+  mostly been model error (NHL player points), so say so when recommending one.
 
 ## 4. Stake size
 
