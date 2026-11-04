@@ -216,17 +216,18 @@ def test_publication_state_in_production(production_unchanged):
         # markets with no decision whose first pick came after the cut-over: unpublished by design, never public
         late = cx.execute("""SELECT count(*), count(*) FILTER (WHERE a.published_at <= (SELECT max(decided_at) FROM publication_holds WHERE auth_method='seed'))
                              FROM ai_picks a WHERE NOT EXISTS (SELECT 1 FROM publication_state s WHERE s.engine=a.engine AND s.market=a.market)""").fetchone()
-        # markets the old rule showed whose picks the new rule does not: each must carry a later decision
-        # (the safety rule suspending it, or an admin changing it); nothing may be lost silently
+        # markets the old rule showed whose picks the new rule does not: each must carry a recorded
+        # publication decision (seeded as leans only, suspended by the safety rule, or changed by an admin);
+        # nothing may drop out of the published feed silently
         undecided = cx.execute("""
             SELECT count(DISTINCT (a.engine, a.market)) FROM ai_picks a WHERE a.status='open' AND a.starts_at > now() AND a.tier IN ('proven','baseline')
               AND NOT EXISTS (SELECT 1 FROM publication_holds h WHERE h.auth_method='migration' AND h.engine=a.engine AND h.market=a.market)
               AND NOT EXISTS (SELECT 1 FROM publication_state s WHERE s.engine=a.engine AND s.market=a.market AND s.status='published')
-              AND NOT EXISTS (SELECT 1 FROM publication_holds h WHERE h.engine=a.engine AND h.market=a.market AND h.auth_method IN ('safety_rule','admin_token'))""").fetchone()[0]
+              AND NOT EXISTS (SELECT 1 FROM publication_state s WHERE s.engine=a.engine AND s.market=a.market)""").fetchone()[0]
     assert HELD <= held
     assert late[1] == 0, "a market that had picks at the cut-over has no publication decision"
     # every pick the old rule showed is still shown, except picks of markets that appeared after the cut-over
-    # (unpublished until an admin decides) and markets the safety rule or an admin changed since (which only removes)
+    # (unpublished until an admin decides) and markets with a recorded decision that keeps them out of the published feed
     assert (lost == 0 or undecided == 0) and gained == 0
     assert (any_lost <= late[0] or suspended_since > 0) and any_gained == 0
     st, d = call(LIVE, "GET", "/picks?status=all&limit=1000&include_hidden=true")

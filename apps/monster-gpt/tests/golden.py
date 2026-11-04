@@ -17,6 +17,8 @@ Grading per question (all must hold):
   must_any at least one pattern matches
   forbid   no pattern matches
   abstain  the answer says it could not verify, and holds no number the question lacks
+A question with "turns" is a conversation: every turn is sent in order in one
+conversation, and the checks apply to the last answer (tools: called on any turn).
 """
 import argparse
 import datetime as dt
@@ -42,7 +44,7 @@ REPORTS = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), 
 ADMIN = ["docker", "exec", "monster-os-postgres-1", "psql", "-U", "monster", "-d", "postgres", "-q", "-c"]
 ABSTAIN = re.compile(r"(?i)((could not|couldn't|cannot|can't|unable to|not able to|don't have|do not have)[^.]{0,80}(verify|find|confirm|data|record|information)"
                      r"|no (relevant |stored |verified )?(information|data|record)s? (is |are )?(available|found|stored)|not available in)")
-WORKFLOWS = "ABCDEFG"
+WORKFLOWS = "ABCDEFGH"  # H: multi-turn (follow-ups, clarifications)
 
 
 def load():
@@ -57,6 +59,8 @@ def load():
         assert not (q.get("truth") or "").lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE")), q["id"]
         for p in q.get("forbid", []) + q.get("must_any", []):
             re.compile(p)
+    for q in g["questions"]:
+        assert isinstance(q.get("turns", [q["text"]]), list) and q.get("turns", [q["text"]])[0] == q["text"], f"{q['id']}: turns must start with text"
     missing = [w for w in WORKFLOWS if not any(q["workflow"] == w for q in g["questions"])]
     assert not missing, f"no question for workflow(s) {missing}"
     return g
@@ -172,11 +176,15 @@ def run(g, rows):
         tok = post("/session", {"user": "golden"})["token"]
         for q in g["questions"]:
             t0 = time.time()
+            answer, events, conv = "", [], None
             try:
-                r = post("/chat", {"text": q["text"]}, tok)
-                answer, events = r.get("answer", ""), r.get("events", [])
+                for turn in q.get("turns", [q["text"]]):
+                    r = post("/chat", {"text": turn, **({"conversation_id": conv} if conv else {})}, tok)
+                    answer = r.get("answer", "")
+                    events += r.get("events", [])
+                    conv = conv or next((e.get("conversation_id") for e in r.get("events", []) if e.get("type") == "ack"), None)
             except (urllib.error.URLError, TimeoutError) as e:
-                answer, events = "", [{"type": "error", "message": str(e)}]
+                answer, events = "", events + [{"type": "error", "message": str(e)}]
             fails, called = grade(q, answer, events, rows.get(q["id"]), g.get("aliases", {}))
             results.append({"id": q["id"], "workflow": q["workflow"], "pass": not fails, "fails": fails, "tools_called": called,
                             "expected": rows.get(q["id"]), "answer": answer, "seconds": round(time.time() - t0, 1)})

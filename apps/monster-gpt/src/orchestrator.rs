@@ -257,6 +257,70 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         detail: Some(format!("{}{}{}", router::describe(&route.filters), if route.inherited { " (kept from your last request)" } else { "" },
             if from_memory.is_empty() { String::new() } else { format!(" (saved: {})", from_memory.join(", ")) })), ms: Some(0) }).await;
 
+    // 1a. sports research (standings, champions, a player's or team's games): answered in
+    // code from stored records, so no language model writes the numbers (research.rs)
+    let prev_state: Value = match (&g.store, &conv) { (Some(s), Some(c)) => s.last_state(c).await.unwrap_or(Value::Null), _ => Value::Null };
+    if route.intent != Intent::Model {
+        let focus: Vec<String> = prev_state["entities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+        let mut forced: HashMap<String, String> = HashMap::new();
+        let mut original = req.text.clone();
+        let mut ask: Option<crate::research::Ask> = None;
+        // the reply to "which James do you mean?"
+        if let Some(cl) = prev_state.get("clarify").filter(|c| c.is_object()) {
+            let cands = cl["candidates"].as_array().cloned().unwrap_or_default();
+            if let Some(id) = crate::research::pick(&req.text, &cands) {
+                original = cl["text"].as_str().unwrap_or("").to_string();
+                if let Some(m) = cl["forced"].as_object() { for (k, v) in m { if let Some(v) = v.as_str() { forced.insert(k.clone(), v.into()); } } }
+                forced.insert(cl["mention"].as_str().unwrap_or("").to_string(), id);
+                ask = crate::research::detect(&original);
+            }
+        }
+        if ask.is_none() { ask = crate::research::detect(&req.text); }
+        if ask.is_none() {
+            if let Ok(p) = serde_json::from_value::<crate::research::Ask>(prev_state["research"].clone()) { ask = crate::research::follow_up(&req.text, &p); }
+        }
+        if ask.is_none() && crate::research::is_sim_request(&req.text) {
+            let reply = crate::research::SIM_REPLY.to_string();
+            send(ServerMsg::Status { request_id: rid.clone(), stage: "route".into(), name: "simulation".into(), state: "completed".into(),
+                detail: Some("simulation from chat is not available yet".into()), ms: Some(0) }).await;
+            send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
+            let usage = json!({ "simulation": "unavailable" });
+            let state = json!({ "intent": "simulation", "filters": route.filters });
+            let message_id = match (&g.store, &conv) {
+                (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &Value::Null, &json!([]), &state, None, &usage, false).await.ok(),
+                _ => None,
+            };
+            send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
+            return None;
+        }
+        if let Some(ask) = ask {
+            send(ServerMsg::Status { request_id: rid.clone(), stage: "route".into(), name: "research".into(), state: "completed".into(),
+                detail: Some(format!("{:?}{}", ask.kind.unwrap_or(crate::research::Kind::Stats), if forced.is_empty() { String::new() } else { " (with your choice)".into() })), ms: Some(0) }).await;
+            let out = crate::research::answer(&g.tools, &ask, &focus, &forced, &original).await;
+            let mut sources: Vec<Source> = Vec::new();
+            for c in &out.calls {
+                g.record_tool(c.tool, c.ok, c.ms);
+                if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
+                send(ServerMsg::Status { request_id: rid.clone(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(),
+                    detail: c.error.clone(), ms: Some(c.ms) }).await;
+                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); sources.push(src); }
+            }
+            if !out.entities.is_empty() { send(ServerMsg::Entities { request_id: rid.clone(), entities: json!(out.entities) }).await; }
+            send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
+            send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: out.reply.clone() }).await;
+            let usage = json!({ "research": true, "tools": out.calls.len() });
+            let mut state = out.state.clone();
+            state["intent"] = json!("research");
+            state["filters"] = json!(route.filters);
+            let message_id = match (&g.store, &conv) {
+                (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &out.reply, &Value::Null, &json!(sources), &state, None, &usage, false).await.ok(),
+                _ => None,
+            };
+            send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
+            return None;
+        }
+    }
+
     // 1b. several parlays with one amount and no "each"/"total": ask, don't guess
     if let (Intent::Bets, Some(v)) = (route.intent, route.filters.unclear_amount) {
         let n = route.filters.parlays.unwrap_or(2);
@@ -342,6 +406,32 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
 
     // 3. bet card from real picks
     let briefs: Vec<Value> = results.get("hub.brief").and_then(|v| v["games"].as_array().cloned()).unwrap_or_default();
+    // a matchup whose game is not on today's slate: say when it is, not a vague answer
+    if route.intent == Intent::Game && briefs.is_empty() {
+        let focus: Vec<String> = prev_state["entities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+        if let Some(out) = crate::research::next_game(&g.tools, &req.text, sport.clone(), &focus).await {
+            for c in &out.calls {
+                g.record_tool(c.tool, c.ok, c.ms);
+                if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
+                send(ServerMsg::Status { request_id: rid.clone(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(),
+                    detail: c.error.clone(), ms: Some(c.ms) }).await;
+                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); sources.push(src); }
+            }
+            send(ServerMsg::Entities { request_id: rid.clone(), entities: json!(out.entities) }).await;
+            send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
+            send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: out.reply.clone() }).await;
+            let usage = json!({ "next_game": true });
+            let mut state = out.state.clone();
+            state["intent"] = json!("game");
+            state["filters"] = json!(route.filters);
+            let message_id = match (&g.store, &conv) {
+                (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &out.reply, &Value::Null, &json!(sources), &state, None, &usage, false).await.ok(),
+                _ => None,
+            };
+            send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
+            return None;
+        }
+    }
     let named_games: Vec<String> = briefs.iter().filter_map(|b| b["game"].as_str().map(|s| s.to_string())).collect();
     let card: Option<Card> = match route.intent {
         Intent::Bets | Intent::Game => results.get("picks.today").map(|v| {

@@ -227,7 +227,8 @@ pub fn route(text: &str, prev: Option<&Filters>) -> Route {
     }
 
     let record = has(&l, &["track record", "record", "how have your", "how are your", "how did your", "win rate", "roi", "performance", "hit rate", "results so far"]);
-    let game = has(&l, &[" vs ", " vs. ", " versus ", " @ ", " against ", "preview", "break down", "breakdown", "matchup", "match up"]);
+    let game = has(&l, &[" vs ", " vs. ", " versus ", " @ ", " against ", "preview", "break down", "breakdown", "matchup", "match up",
+        "analyze the", "analyse the", "upcoming", "next game"]);
     let bets = has(&l, &["bet", "pick", "play", "lock", "parlay", "wager", "what should i", "best", "value", "edge", "props", "money on", "put on"]);
 
     // the answer to "is the $100 for each parlay or in total?"
@@ -436,6 +437,8 @@ mod tests {
     fn record_and_game_intents() {
         assert_eq!(route("how are your picks doing this month?", None).intent, Intent::Record);
         assert_eq!(route("break down Avalanche vs Flames", None).intent, Intent::Game);
+        assert_eq!(route("Analyze the upcoming Lakers game.", None).intent, Intent::Game);
+        assert_eq!(route("Break down Edmonton's next game.", None).intent, Intent::Game);
         assert_eq!(route("Explain no-vig fair odds", None).intent, Intent::General);
     }
 

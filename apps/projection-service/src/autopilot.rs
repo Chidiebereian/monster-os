@@ -126,6 +126,12 @@ pub fn spawn(state: web::Data<State>) {
                 if let Err(e) = &v { println!("autopilot projections sync {sport}: {e}"); }
                 mark(&s2.db, &job, v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
             }
+            // canonical players and teams for MonsterGPT (entities.rs), after the rosters sync; daily
+            if !paused(&s2.db).await && due(&s2.db, "entities:build", 1440).await {
+                let v = crate::entities::build_all(&s2).await;
+                if let Err(e) = &v { println!("autopilot entities build: {e}"); }
+                mark(&s2.db, "entities:build", v.is_ok(), &v.unwrap_or_else(|e| json!({ "error": e }))).await;
+            }
             // Games page / matchup hub (game_hub.rs, nfl_hub.rs): NFL EPA + FTN charting +
             // schedule every 3 h, and today's schedules pre-warmed for every sport
             if !paused(&s2.db).await && due(&s2.db, "hub:refresh", 180).await {

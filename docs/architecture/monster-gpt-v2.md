@@ -330,6 +330,28 @@ Ordered by what unlocks the seven workflows. Each step ends with tests and a rep
 | P7 | Dashboard: @ picker, claims and footnotes, research panel, job progress | UI |
 | P8 | Golden set to its gates; then new sports by registry review | release |
 
+### Status (2026-11-03)
+
+| Step | State | Where |
+| --- | --- | --- |
+| P2 | done | `scripts/ci/research_checks.py`, `scripts/ops/migrate.py`, migrations 0040-0043, `apps/monster-gpt/tests/golden.{json,py}` |
+| P3a | done; terms reviewed, statuses left pending by the owner | `entities.rs`, `teams.rs` (`stored_game_type`), migration 0044, `data-foundation.md` |
+| P3b | done (head-to-head is `kb.results` with an opponent) | `projection-service/src/knowledge.rs`: `/kb/standings`, `/kb/champions`, `/kb/player_stats`, `/kb/results` (+ `upcoming=true`) |
+| P4 | done for the research kinds below; the other master-plan categories still go through the existing intents | `monster-gpt/src/research.rs`, `orchestrator.rs` step 1a, `tools.rs` |
+
+Implemented in P4: research questions of four kinds (standings, champions, a player's
+games, a team's results) are detected in code, every name is resolved through
+`entities.resolve` (an ambiguous one gets "Which James do you mean: ...?" and the reply
+picks one), follow-ups that change only the stat or window keep the players
+("what about rebounds?"), and the answer is written in code from the tool results.
+A matchup whose game is not on today's slate gets its next scheduled game. A
+simulation request is told plainly that chat cannot run simulations yet (P6). New
+frame: `entities`. Golden set: 15/17 (A-D, F-H all pass; E waits for P6).
+
+Not yet: claim statuses and per-sentence citations (P5); news; tactical analysis,
+parlay research, odds comparison beyond the existing bet card; injuries as a research
+answer; the model-based intent fallback (not needed by the golden set so far).
+
 ## 13. Open risks
 
 - Undocumented endpoints (ESPN, NHL) can change or close; the registry marks them and

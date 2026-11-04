@@ -11,7 +11,8 @@
 //! - players from `sports_players` (NBA ESPN ids, NFL gsis ids, NHL and MLB league
 //!   ids); NHL names are stored abbreviated ("C. McDavid"), so current NHL rosters
 //!   (api-web.nhle.com) supply full names.
-//! Ids derive from the source ids, so a rebuild keeps them.
+//! Ids derive from the source ids, so a rebuild keeps them. The autopilot runs it daily
+//! (job `entities:build`, after the projections roster sync).
 //!
 //! `GET /entities/search?q=&sport=&kind=&limit=` ranks candidates;
 //! `GET /entities/resolve?q=&sport=&focus=` resolves one mention or says it is
@@ -100,7 +101,7 @@ pub async fn build(state: web::Data<State>) -> impl Responder {
     }
 }
 
-async fn build_all(state: &State) -> Result<Value, String> {
+pub(crate) async fn build_all(state: &State) -> Result<Value, String> {
     let db = &state.db;
     let mut b = Batch::default();
     let mut report = serde_json::Map::new();

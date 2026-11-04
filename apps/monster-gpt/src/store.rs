@@ -86,6 +86,12 @@ impl Store {
         Ok((msgs, prev))
     }
 
+    /// State saved with the newest assistant turn (research question, entities, a pending clarification).
+    pub async fn last_state(&self, conv: &str) -> Option<Value> {
+        self.db.query_opt("SELECT state FROM gpt_messages WHERE conversation_id=$1 AND role='assistant' AND NOT cancelled ORDER BY created_at DESC LIMIT 1", &[&conv])
+            .await.ok().flatten().and_then(|r| r.get::<_, Option<Json<Value>>>(0)).map(|j| j.0)
+    }
+
     /// Rolling summary of the conversation's older turns.
     pub async fn summary(&self, conv: &str) -> Option<String> {
         self.db.query_opt("SELECT summary FROM gpt_conversations WHERE id=$1", &[&conv]).await.ok().flatten().and_then(|r| r.get(0))

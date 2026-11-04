@@ -84,5 +84,5 @@ or MLB.
 
 `GET /entities/search?q=&sport=&kind=&limit=` returns ranked candidates for the @ picker.
 
-The build is run by hand for now. A daily rebuild in the autopilot is proposed and needs
-approval (it is a new scheduled job).
+The autopilot rebuilds it daily (job `entities:build`, approved 2026-11-03), after the
+projections roster sync; `POST /entities/build` runs it by hand.

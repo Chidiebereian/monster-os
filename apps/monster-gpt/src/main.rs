@@ -27,6 +27,7 @@ mod llm;
 mod memory;
 mod orchestrator;
 mod protocol;
+mod research;
 mod rag;
 mod router;
 mod store;

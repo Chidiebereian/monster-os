@@ -45,11 +45,31 @@ pub enum Tool {
     /// validation scorecard: calibration, Brier vs baseline and market, ROI, CLV,
     /// drawdown and status per engine x market, plus quarantined odds feeds
     Validation { sport: Option<String> },
+    /// league table from final scores (knowledge.rs)
+    Standings { sport: String, season: Option<i32> },
+    /// each season's champion: the last postseason game and the final series
+    Champions { sport: String, season: Option<i32>, limit: u32 },
+    /// one player's recent games and averages
+    PlayerStats { entity: String, stats: Vec<String>, last: u32, season: Option<i32> },
+    /// one team's recent results, optionally against one opponent
+    TeamResults { entity: String, opponent: Option<String>, last: u32, season: Option<i32> },
+    /// one team's next scheduled games
+    TeamSchedule { entity: String, next: u32 },
+    /// a name -> canonical entity, or the candidates when it is ambiguous
+    Resolve { q: String, sport: Option<String>, kind: Option<String>, focus: Vec<String> },
+}
+
+fn entity_ok(id: &str, prefix: &str) -> bool {
+    let p: Vec<&str> = id.split(':').collect();
+    p.len() == 3 && p[0] == prefix && SPORTS.contains(&p[1]) && !p[2].is_empty() && p[2].len() <= 24
+        && p[2].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 impl Tool {
     pub fn name(&self) -> &'static str {
-        match self { Tool::PicksToday { .. } => "picks.today", Tool::PicksRecord { .. } => "picks.record", Tool::HubBrief { .. } => "hub.brief", Tool::HubSlate { .. } => "hub.slate", Tool::Validation { .. } => "model.validation" }
+        match self { Tool::PicksToday { .. } => "picks.today", Tool::PicksRecord { .. } => "picks.record", Tool::HubBrief { .. } => "hub.brief", Tool::HubSlate { .. } => "hub.slate", Tool::Validation { .. } => "model.validation",
+            Tool::Standings { .. } => "kb.standings", Tool::Champions { .. } => "kb.champions", Tool::PlayerStats { .. } => "kb.player_stats",
+            Tool::TeamResults { .. } => "kb.results", Tool::TeamSchedule { .. } => "kb.schedule", Tool::Resolve { .. } => "entities.resolve" }
     }
 
     /// Argument checks: known sports only, bounded free text.
@@ -63,7 +83,32 @@ impl Tool {
                 if !sport_ok(sport) { return Err("unknown sport".into()); }
                 Ok(())
             }
-            Tool::HubSlate { sport } if !SPORTS.contains(&sport.as_str()) => Err("unknown sport".into()),
+            Tool::HubSlate { sport } | Tool::Standings { sport, .. } | Tool::Champions { sport, .. } if !SPORTS.contains(&sport.as_str()) => Err("unknown sport".into()),
+            Tool::Standings { season: Some(y), .. } | Tool::Champions { season: Some(y), .. } if !(1990..=2100).contains(y) => Err("season out of range".into()),
+            Tool::Champions { limit, .. } if *limit == 0 || *limit > 30 => Err("limit must be 1-30".into()),
+            Tool::PlayerStats { entity, stats, last, .. } => {
+                if !entity_ok(entity, "pl") { return Err("entity must be pl:<sport>:<id>".into()); }
+                if stats.len() > 8 || stats.iter().any(|x| x.is_empty() || x.len() > 30 || !x.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) { return Err("bad stat names".into()); }
+                if *last == 0 || *last > 200 { return Err("last must be 1-200".into()); }
+                Ok(())
+            }
+            Tool::TeamResults { entity, opponent, last, .. } => {
+                if !entity_ok(entity, "tm") || opponent.as_deref().map(|o| !entity_ok(o, "tm")).unwrap_or(false) { return Err("entity must be tm:<sport>:<code>".into()); }
+                if *last == 0 || *last > 200 { return Err("last must be 1-200".into()); }
+                Ok(())
+            }
+            Tool::TeamSchedule { entity, next } => {
+                if !entity_ok(entity, "tm") { return Err("entity must be tm:<sport>:<code>".into()); }
+                if *next == 0 || *next > 20 { return Err("next must be 1-20".into()); }
+                Ok(())
+            }
+            Tool::Resolve { q, sport, kind, focus } => {
+                if q.trim().is_empty() || q.len() > 60 { return Err("q must be 1-60 characters".into()); }
+                if !sport_ok(sport) { return Err("unknown sport".into()); }
+                if kind.as_deref().map(|k| !matches!(k, "player" | "team")).unwrap_or(false) { return Err("kind must be player or team".into()); }
+                if focus.len() > 10 || focus.iter().any(|f| !(entity_ok(f, "pl") || entity_ok(f, "tm"))) { return Err("bad focus ids".into()); }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -79,6 +124,15 @@ impl Tool {
             Tool::HubBrief { q, sport } => format!("{base}/hub/brief?q={}{}", crate::urlencode(q), sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default()),
             Tool::HubSlate { sport } => format!("{base}/hub/{sport}/schedule"),
             Tool::Validation { sport } => format!("{base}/validation/scorecard{}", sport.as_deref().map(|s| format!("?sport={s}")).unwrap_or_default()),
+            Tool::Standings { sport, season } => format!("{base}/kb/standings?sport={sport}{}", season.map(|y| format!("&season={y}")).unwrap_or_default()),
+            Tool::Champions { sport, season, limit } => format!("{base}/kb/champions?sport={sport}&limit={limit}{}", season.map(|y| format!("&season={y}")).unwrap_or_default()),
+            Tool::PlayerStats { entity, stats, last, season } => format!("{base}/kb/player_stats?entity={}&last={last}{}{}", crate::urlencode(entity),
+                if stats.is_empty() { String::new() } else { format!("&stats={}", stats.join(",")) }, season.map(|y| format!("&season={y}")).unwrap_or_default()),
+            Tool::TeamResults { entity, opponent, last, season } => format!("{base}/kb/results?entity={}&last={last}{}{}", crate::urlencode(entity),
+                opponent.as_deref().map(|o| format!("&opponent={}", crate::urlencode(o))).unwrap_or_default(), season.map(|y| format!("&season={y}")).unwrap_or_default()),
+            Tool::TeamSchedule { entity, next } => format!("{base}/kb/results?entity={}&last={next}&upcoming=true", crate::urlencode(entity)),
+            Tool::Resolve { q, sport, kind, focus } => format!("{base}/entities/resolve?q={}{}{}{}", crate::urlencode(q), sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default(),
+                kind.as_deref().map(|k| format!("&kind={k}")).unwrap_or_default(), if focus.is_empty() { String::new() } else { format!("&focus={}", crate::urlencode(&focus.join(","))) }),
         }
     }
 
@@ -89,6 +143,12 @@ impl Tool {
             Tool::HubBrief { .. } => "Games hub: game briefs (model, best lines, injuries, matchup ranks)".into(),
             Tool::HubSlate { sport } => format!("Games hub: {} schedule", sport.to_uppercase()),
             Tool::Validation { sport } => format!("Validation engine: model scorecard{}", sport.as_deref().map(|s| format!(" ({})", s.to_uppercase())).unwrap_or_default()),
+            Tool::Standings { sport, .. } => format!("{} standings computed from stored final scores", sport.to_uppercase()),
+            Tool::Champions { sport, .. } => format!("{} champions from stored postseason games", sport.to_uppercase()),
+            Tool::PlayerStats { entity, .. } => format!("Player game logs ({entity})"),
+            Tool::TeamResults { entity, .. } => format!("Team results ({entity})"),
+            Tool::TeamSchedule { entity, .. } => format!("Team schedule ({entity})"),
+            Tool::Resolve { q, .. } => format!("Entity lookup: \"{q}\""),
         }
     }
 }
@@ -113,6 +173,12 @@ impl Tools {
             Tool::HubBrief { q, sport } => json!({ "q": q, "sport": sport }),
             Tool::HubSlate { sport } => json!({ "sport": sport }),
             Tool::Validation { sport } => json!({ "sport": sport }),
+            Tool::Standings { sport, season } => json!({ "sport": sport, "season": season }),
+            Tool::Champions { sport, season, limit } => json!({ "sport": sport, "season": season, "limit": limit }),
+            Tool::PlayerStats { entity, stats, last, season } => json!({ "entity": entity, "stats": stats, "last": last, "season": season }),
+            Tool::TeamResults { entity, opponent, last, season } => json!({ "entity": entity, "opponent": opponent, "last": last, "season": season }),
+            Tool::TeamSchedule { entity, next } => json!({ "entity": entity, "next": next }),
+            Tool::Resolve { q, sport, kind, focus } => json!({ "q": q, "sport": sport, "kind": kind, "focus": focus }),
         };
         if let Err(e) = tool.validate() {
             return ToolCall { tool: name, args, ok: false, ms: 0, error: Some(e), value: Value::Null, source: None };
@@ -167,6 +233,21 @@ mod tests {
         assert!(Tool::PicksRecord { sport: None, days: 0 }.validate().is_err());
         assert!(Tool::HubSlate { sport: "nhl".into() }.validate().is_ok());
         assert!(Tool::PicksToday { sport: None }.validate().is_ok());
+    }
+
+    #[test]
+    fn knowledge_tools_take_only_well_formed_ids_and_bounded_windows() {
+        assert!(Tool::PlayerStats { entity: "pl:nba:3112335".into(), stats: vec!["pts".into()], last: 20, season: None }.validate().is_ok());
+        assert!(Tool::PlayerStats { entity: "pl:nba:1; DROP TABLE x".into(), stats: vec![], last: 20, season: None }.validate().is_err());
+        assert!(Tool::PlayerStats { entity: "tm:nba:LAL".into(), stats: vec![], last: 20, season: None }.validate().is_err());
+        assert!(Tool::PlayerStats { entity: "pl:nba:1".into(), stats: vec!["pts' OR 1=1".into()], last: 20, season: None }.validate().is_err());
+        assert!(Tool::PlayerStats { entity: "pl:nba:1".into(), stats: vec![], last: 0, season: None }.validate().is_err());
+        assert!(Tool::TeamResults { entity: "tm:nhl:EDM".into(), opponent: Some("tm:nhl:NJD".into()), last: 10, season: None }.validate().is_ok());
+        assert!(Tool::Standings { sport: "xfl".into(), season: None }.validate().is_err());
+        assert!(Tool::Champions { sport: "mlb".into(), season: Some(2025), limit: 1 }.validate().is_ok());
+        assert!(Tool::Resolve { q: "James".into(), sport: Some("nba".into()), kind: Some("player".into()), focus: vec!["pl:nba:1966".into()] }.validate().is_ok());
+        assert!(Tool::Resolve { q: "x".into(), sport: None, kind: Some("venue".into()), focus: vec![] }.validate().is_err());
+        assert_eq!(Tool::Standings { sport: "nhl".into(), season: Some(2025) }.url("http://p"), "http://p/kb/standings?sport=nhl&season=2025");
     }
 
     #[tokio::test]
