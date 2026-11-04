@@ -34,9 +34,12 @@ fn canon(n: &str) -> Option<(String, bool)> {
     Some((format!("{}", (v * 100.0).round() / 100.0), pct))
 }
 
+/// The value part of [`canon`] ("$1,250.50" -> "1250.5"), for matching against records.
+pub(crate) fn canon_value(n: &str) -> Option<String> { canon(n).map(|x| x.0) }
+
 /// Which numbers in `answer` are worth checking: money, odds, percentages,
 /// decimals, and integers above 10 (list numbering and counts are left alone).
-fn checkable(n: &str) -> bool {
+pub(crate) fn checkable(n: &str) -> bool {
     if n.starts_with('$') || n.ends_with('%') || n.contains('.') { return true; }
     let t = n.trim_start_matches(['+', '-']).replace(',', "");
     match t.parse::<i64>() { Ok(v) => v > 10 && !(1900..=2100).contains(&v), Err(_) => false }

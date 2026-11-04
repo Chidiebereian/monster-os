@@ -312,6 +312,24 @@
       "forbid": [
         "\\d+\\.\\d+ points"
       ]
+    },
+    {
+      "id": "I1",
+      "workflow": "I",
+      "text": "What are the best bets for tomorrow? I have $100.",
+      "tools": [
+        "picks.today"
+      ],
+      "truth": null,
+      "facts": [],
+      "statuses": [
+        "model_estimated"
+      ],
+      "forbid": [
+        "(?i)guarantee",
+        "(?i)can't lose",
+        "(?i)sure thing"
+      ]
     }
   ]
 }

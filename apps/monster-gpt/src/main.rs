@@ -33,6 +33,7 @@ mod router;
 mod store;
 mod tools;
 mod validate;
+mod verify;
 mod ws;
 
 use std::collections::HashMap;

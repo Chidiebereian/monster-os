@@ -86,6 +86,15 @@ impl Store {
         Ok((msgs, prev))
     }
 
+    /// Per-sentence evidence for an answer (gpt_claims, write-once).
+    pub async fn save_claims(&self, message_id: &str, claims: &[crate::verify::Claim]) {
+        for c in claims {
+            let _ = self.db.execute("INSERT INTO gpt_claims (message_id, sentence_ix, text, status, facts, issues) VALUES ($1, $2, $3, $4, $5, $6) \
+                ON CONFLICT (message_id, sentence_ix) DO NOTHING",
+                &[&message_id, &(c.sentence_ix as i32), &c.text, &c.status.as_str(), &Json(serde_json::json!(c.citations)), &Json(serde_json::json!(c.issues))]).await;
+        }
+    }
+
     /// State saved with the newest assistant turn (research question, entities, a pending clarification).
     pub async fn last_state(&self, conv: &str) -> Option<Value> {
         self.db.query_opt("SELECT state FROM gpt_messages WHERE conversation_id=$1 AND role='assistant' AND NOT cancelled ORDER BY created_at DESC LIMIT 1", &[&conv])

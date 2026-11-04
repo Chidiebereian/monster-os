@@ -84,6 +84,15 @@ impl Gpt {
         token
     }
     pub fn origin_ok(&self, origin: &str) -> bool { self.origins.iter().any(|o| o == origin) }
+    /// Verify the final answer sentence by sentence against this turn's facts, store the
+    /// claims with the message and send them (verify.rs).
+    pub async fn claims(&self, tx: &mpsc::Sender<ServerMsg>, rid: &str, message_id: &Option<String>, text: &str, facts: &[crate::verify::Fact]) -> Value {
+        let claims = crate::verify::check(text, facts);
+        if let (Some(s), Some(m)) = (&self.store, message_id) { s.save_claims(m, &claims).await; }
+        let summary = crate::verify::summary(&claims);
+        let _ = tx.send(ServerMsg::Claims { request_id: rid.into(), message_id: message_id.clone(), claims: json!(claims), summary: summary.clone() }).await;
+        summary
+    }
     pub fn model(&self, id: Option<&str>) -> &ModelCfg { id.and_then(|i| self.models.iter().find(|m| m.id == i)).unwrap_or(&self.models[0]) }
     fn record_tool(&self, name: &str, ok: bool, ms: u64) {
         let mut t = self.metrics.tool_ms.lock().unwrap();
@@ -259,6 +268,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
 
     // 1a. sports research (standings, champions, a player's or team's games): answered in
     // code from stored records, so no language model writes the numbers (research.rs)
+    let today = card::et_date(chrono::Utc::now());
     let prev_state: Value = match (&g.store, &conv) { (Some(s), Some(c)) => s.last_state(c).await.unwrap_or(Value::Null), _ => Value::Null };
     if route.intent != Intent::Model {
         let focus: Vec<String> = prev_state["entities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
@@ -298,12 +308,17 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 detail: Some(format!("{:?}{}", ask.kind.unwrap_or(crate::research::Kind::Stats), if forced.is_empty() { String::new() } else { " (with your choice)".into() })), ms: Some(0) }).await;
             let out = crate::research::answer(&g.tools, &ask, &focus, &forced, &original).await;
             let mut sources: Vec<Source> = Vec::new();
+            let mut facts: Vec<crate::verify::Fact> = Vec::new();
             for c in &out.calls {
                 g.record_tool(c.tool, c.ok, c.ms);
                 if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
                 send(ServerMsg::Status { request_id: rid.clone(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(),
                     detail: c.error.clone(), ms: Some(c.ms) }).await;
-                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); sources.push(src); }
+                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); facts.extend(crate::verify::facts_from(c.tool, &c.value, &src, facts.len(), today)); sources.push(src); }
+            }
+            // calculations made from the records are computed facts of the records they used
+            if let (false, Some(src)) = (out.derived.is_empty(), sources.iter().find(|s| s.tool == "kb.player_stats").cloned()) {
+                facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Computed, &out.derived.join("\n"), &src, facts.len() + 1));
             }
             if !out.entities.is_empty() { send(ServerMsg::Entities { request_id: rid.clone(), entities: json!(out.entities) }).await; }
             send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
@@ -316,6 +331,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &out.reply, &Value::Null, &json!(sources), &state, None, &usage, false).await.ok(),
                 _ => None,
             };
+            g.claims(&tx, &rid, &message_id, &out.reply, &facts).await;
             send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
             return None;
         }
@@ -376,12 +392,13 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
     let sport: Option<String> = f.sport.clone().or(brief_sport);
     let mut sources: Vec<Source> = Vec::new();
     let mut results: HashMap<&'static str, Value> = HashMap::new();
+    let mut facts: Vec<crate::verify::Fact> = Vec::new();
     for c in calls {
         g.record_tool(c.tool, c.ok, c.ms);
         if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
         send(ServerMsg::Status { request_id: rid.clone(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(),
             detail: c.error.clone(), ms: Some(c.ms) }).await;
-        if let Some(mut src) = c.source { src.id = format!("S{}", sources.len() + 1); sources.push(src); }
+        if let Some(mut src) = c.source { src.id = format!("S{}", sources.len() + 1); facts.extend(crate::verify::facts_from(c.tool, &c.value, &src, facts.len(), today)); sources.push(src); }
         if c.ok { results.insert(c.tool, c.value); }
     }
 
@@ -400,6 +417,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
             (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &Value::Null, &serde_json::to_value(&sources).unwrap_or(Value::Null), &state, None, &usage, false).await.ok(),
             _ => None,
         };
+        g.claims(&tx, &rid, &message_id, &reply, &facts).await;
         send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
         return None;
     }
@@ -415,7 +433,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
                 send(ServerMsg::Status { request_id: rid.clone(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(),
                     detail: c.error.clone(), ms: Some(c.ms) }).await;
-                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); sources.push(src); }
+                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); facts.extend(crate::verify::facts_from(c.tool, &c.value, &src, facts.len(), today)); sources.push(src); }
             }
             send(ServerMsg::Entities { request_id: rid.clone(), entities: json!(out.entities) }).await;
             send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
@@ -428,6 +446,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &out.reply, &Value::Null, &json!(sources), &state, None, &usage, false).await.ok(),
                 _ => None,
             };
+            g.claims(&tx, &rid, &message_id, &out.reply, &facts).await;
             send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
             return None;
         }
@@ -469,12 +488,19 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 crate::lean::reply(sp, market, &leans, &crate::lean::why_no_pick(results.get("picks.record"), sp, market), limit, game)
             } else { format!("{}\n\nI only suggest bets the models actually priced, so there's nothing to recommend for this request. Try changing the sport, risk or day.", c.notes.join(" ")) };
             send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
+            if let Some(src) = sources.iter().find(|s| s.tool == "hub.slate").cloned() {
+                facts.push(crate::verify::fact_from_text(crate::verify::FactKind::ModelEstimate, &crate::lean::evidence(&leans, 50), &src, facts.len() + 1));
+            }
+            if let Some(src) = sources.iter().find(|s| s.tool == "picks.today").cloned() {
+                facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Computed, &c.notes.join(" "), &src, facts.len() + 1));
+            }
             let usage = json!({ "empty_card": true, "leans": leans.len().min(limit) });
             let state = json!({ "intent": intent_name, "filters": route.filters, "inherited": route.inherited, "from_memory": from_memory });
             let message_id = match (&g.store, &conv) {
                 (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &card_json, &serde_json::to_value(&sources).unwrap_or(Value::Null), &state, None, &usage, false).await.ok(),
                 _ => None,
             };
+            g.claims(&tx, &rid, &message_id, &reply, &facts).await;
             send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
             return None;
         }
@@ -540,6 +566,34 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
     if let Some(ctx) = &req.context { ev.push_str(&format!("CALLER CONTEXT (from the page the user came from):\n{}\n", serde_json::to_string(ctx).unwrap_or_default())); }
     if card.is_none() && briefs.is_empty() && passages.is_empty() && !results.contains_key("picks.record") && !results.contains_key("hub.slate") && req.context.is_none() {
         ev.push_str("(no Monster OS data was needed or found for this question)\n");
+    }
+
+    if let (Some(c), Some(src)) = (&card, sources.iter().find(|s| s.tool == "picks.today").cloned()) {
+        facts.push(crate::verify::fact_from_text(crate::verify::FactKind::ModelEstimate, &bet_card_evidence(c), &src, facts.len() + 1));
+    }
+    if let Some(src) = sources.iter().find(|s| s.tool == "hub.slate").cloned() {
+        if !leans.is_empty() { facts.push(crate::verify::fact_from_text(crate::verify::FactKind::ModelEstimate, &crate::lean::evidence(&leans, 8), &src, facts.len() + 1)); }
+    }
+    for (id, _, text) in &passages {
+        if let Some(src) = sources.iter().find(|s| &s.id == id).cloned() { facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Reference, text, &src, facts.len() + 1)); }
+    }
+
+    // no-answer policy: a factual question that no record or document answers is not
+    // answered from the model's memory (monster-gpt-v2.md 7.4)
+    if route.intent == Intent::General && passages.is_empty() && results.is_empty() && req.context.is_none() && crate::research::looks_factual(&req.text) {
+        let searched = if g.rag.is_some() { "Monster OS's documents (no matching passage)" } else { "Monster OS's research notes (no matching passage)" };
+        let reply = format!("I can't verify that from Monster OS's records. I searched {searched}, and the question isn't about standings, champions, \
+            or a player's or team's games, which are the records I hold for the NBA, NFL, NHL and MLB. I won't answer it from memory, because I couldn't show you where the answer came from.");
+        send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
+        let usage = json!({ "no_answer": true });
+        let state = json!({ "intent": intent_name, "filters": route.filters, "inherited": route.inherited, "from_memory": from_memory });
+        let message_id = match (&g.store, &conv) {
+            (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &Value::Null, &sources_json, &state, None, &usage, false).await.ok(),
+            _ => None,
+        };
+        g.claims(&tx, &rid, &message_id, &reply, &facts).await;
+        send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
+        return None;
     }
 
     // 6. model: draft, check, at most one rewrite
@@ -682,6 +736,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         (Some(s), Some(c)) => s.save_turn(c, &rid, &req.text, &text, &card_json, &sources_json, &state, model_used.as_deref(), &usage, cancelled).await.ok(),
         _ => None,
     };
+    if !cancelled { g.claims(&tx, &rid, &message_id, &text, &facts).await; }
     send(ServerMsg::Done { request_id: rid, message_id, model: model_used.clone(), cancelled, usage }).await;
     // after delivery: keep a short summary of older turns for long conversations
     match (conv, model_used) { (Some(c), Some(_)) => Some(FollowUp { conversation: c, model: m }), _ => None }

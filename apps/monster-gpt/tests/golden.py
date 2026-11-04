@@ -17,6 +17,8 @@ Grading per question (all must hold):
   must_any at least one pattern matches
   forbid   no pattern matches
   abstain  the answer says it could not verify, and holds no number the question lacks
+  claims   (questions with a truth query) every expected fact sits in a sentence the
+           verifier marked verified or cross_verified; an abstain answer has no verified sentence
 A question with "turns" is a conversation: every turn is sent in order in one
 conversation, and the checks apply to the last answer (tools: called on any turn).
 """
@@ -44,7 +46,7 @@ REPORTS = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), 
 ADMIN = ["docker", "exec", "monster-os-postgres-1", "psql", "-U", "monster", "-d", "postgres", "-q", "-c"]
 ABSTAIN = re.compile(r"(?i)((could not|couldn't|cannot|can't|unable to|not able to|don't have|do not have)[^.]{0,80}(verify|find|confirm|data|record|information)"
                      r"|no (relevant |stored |verified )?(information|data|record)s? (is |are )?(available|found|stored)|not available in)")
-WORKFLOWS = "ABCDEFGH"  # H: multi-turn (follow-ups, clarifications)
+WORKFLOWS = "ABCDEFGHI"  # H: multi-turn (follow-ups, clarifications); I: bets answered by the language model
 
 
 def load():
@@ -106,13 +108,26 @@ def grade(q, answer, events, row, aliases):
     for p in q.get("forbid", []):
         if re.search(p, answer):
             fails.append(f"forbidden /{p}/")
+    claims = [c for e in events if e.get("type") == "claims" for c in (e.get("claims") or [])]
+    last_claims = next((e.get("claims") or [] for e in reversed(events) if e.get("type") == "claims"), [])
+    if q.get("truth"):
+        verified = " ".join(c["text"] for c in last_claims if c["status"] in ("verified", "cross_verified"))
+        for alts in expected(q, row, aliases):
+            if any(a.lower() in answer.lower() for a in alts) and not any(a.lower() in verified.lower() for a in alts):
+                fails.append(f"fact {alts[0]} is in the answer but not in a verified sentence")
+    # only when the language model wrote the answer (with no open picks the reply is built in code)
+    modeled = any(e.get("type") == "done" and e.get("model") for e in events)
+    if q.get("statuses") and modeled and not any(c["status"] in q["statuses"] for c in last_claims):
+        fails.append(f"no sentence marked {' or '.join(q['statuses'])} (got {sorted({c['status'] for c in last_claims})})")
+    if q.get("abstain") and any(c["status"] in ("verified", "cross_verified") for c in last_claims):
+        fails.append("an unverifiable answer has a verified sentence")
     if q.get("abstain"):
         if not ABSTAIN.search(answer):
             fails.append("did not say it could not verify")
         extra = set(re.findall(r"\d[\d,.]*", answer)) - set(re.findall(r"\d[\d,.]*", q["text"]))
         if extra:
             fails.append(f"numbers in an unverifiable answer: {sorted(extra)[:5]}")
-    return fails, sorted(x for x in called if x)
+    return fails, sorted(x for x in called if x), [c["status"] for c in last_claims],         [{"status": c["status"], "text": c["text"][:200], "issues": c.get("issues", [])} for c in last_claims if c["status"] not in ("verified", "cross_verified")]
 
 
 # ------------------------------------------------------------------ scratch instance
@@ -171,7 +186,7 @@ def run(g, rows):
     os.makedirs(REPORTS, exist_ok=True)
     scratch_db()
     proc = start()
-    results = []
+    results, stored = [], {}
     try:
         tok = post("/session", {"user": "golden"})["token"]
         for q in g["questions"]:
@@ -185,10 +200,13 @@ def run(g, rows):
                     conv = conv or next((e.get("conversation_id") for e in r.get("events", []) if e.get("type") == "ack"), None)
             except (urllib.error.URLError, TimeoutError) as e:
                 answer, events = "", events + [{"type": "error", "message": str(e)}]
-            fails, called = grade(q, answer, events, rows.get(q["id"]), g.get("aliases", {}))
-            results.append({"id": q["id"], "workflow": q["workflow"], "pass": not fails, "fails": fails, "tools_called": called,
+            fails, called, statuses, flagged = grade(q, answer, events, rows.get(q["id"]), g.get("aliases", {}))
+            results.append({"id": q["id"], "workflow": q["workflow"], "pass": not fails, "fails": fails, "tools_called": called, "claims": statuses, "flagged": flagged,
                             "expected": rows.get(q["id"]), "answer": answer, "seconds": round(time.time() - t0, 1)})
             print(f"{'PASS' if not fails else 'FAIL'}  {q['id']}  {round(time.time() - t0, 1):>5}s  {'; '.join(fails)[:160]}", flush=True)
+        import psycopg
+        with psycopg.connect(dbenv.url("OPS_DATABASE_URL").rsplit("/", 1)[0] + "/" + DB) as cx:
+            stored = dict(cx.execute("SELECT status, count(*) FROM gpt_claims GROUP BY 1").fetchall())
     finally:
         proc.kill()
         subprocess.run(ADMIN + [f"DROP DATABASE IF EXISTS {DB} WITH (FORCE)"], capture_output=True)
@@ -196,7 +214,9 @@ def run(g, rows):
     summary = {"passed": sum(r["pass"] for r in results), "total": len(results),
                "by_workflow": {w: f"{sum(r['pass'] for r in v)}/{len(v)}" for w, v in by.items()},
                "tool_selection": round(sum(all(t in r["tools_called"] for t in q.get("tools", [])) for r, q in zip(results, g["questions"])) / len(results), 3),
-               "abstain_violations": sum(1 for r, q in zip(results, g["questions"]) if q.get("abstain") and not r["pass"])}
+               "abstain_violations": sum(1 for r, q in zip(results, g["questions"]) if q.get("abstain") and not r["pass"]),
+               "claim_statuses": {k: sum(r["claims"].count(k) for r in results) for k in sorted({x for r in results for x in r["claims"]})},
+               "claims_stored": stored}
     path = os.path.join(REPORTS, f"golden_{dt.datetime.now():%Y%m%d_%H%M%S}.json")
     json.dump({"at": dt.datetime.now(dt.timezone.utc).isoformat(), "summary": summary, "results": results}, open(path, "w", encoding="utf-8"), indent=1)
     print(json.dumps(summary), f"\nreport: {path}")

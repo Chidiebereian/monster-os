@@ -260,6 +260,16 @@ fn current_season(sport: &str) -> i32 {
     match sport { "nba" | "nhl" => if m >= 9 { y } else { y - 1 }, "nfl" => if m >= 8 { y } else { y - 1 }, _ => y }
 }
 
+/// A question asking for a fact ("who", "how many", "when did") rather than an
+/// explanation; with no record to answer it, the reply says so instead of the model
+/// answering from memory.
+pub fn looks_factual(text: &str) -> bool {
+    let l = text.trim().to_lowercase();
+    let starts = ["who ", "when ", "where ", "which ", "how many", "how much", "did ", "was ", "were ", "what was", "what were", "what year", "in what year", "has ", "have "];
+    starts.iter().any(|s| l.starts_with(s))
+        && !has(&l, &["you", "monster", "explain", " mean", "why", "how does", "how do", "should i", "can i", "what is a ", "what's a "])
+}
+
 /// A per-game average as shown: one decimal, two below 1 (0.35 goals, 23.4 points).
 pub fn avg_shown(x: f64) -> f64 { if x.abs() < 1.0 { (x * 100.0).round() / 100.0 } else { (x * 10.0).round() / 10.0 } }
 
@@ -281,6 +291,9 @@ pub struct Outcome {
     /// saved on the message: the question, the entities it used, a pending clarification
     pub state: Value,
     pub entities: Vec<Value>,
+    /// calculations the reply made from the records ("37.7 - 23.4 = 14.3"), so the
+    /// verifier can tie a computed number to its inputs
+    pub derived: Vec<String>,
 }
 
 /// Answer a research question. `focus` are the entities of the conversation so far;
@@ -306,7 +319,7 @@ pub async fn answer(tools: &Tools, ask: &Ask, focus: &[String], forced: &HashMap
                 Some("ambiguous") => {
                     let cands = v["candidates"].as_array().cloned().unwrap_or_default();
                     return Outcome { reply: clarify_text(m, &cands), calls, entities,
-                        state: json!({ "research": ask, "clarify": { "text": original, "mention": m, "candidates": cands, "forced": forced } }) };
+                        state: json!({ "research": ask, "clarify": { "text": original, "mention": m, "candidates": cands, "forced": forced } }), derived: vec![] };
                 }
                 _ => {}
             }
@@ -314,7 +327,7 @@ pub async fn answer(tools: &Tools, ask: &Ask, focus: &[String], forced: &HashMap
         if entities.is_empty() {
             let names = if ask.mentions.is_empty() { "a player or team".to_string() } else { ask.mentions.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ") };
             return Outcome { reply: format!("I can't verify that from Monster OS's records. I looked for {names} among NBA, NFL, NHL and MLB players and teams and found no match, and I don't hold other records that would answer it. If you meant a player or team, try the full name."),
-                calls, state: base_state(&entities), entities };
+                calls, state: base_state(&entities), entities, derived: vec![] };
         }
     }
     let sport = ask.sport.clone().or_else(|| entities.iter().find_map(|e| e["entity_id"].as_str().and_then(|i| i.split(':').nth(1)).map(String::from)));
@@ -324,7 +337,7 @@ pub async fn answer(tools: &Tools, ask: &Ask, focus: &[String], forced: &HashMap
         Kind::Standings | Kind::Champion => {
             let Some(sp) = sport.clone() else {
                 return Outcome { reply: format!("Which league: NBA, NFL, NHL or MLB? I keep {} for those four.", if kind == Kind::Standings { "standings" } else { "champions" }),
-                    calls, state: json!({ "research": ask }), entities };
+                    calls, state: json!({ "research": ask }), entities, derived: vec![] };
             };
             let tool = if kind == Kind::Standings { Tool::Standings { sport: sp.clone(), season: ask.season } } else { Tool::Champions { sport: sp.clone(), season: ask.season, limit: 1 } };
             let c = tools.call(tool).await;
@@ -335,6 +348,7 @@ pub async fn answer(tools: &Tools, ask: &Ask, focus: &[String], forced: &HashMap
         }
         Kind::Stats | Kind::Results => {
             let mut parts = Vec::new();
+            let mut derived = Vec::new();
             let mut player_rows: Vec<(String, String, f64)> = Vec::new(); // (name, stat label, mean) for a comparison line
             for e in &entities {
                 let id = e["entity_id"].as_str().unwrap_or("").to_string();
@@ -359,14 +373,18 @@ pub async fn answer(tools: &Tools, ask: &Ask, focus: &[String], forced: &HashMap
                 if a.1 == b.1 && (a.2 - b.2).abs() > 1e-9 {
                     let (hi, lo) = if a.2 > b.2 { (a, b) } else { (b, a) };
                     // from the averages as shown, so the sentence agrees with the lines above it
-                    parts.push(format!("{} averaged {} more {} per game than {} over those games.", hi.0, fmt_num(avg_shown(hi.2 - lo.2)), hi.1, lo.0));
+                    let d = avg_shown(hi.2 - lo.2);
+                    derived.push(format!("{} - {} = {} {} per game ({} minus {})", fmt_num(hi.2), fmt_num(lo.2), fmt_num(d), hi.1, hi.0, lo.0));
+                    parts.push(format!("{} averaged {} more {} per game than {} over those games.", hi.0, fmt_num(d), hi.1, lo.0));
                 }
             }
-            parts.join("\n\n")
+            let reply = parts.join("\n\n");
+            let ents: Vec<Value> = entities.clone();
+            return Outcome { reply, calls, state: base_state(&ents), entities, derived };
         }
     };
     let ents: Vec<Value> = entities.clone();
-    Outcome { reply, calls, state: base_state(&ents), entities }
+    Outcome { reply, calls, state: base_state(&ents), entities, derived: vec![] }
 }
 
 /// A matchup question whose game is not on today's slate: find the team's next game and
@@ -385,7 +403,14 @@ pub async fn next_game(tools: &Tools, text: &str, sport: Option<String>, focus: 
     let v = c.value.clone();
     calls.push(c);
     let name = v["name"].as_str().unwrap_or("That team").to_string();
+    let started = |g: &Value| g["start"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t <= chrono::Utc::now()).unwrap_or(false);
+    let poss = if name.ends_with('s') { "'" } else { "'s" };
     let reply = match v["upcoming"].as_array().and_then(|a| a.first()) {
+        // briefs cover games before they start; a game under way gets its start time, not "ask on game day"
+        Some(g) if started(g) => format!("The {name}{poss} current game is {} the {}; it started at {} UTC. Game briefs are built before a game starts, so I don't have a \
+            breakdown for it now; ask me who won once it's final.\n\n{}",
+            if g["home"].as_bool().unwrap_or(false) { "at home against" } else { "on the road at" }, g["opponent_name"].as_str().or(g["opponent"].as_str()).unwrap_or(""),
+            g["start"].as_str().map(|t| t.replace('T', " ").chars().take(16).collect::<String>()).unwrap_or_default(), source_line(&v)),
         Some(g) => format!("The {name}{} next game is {} the {} on {}. Monster OS builds game briefs (model view, best lines, injuries, matchup ranks) for the day's slate, \
             so this game's numbers aren't ready yet; ask again on game day for the breakdown.\n\n{}",
             if name.ends_with('s') { "'" } else { "'s" }, if g["home"].as_bool().unwrap_or(false) { "at home against" } else { "on the road at" }, g["opponent_name"].as_str().or(g["opponent"].as_str()).unwrap_or(""),
@@ -393,7 +418,7 @@ pub async fn next_game(tools: &Tools, text: &str, sport: Option<String>, focus: 
         None => format!("I don't have a scheduled game stored for the {name}, so I can't break one down. {}", source_line(&v)),
     };
     let entities = vec![json!({ "entity_id": id, "name": name })];
-    Some(Outcome { reply, calls, state: json!({ "entities": [id] }), entities })
+    Some(Outcome { reply, calls, state: json!({ "entities": [id] }), entities, derived: vec![] })
 }
 
 fn source_line(v: &Value) -> String {

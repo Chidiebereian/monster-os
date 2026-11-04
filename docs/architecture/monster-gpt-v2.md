@@ -348,7 +348,23 @@ A matchup whose game is not on today's slate gets its next scheduled game. A
 simulation request is told plainly that chat cannot run simulations yet (P6). New
 frame: `entities`. Golden set: 15/17 (A-D, F-H all pass; E waits for P6).
 
-Not yet: claim statuses and per-sentence citations (P5); news; tactical analysis,
+P5 (done, `monster-gpt/src/verify.rs`): every tool result becomes facts by kind
+(observed, computed, model estimate, hypothetical, reference) with source, record date
+and staleness; calculations an answer makes are computed facts with their inputs
+("37.7 - 23.4 = 14.3"). Every answer path (research, next game, diagnostics, empty
+card, model answers) is split into sentences; each number and name is matched to the
+facts holding it and the sentence gets a status (verified, cross_verified,
+partially_verified, conflicting when two sources disagree on a subject's value,
+unverified, stale, model_estimated, hypothetical) and citations to this turn's
+sources only. Questions back to the user and the user's quoted words are not claims.
+Stored write-once in `gpt_claims`; sent as a `claims` frame. A factual question that no
+record or document answers gets a code-built "I can't verify that" listing what was
+searched (no answer from model memory). Golden: 16/18, 74 claims stored, none of the
+expected facts outside a verified sentence. Not shown in the dashboard yet (P7).
+Cross-verified and conflicting need a second source for the same value; none is
+wired yet, so in practice answers are verified or model_estimated.
+
+Not yet: news; tactical analysis,
 parlay research, odds comparison beyond the existing bet card; injuries as a research
 answer; the model-based intent fallback (not needed by the golden set so far).
 

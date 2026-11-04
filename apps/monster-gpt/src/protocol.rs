@@ -34,6 +34,8 @@ pub enum ServerMsg {
     /// stage: route | tool | retrieval | model ; state: started | queued | completed | failed
     Status { request_id: String, stage: String, name: String, state: String, #[serde(skip_serializing_if = "Option::is_none")] detail: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] ms: Option<u64> },
     Card { request_id: String, card: Value },
+    /// v2: the answer's sentences with a status and citations each (verify.rs)
+    Claims { request_id: String, message_id: Option<String>, claims: Value, summary: Value },
     /// v2: the players and teams a research question resolved to (canonical ids)
     Entities { request_id: String, entities: Value },
     Sources { request_id: String, sources: Value },
