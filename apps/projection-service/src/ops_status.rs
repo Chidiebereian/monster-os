@@ -102,6 +102,26 @@ fn backup_status() -> Value {
     }
 }
 
+/// whale-tracker ingests ~150k sharp-wallet trades a day; the longest normal gap is under an hour.
+const PM_TRADES_MAX_MIN: i64 = 120;
+
+/// A live service log past this size is flooding (start-stack.ps1 archives logs only on restart).
+const LOG_MAX_MB: f64 = 100.0;
+
+/// Live logs in %LOCALAPPDATA%/MonsterOS/logs (not the archive): total size and the largest.
+fn logs_status() -> Value {
+    let Some(dir) = std::env::var("LOCALAPPDATA").ok().map(|l| format!("{l}\\MonsterOS\\logs")) else { return json!(null) };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return json!(null) };
+    let mut files: Vec<(String, u64)> = rd.flatten()
+        .filter_map(|e| { let m = e.metadata().ok()?; m.is_file().then(|| (e.file_name().to_string_lossy().into_owned(), m.len())) })
+        .collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    let mb = |b: u64| (b as f64 / 1048576.0 * 10.0).round() / 10.0;
+    let archive: u64 = std::fs::read_dir(format!("{dir}\\archive")).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+    json!({ "total_mb": mb(files.iter().map(|f| f.1).sum()), "archive_mb": mb(archive),
+            "largest": files.iter().take(3).map(|(n, b)| json!({ "file": n, "mb": mb(*b) })).collect::<Vec<_>>() })
+}
+
 pub(crate) fn assess(services: &[(String, bool)], deps: &Value, failing_jobs: usize, tick_min: Option<i64>, stale_sports: &[String], host: &Value) -> (&'static str, Vec<String>) {
     let mut down = Vec::new();
     let mut degraded = Vec::new();
@@ -110,6 +130,10 @@ pub(crate) fn assess(services: &[(String, bool)], deps: &Value, failing_jobs: us
     }
     if deps["postgres"]["ok"] != json!(true) { down.push("postgres is not answering".into()); }
     for d in ["clickhouse", "ollama"] { if deps[d]["ok"] != json!(true) { degraded.push(format!("{d} is not answering")); } }
+    match deps["polymarket"]["last_trade_min"].as_i64() {
+        Some(m) if m > PM_TRADES_MAX_MIN => degraded.push(format!("polymarket: no sharp-wallet trade ingested in {m} min (whale-tracker)")),
+        _ => {}
+    }
     if failing_jobs > 0 { degraded.push(format!("{failing_jobs} autopilot job(s) failed on their last run")); }
     match tick_min { Some(m) if m <= TICK_MAX_MIN => {}, Some(m) => degraded.push(format!("autopilot last ticked {m} min ago")), None => degraded.push("autopilot has never ticked".into()) }
     for s in stale_sports { degraded.push(format!("{s}: open picks but no line seen in {LINES_MAX_MIN} min")); }
@@ -121,6 +145,11 @@ pub(crate) fn assess(services: &[(String, bool)], deps: &Value, failing_jobs: us
             None => degraded.push("no database backup recorded (scripts/ops/backup.py)".into()),
             Some(h) if h > BACKUP_MAX_H => degraded.push(format!("last database backup {h:.0} h ago")),
             _ => {}
+        }
+    }
+    if let Some(big) = host["logs"]["largest"].as_array() {
+        for f in big.iter().filter(|f| f["mb"].as_f64().map(|m| m > LOG_MAX_MB).unwrap_or(false)) {
+            degraded.push(format!("log {} is {} MB", f["file"].as_str().unwrap_or("?"), f["mb"]));
         }
     }
     let overall = if !down.is_empty() { "down" } else if !degraded.is_empty() { "degraded" } else { "ok" };
@@ -148,9 +177,11 @@ pub async fn ops_status(state: web::Data<State>) -> impl Responder {
 
     let pg = db_ok(db).await;
     let size = db.query_opt("SELECT pg_database_size(current_database())", &[]).await.ok().flatten().map(|r| r.get::<_, i64>(0));
+    let pm_last = db.query_opt("SELECT max(ts) FROM pm_sharp_trades", &[]).await.ok().flatten().and_then(|r| r.get::<_, Option<DateTime<Utc>>>(0));
     let deps = json!({
         "postgres": { "ok": pg.is_ok(), "error": pg.err(), "size_gb": size.map(|b| (b as f64 / 1e9 * 10.0).round() / 10.0) },
         "clickhouse": { "ok": ch.0, "ms": ch.2 }, "ollama": { "ok": ol.0, "ms": ol.2 },
+        "polymarket": { "last_trade_at": pm_last, "last_trade_min": age_min(pm_last) },
     });
 
     let jobs = db.query("SELECT job, last_run, last_ok, left(coalesce(detail::text, ''), 200) FROM learning_jobs ORDER BY job", &[]).await.unwrap_or_default();
@@ -184,6 +215,7 @@ pub async fn ops_status(state: web::Data<State>) -> impl Responder {
 
     let mut host = host;
     host["backup"] = backup_status();
+    host["logs"] = logs_status();
     let svc_ok: Vec<(String, bool)> = svc.iter().map(|(n, _, ok, _, _)| (n.clone(), *ok)).collect();
     let (overall, reasons) = assess(&svc_ok, &deps, failing.len(), tick, &stale, &host);
     HttpResponse::Ok().json(json!({
@@ -220,5 +252,11 @@ mod tests {
         assert_eq!(assess(&up, &deps, 0, Some(5), &[], &old).1, vec!["last database backup 50 h ago".to_string()]);
         let none = json!({ "disk_c_free_gb": 40.0, "mem_free_gb": 4.0, "backup": { "age_h": null } });
         assert_eq!(assess(&up, &deps, 0, Some(5), &[], &none).0, "degraded");
+        let pm_stale = json!({ "postgres": { "ok": true }, "clickhouse": { "ok": true }, "ollama": { "ok": true }, "polymarket": { "last_trade_min": 2100 } });
+        assert_eq!(assess(&up, &pm_stale, 0, Some(5), &[], &host).1, vec!["polymarket: no sharp-wallet trade ingested in 2100 min (whale-tracker)".to_string()]);
+        let pm_ok = json!({ "postgres": { "ok": true }, "clickhouse": { "ok": true }, "ollama": { "ok": true }, "polymarket": { "last_trade_min": 30 } });
+        assert_eq!(assess(&up, &pm_ok, 0, Some(5), &[], &host).0, "ok");
+        let flood = json!({ "disk_c_free_gb": 40.0, "mem_free_gb": 4.0, "logs": { "largest": [{ "file": "x.err.log", "mb": 150.0 }, { "file": "y.out.log", "mb": 2.0 }] } });
+        assert_eq!(assess(&up, &deps, 0, Some(5), &[], &flood).1, vec!["log x.err.log is 150.0 MB".to_string()]);
     }
 }

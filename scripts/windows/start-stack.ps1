@@ -5,12 +5,42 @@
 # overrides are applied (Postgres on 5434, ClickHouse monster/monster).
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\windows\start-stack.ps1
+# Logs are not overwritten: before a service starts, its previous logs move to logs\archive\
+# (<name>.<out|err>.<time>.log); the archive keeps the last 5 per log, none older than 14 days,
+# at most 500 MB in all. A live log cannot be rotated while its service runs (Windows holds the
+# file); /ops/status flags one that grows past 100 MB.
 # Stop everything: Get-Process *-service,*-engine,api-gateway,monster-gpt,whale-tracker,feature-store,model-registry,market-intelligence,sport-intelligence,copy-trading | Stop-Process
 
 $ErrorActionPreference = "Continue"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $logDir = Join-Path $env:LOCALAPPDATA "MonsterOS\logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
+
+$archive = Join-Path $logDir "archive"
+New-Item -ItemType Directory -Force $archive | Out-Null
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$archivePattern = '^(.+)\.\d{8}_\d{6}\.log$'
+
+# moves a previous, non-empty log into the archive (skipped if a process still holds it)
+function Archive-Log($path) {
+    if (-not (Test-Path $path) -or (Get-Item $path).Length -eq 0) { return }
+    $base = [IO.Path]::GetFileNameWithoutExtension($path)
+    try { Move-Item $path (Join-Path $archive "$base.$stamp.log") -ErrorAction Stop } catch {}
+}
+
+# retention: only files this script archived (<log>.<yyyyMMdd_HHmmss>.log)
+function Prune-Archive {
+    $files = Get-ChildItem $archive -File | Where-Object { $_.Name -match $archivePattern } | Sort-Object LastWriteTime -Descending
+    $cutoff = (Get-Date).AddDays(-14)
+    $drop = @()
+    foreach ($g in $files | Group-Object { ($_.Name -replace $archivePattern, '$1') }) {
+        $drop += $g.Group | Select-Object -Skip 5
+    }
+    $drop += $files | Where-Object { $_.LastWriteTime -lt $cutoff }
+    $total = 0
+    foreach ($f in $files) { $total += $f.Length; if ($total -gt 500MB) { $drop += $f } }
+    $drop | Sort-Object FullName -Unique | Remove-Item -Force -ErrorAction SilentlyContinue
+}
 
 function Listening($port) {
     [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
@@ -58,6 +88,8 @@ foreach ($name in $services.Keys) {
     if (Listening $port) { Write-Output ("{0,-26} :{1} already running" -f $name, $port); continue }
     if (-not (Test-Path $exe)) { Write-Output ("{0,-26} :{1} NOT BUILT (cargo build -p {0})" -f $name, $port); continue }
     $env:PORT = "$port"
+    Archive-Log (Join-Path $logDir "$name.out.log")
+    Archive-Log (Join-Path $logDir "$name.err.log")
     Start-Process -FilePath $exe -WorkingDirectory $repo -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logDir "$name.out.log") `
         -RedirectStandardError (Join-Path $logDir "$name.err.log") | Out-Null
@@ -69,8 +101,10 @@ $dash = Join-Path $repo "apps\dashboard"
 if (Listening 5190) {
     Write-Output "dashboard                  :5190 already running"
 } else {
+    Archive-Log (Join-Path $logDir "dashboard.log")
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "npm run dev > `"$logDir\dashboard.log`" 2>&1" `
         -WorkingDirectory $dash -WindowStyle Hidden | Out-Null
     Write-Output "dashboard                  :5190 started"
 }
+Prune-Archive
 Write-Output "Open http://localhost:5190  (logs: $logDir)"

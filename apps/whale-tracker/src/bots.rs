@@ -928,7 +928,7 @@ async fn cycle(state: &State) -> Result<Value, String> {
             };
             let err = res.as_ref().err().cloned();
             if let Some(e) = &err {
-                eprintln!("whale-tracker: bot {} ({}): {e}", b.id, b.strategy);
+                crate::log_err(format!("bot {} ({}): {e}", b.id, b.strategy));
             }
             copied += res.unwrap_or(0);
             let _ = state.db.execute(
@@ -947,7 +947,7 @@ pub fn spawn_loop(state: web::Data<State>) {
     actix_web::rt::spawn(async move {
         loop {
             if let Err(e) = run_cycle(&state).await {
-                eprintln!("whale-tracker: copy bots cycle: {e}");
+                crate::log_err(format!("copy bots cycle: {e}"));
             }
             actix_web::rt::time::sleep(Duration::from_secs(secs)).await;
         }
@@ -1068,7 +1068,7 @@ pub async fn create(state: web::Data<State>, body: web::Json<NewBot>) -> HttpRes
             let mut mirror_err = None;
             if body.mirror_existing {
                 if let Err(e) = mirror_positions(&state, &bot_from_row(&r)).await {
-                    eprintln!("whale-tracker: mirror positions: {e}");
+                    crate::log_err(format!("mirror positions: {e}"));
                     mirror_err = Some(e);
                 }
             }

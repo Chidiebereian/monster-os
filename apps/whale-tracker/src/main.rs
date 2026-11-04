@@ -121,8 +121,43 @@ impl PmTrade {
     }
 }
 
+/// Writes an error line with a UTC timestamp. The same kind of error (URLs, numbers and
+/// addresses ignored) is printed at most once an hour, with a count of the ones held back,
+/// so a failing upstream cannot flood the log (Polymarket's v1 retirement wrote 67k
+/// identical lines in 35 h).
+pub(crate) fn log_err(msg: impl std::fmt::Display) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static SEEN: Mutex<Option<HashMap<String, (Instant, u64)>>> = Mutex::new(None);
+    let msg = msg.to_string();
+    let now = Instant::now();
+    let held = {
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = g.get_or_insert_with(HashMap::new);
+        match seen.get_mut(&err_key(&msg)) {
+            Some((last, n)) if now.duration_since(*last) < Duration::from_secs(3600) => { *n += 1; return; }
+            Some((last, n)) => { let h = *n; *last = now; *n = 0; h }
+            None => {
+                if seen.len() > 2000 { seen.clear(); }
+                seen.insert(err_key(&msg), (now, 0));
+                0
+            }
+        }
+    };
+    let more = if held > 0 { format!(" ({held} more like this since the last one)") } else { String::new() };
+    eprintln!("{} whale-tracker: {msg}{more}", Utc::now().format("%Y-%m-%dT%H:%M:%SZ"));
+}
+
+/// The kind of an error message: URLs dropped, 0x addresses and digits masked.
+fn err_key(msg: &str) -> String {
+    msg.split_whitespace()
+        .filter(|t| !t.contains("://"))
+        .map(|t| if t.starts_with("0x") { "0x".to_string() } else { t.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect() })
+        .collect::<Vec<_>>().join(" ").chars().take(200).collect()
+}
+
 fn internal(msg: impl std::fmt::Display) -> HttpResponse {
-    eprintln!("whale-tracker: {msg}");
+    crate::log_err(format!("{msg}"));
     HttpResponse::InternalServerError().json(json!({ "error": msg.to_string() }))
 }
 
@@ -840,7 +875,7 @@ async fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     actix_web::rt::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("whale-tracker: postgres connection closed: {e}");
+            crate::log_err(format!("postgres connection closed: {e}"));
         }
     });
 
@@ -913,6 +948,15 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_kinds_ignore_urls_numbers_and_addresses() {
+        let a = "bot 3 (RN1): https://data-api.polymarket.com/activity?user=0x2005&limit=200: HTTP 410 Gone: retired";
+        let b = "bot 3 (RN1): https://data-api.polymarket.com/activity?user=0x2005&limit=100: HTTP 410 Gone: retired";
+        assert_eq!(err_key(a), err_key(b));
+        assert_eq!(err_key("pm refresh 0xabc: timeout after 30 s"), err_key("pm refresh 0xdef: timeout after 31 s"));
+        assert_ne!(err_key("signals poll: HTTP 410 Gone"), err_key("signals cycle: HTTP 410 Gone"));
+    }
 
     fn t(slug: &str, cond: &str, side: &str, ts: i64) -> PmTrade {
         PmTrade {

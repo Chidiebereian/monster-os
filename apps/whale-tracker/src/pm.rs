@@ -370,7 +370,7 @@ fn spawn_refresh(state: web::Data<State>, wallets: Vec<String>, full: bool) {
         for w in wallets {
             let r = if full { refresh_full(&state, &w).await } else { refresh_lite(&state, &w).await };
             if let Err(e) = r {
-                eprintln!("whale-tracker: pm refresh {w}: {e}");
+                crate::log_err(format!("pm refresh {w}: {e}"));
             }
             inflight().lock().unwrap().remove(&w);
         }
@@ -775,7 +775,7 @@ async fn big_trades(state: &web::Data<State>, min_trade: f64) -> Result<(Vec<Val
     stream::iter(need)
         .map(|w| async move {
             if let Err(e) = refresh_lite(state, &w).await {
-                eprintln!("whale-tracker: pm lite {w}: {e}");
+                crate::log_err(format!("pm lite {w}: {e}"));
             }
         })
         .buffer_unordered(6)

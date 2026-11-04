@@ -419,7 +419,7 @@ pub async fn run_cycle(state: &State) -> Result<Value, String> {
     let new_trades: usize = polled.iter().filter_map(|r| r.as_ref().ok()).sum();
     let poll_errors = polled.iter().filter(|r| r.is_err()).count();
     for e in polled.iter().filter_map(|r| r.as_ref().err()).take(3) {
-        eprintln!("whale-tracker: signals poll: {e}");
+        crate::log_err(format!("signals poll: {e}"));
     }
     state.db.execute("DELETE FROM pm_sharp_trades WHERE ts < now() - interval '7 days'", &[]).await.map_err(|e| e.to_string())?;
 
@@ -618,7 +618,7 @@ async fn trigger(state: &State) -> Value {
     let out = match run_cycle(state).await {
         Ok(v) => json!({"state": "ok", "last": v}),
         Err(e) => {
-            eprintln!("whale-tracker: signals cycle: {e}");
+            crate::log_err(format!("signals cycle: {e}"));
             json!({"state": "error", "error": e, "at": Utc::now()})
         }
     };
