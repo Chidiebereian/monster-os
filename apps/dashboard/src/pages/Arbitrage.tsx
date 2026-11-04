@@ -5,17 +5,22 @@ import { api } from "../lib/api";
 import { calculateArbitrage } from "../lib/arb";
 import { useSettings, SPORTS } from "../store/settings";
 import { formatPct, formatUsd } from "../lib/odds";
-import { Card, Input, Msg, PageTitle, Stat, Table, Td, Th } from "../components/ui";
+import { Card, Input, Msg, PageTitle, Pills, Stat, Table, Td, Th } from "../components/ui";
+import { PmArb } from "../components/PmArb";
 
-// Module 3: Arbitrage & Dutching. Top = client-side Dutching calculator; bottom
-// = cross-venue scanner (arbitrage-engine /scan: Kalshi vs sportsbook no-vig
-// consensus, with liquidity gates).
+// Module 3: Arbitrage. Prediction markets = Kalshi vs Polymarket futures arbs
+// (arbitrage-engine /pm-arb). Sportsbooks = Dutching calculator + the Kalshi vs
+// sportsbook no-vig scanner (arbitrage-engine /scan).
 export function Arbitrage() {
+  const [mode, setMode] = useState("pm");
   return (
     <div className="space-y-6">
-      <PageTitle title="Arbitrage & Dutching" subtitle="guaranteed-profit staking + cross-venue scanner" />
-      <DutchingCalculator />
-      <Scanner />
+      <PageTitle
+        title="Arbitrage"
+        subtitle={mode === "pm" ? "the same outcome on two prediction markets, priced under $1 for YES + NO" : "guaranteed-profit staking + cross-venue scanner"}
+        right={<Pills options={[{ key: "pm", label: "Prediction markets" }, { key: "books", label: "Sportsbooks" }]} value={mode} onChange={setMode} />}
+      />
+      {mode === "pm" ? <PmArb /> : <><DutchingCalculator /><Scanner /></>}
     </div>
   );
 }

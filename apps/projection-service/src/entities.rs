@@ -47,6 +47,16 @@ const FORMER_NAMES: [(&str, &str, &str, i32, i32); 2] = [
     ("nfl", "WAS", "Washington Football Team", 2020, 2021),
 ];
 
+/// Names other sources still use for a current team (no date limit): Polymarket's
+/// 2027 Stanley Cup market says "Utah Hockey Club"; Kalshi calls the Athletics "A's".
+const OTHER_NAMES: [(&str, &str, &str); 2] = [
+    ("nhl", "UTA", "Utah Hockey Club"),
+    ("mlb", "ATH", "A's"),
+];
+/// ESPN short locations that venues write out: the "LA Clippers" are also the
+/// "Los Angeles Clippers" (without it, "Los Angeles C" matched the Lakers).
+const LOCATIONS: [(&str, &str); 1] = [("LA", "Los Angeles")];
+
 /// Lowercase letters and digits only, accents folded ("Jokić" -> "jokic").
 pub(crate) fn norm(s: &str) -> String {
     s.chars().flat_map(|c| c.to_lowercase()).filter_map(|c| {
@@ -133,6 +143,10 @@ pub(crate) async fn build_all(state: &State) -> Result<Value, String> {
             }
             b.alias(&id, abbr, 0.8, None, None);
             b.alias(&id, &code, 0.8, None, None);
+            if let Some((_, long)) = LOCATIONS.iter().find(|l| Some(l.0) == t["location"].as_str()) {
+                b.alias(&id, long, 0.6, None, None);
+                if let Some(nick) = t["name"].as_str() { b.alias(&id, &format!("{long} {nick}"), 1.0, None, None); }
+            }
             kept += 1;
         }
         // stored raw codes that canon maps onto a kept team (NY -> NYK, LA -> LAR ...)
@@ -159,6 +173,10 @@ pub(crate) async fn build_all(state: &State) -> Result<Value, String> {
     }
     for (sport, code, name, from, to) in FORMER_NAMES {
         b.alias(&format!("tm:{sport}:{code}"), name, 1.0, season_start(from), season_end(to));
+    }
+    for (sport, code, name) in OTHER_NAMES {
+        let id = format!("tm:{sport}:{code}");
+        if b.ents.iter().any(|e| e.0 == id) { b.alias(&id, name, 1.0, None, None); }
     }
     // NHL full names from the current rosters (the stored names are "C. McDavid")
     let nhl_full = nhl_full_names(state, stored.get("nhl").cloned().unwrap_or_default()).await;

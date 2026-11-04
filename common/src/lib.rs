@@ -99,6 +99,40 @@ impl FeeSchedule {
     }
 }
 
+/// One outcome of a multi-outcome event on a prediction-market venue (e.g. "Baltimore"
+/// in Kalshi's AFC Champion 2026-27 event), as prediction-market-service `/futures`
+/// returns it. Prices are dollars per $1 contract; `None` = no resting order.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VenueMarket {
+    pub venue: String,
+    /// Kalshi market ticker, or Polymarket market slug.
+    pub market_id: String,
+    pub event_id: String,
+    pub event_title: String,
+    /// What YES resolves on, as the venue labels it ("Baltimore", "Buffalo Bills").
+    pub outcome: String,
+    /// The venue's own short code for the outcome, when it has one (Kalshi ticker suffix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Season as the year it ends (Kalshi "-27", Polymarket "2027"), when the venue says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<i32>,
+    pub yes_bid: Option<f64>,
+    pub yes_ask: Option<f64>,
+    /// When the outcome is expected to be known (Kalshi expected expiration, Polymarket end date).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolves_at: Option<DateTime<Utc>>,
+    /// The venue's resolution rules for this market, verbatim.
+    pub rules: String,
+    /// The venue's page for this market.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f64>,
+    /// Taker fee, when known. `None` means unknown, not free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taker_fee: Option<FeeSchedule>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PricingOutput {
     pub probability: f64,

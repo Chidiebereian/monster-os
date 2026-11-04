@@ -15,9 +15,14 @@
 //!     odds-service (ODDS_SERVICE_URL) and prices it against the sportsbooks'
 //!     no-vig consensus, after an estimated Kalshi taker fee. See scan.rs.
 //!
+//! GET  /pm-arb, POST /pm-arb/refresh
+//!     prediction-market arbitrage: the same futures outcome on Kalshi and Polymarket
+//!     priced below $1 for YES + NO after fees. See pm_arb.rs.
+//!
 //! `edge` is fair probability minus the market's implied probability; `roi`
 //! is expected profit per unit staked.
 
+mod pm_arb;
 mod scan;
 
 use std::time::Duration;
@@ -295,10 +300,39 @@ async fn main() -> std::io::Result<()> {
             .trim_end_matches('/')
             .to_string(),
     });
+    // prediction-market arbitrage: scanned in the background (PM_ARB_INTERVAL_SECS, 0 = off)
+    let arb = web::Data::new(pm_arb::ArbState::new());
+    let arb_urls = web::Data::new(pm_arb::Urls {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+        markets: markets.base_url.clone(),
+        projection: std::env::var("PROJECTION_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8121".into())
+            .trim_end_matches('/')
+            .to_string(),
+    });
+    let every: u64 = std::env::var("PM_ARB_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(180);
+    if every > 0 {
+        let (st, u) = (arb.clone(), arb_urls.clone());
+        actix_web::rt::spawn(async move {
+            // let the other services come up first
+            actix_web::rt::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                pm_arb::run(&u, &st).await;
+                actix_web::rt::time::sleep(Duration::from_secs(every.max(60))).await;
+            }
+        });
+    }
     println!("arbitrage-engine on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(markets.clone())
+            .app_data(arb.clone())
+            .app_data(arb_urls.clone())
+            .route("/pm-arb", web::get().to(pm_arb::get_http))
+            .route("/pm-arb/refresh", web::post().to(pm_arb::refresh_http))
             .route("/healthz", web::get().to(healthz))
             .route("/edges", web::get().to(edges))
             .route("/scan", web::get().to(scan_markets))
