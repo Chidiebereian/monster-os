@@ -21,10 +21,12 @@ Runs, in order, and fails closed (exit 1) on the first broken guarantee:
   9. curriculum      the from-scratch model curriculum and Micro GPT (models/monster-gpt/tests)
  10. sim-repro       the simulators reproduce a run from its seed, and two seeds agree within the
                      Monte Carlo error MonsterGPT states (apps/monster-gpt/tests/test_sim_repro.py)
- 11. golden          golden.json is valid and every truth query computes (read-only);
+ 11. restore         the latest backup restores into a scratch database and matches its manifest
+                     (scripts/ops/restore_check.py; run scripts/ops/backup.py first)
+ 12. golden          golden.json is valid and every truth query computes (read-only);
                      --golden also asks every question on a scratch MonsterGPT, grades it and
                      fails unless every release gate is met
- 12. secrets         tracked, staged and to-be-added files plus git history: database URLs
+ 13. secrets         tracked, staged and to-be-added files plus git history: database URLs
                      with passwords, the live .env credentials, private keys, API-key shapes.
                      Files that already carried the local owner login before this gate
                      existed are listed as pre-existing; anything else fails. No value is printed.
@@ -136,6 +138,7 @@ def main():
     steps.append(("curriculum", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "models/monster-gpt/tests"])))
     steps.append(("golden", lambda: run([py, "apps/monster-gpt/tests/golden.py", "--check"])))
     steps.append(("sim-repro", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "apps/monster-gpt/tests/test_sim_repro.py"])))
+    steps.append(("restore", lambda: run([py, "scripts/ops/restore_check.py"], timeout=1800)))
     steps.append(("secrets", secrets_scan))
     if a.e2e:
         steps.append(("e2e", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "apps/monster-gpt/tests/e2e_ws.py"], timeout=3600)))

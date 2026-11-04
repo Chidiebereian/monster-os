@@ -81,6 +81,27 @@ fn host() -> Value {
 }
 
 /// Reasons the stack is degraded or down, from the summary (pure, so it is testable).
+/// A daily backup that has missed more than one run.
+const BACKUP_MAX_H: f64 = 36.0;
+
+/// The newest backup's manifest (%LOCALAPPDATA%/MonsterOS/backups/LATEST, written by scripts/ops/backup.py).
+fn backup_status() -> Value {
+    let dir = std::env::var("MONSTER_BACKUP_DIR").ok()
+        .or_else(|| std::env::var("LOCALAPPDATA").ok().map(|l| format!("{l}\\MonsterOS\\backups")));
+    let manifest = dir.and_then(|d| std::fs::read_to_string(format!("{d}\\LATEST")).ok())
+        .and_then(|p| std::fs::read_to_string(format!("{}\\manifest.json", p.trim())).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    match manifest {
+        Some(m) => {
+            let created = m["created"].as_str().and_then(|c| chrono::NaiveDateTime::parse_from_str(c, "%Y-%m-%dT%H:%M:%S").ok());
+            let age = created.map(|c| (chrono::Local::now().naive_local() - c).num_minutes() as f64 / 60.0);
+            json!({ "age_h": age.map(|a| (a * 10.0).round() / 10.0), "created": m["created"], "dump_mb": m["files"]["monsteros.dump"]["bytes"].as_f64().map(|b| (b / 1048576.0).round()),
+                    "offsite": m["offsite"] })
+        }
+        None => json!({ "age_h": null }),
+    }
+}
+
 pub(crate) fn assess(services: &[(String, bool)], deps: &Value, failing_jobs: usize, tick_min: Option<i64>, stale_sports: &[String], host: &Value) -> (&'static str, Vec<String>) {
     let mut down = Vec::new();
     let mut degraded = Vec::new();
@@ -94,6 +115,14 @@ pub(crate) fn assess(services: &[(String, bool)], deps: &Value, failing_jobs: us
     for s in stale_sports { degraded.push(format!("{s}: open picks but no line seen in {LINES_MAX_MIN} min")); }
     if host["disk_c_free_gb"].as_f64().map(|g| g < 10.0).unwrap_or(false) { degraded.push(format!("C: has {} GB free", host["disk_c_free_gb"])); }
     if host["mem_free_gb"].as_f64().map(|g| g < 1.0).unwrap_or(false) { degraded.push(format!("{} GB of memory free", host["mem_free_gb"])); }
+    // the latest database backup (scripts/ops/backup.py): none, or older than a day and a half
+    if let Some(b) = host.get("backup") {
+        match b["age_h"].as_f64() {
+            None => degraded.push("no database backup recorded (scripts/ops/backup.py)".into()),
+            Some(h) if h > BACKUP_MAX_H => degraded.push(format!("last database backup {h:.0} h ago")),
+            _ => {}
+        }
+    }
     let overall = if !down.is_empty() { "down" } else if !degraded.is_empty() { "degraded" } else { "ok" };
     down.extend(degraded);
     (overall, down)
@@ -153,6 +182,8 @@ pub async fn ops_status(state: web::Data<State>) -> impl Responder {
         budgets.push(json!({ "provider": p, "today": r.get::<_, i32>(1), "daily_budget": daily, "month": r.get::<_, i32>(2) }));
     }
 
+    let mut host = host;
+    host["backup"] = backup_status();
     let svc_ok: Vec<(String, bool)> = svc.iter().map(|(n, _, ok, _, _)| (n.clone(), *ok)).collect();
     let (overall, reasons) = assess(&svc_ok, &deps, failing.len(), tick, &stale, &host);
     HttpResponse::Ok().json(json!({
@@ -183,5 +214,11 @@ mod tests {
         assert_eq!(o, "degraded");
         assert_eq!(r.len(), 6, "{r:?}");
         assert_eq!(assess(&up, &json!({ "postgres": { "ok": false } }), 0, Some(5), &[], &host).0, "down");
+        let fresh = json!({ "disk_c_free_gb": 40.0, "mem_free_gb": 4.0, "backup": { "age_h": 3.0 } });
+        assert_eq!(assess(&up, &deps, 0, Some(5), &[], &fresh).0, "ok");
+        let old = json!({ "disk_c_free_gb": 40.0, "mem_free_gb": 4.0, "backup": { "age_h": 50.0 } });
+        assert_eq!(assess(&up, &deps, 0, Some(5), &[], &old).1, vec!["last database backup 50 h ago".to_string()]);
+        let none = json!({ "disk_c_free_gb": 40.0, "mem_free_gb": 4.0, "backup": { "age_h": null } });
+        assert_eq!(assess(&up, &deps, 0, Some(5), &[], &none).0, "degraded");
     }
 }
