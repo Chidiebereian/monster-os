@@ -295,7 +295,7 @@ async fn main() -> std::io::Result<()> {
             .trim_end_matches('/')
             .to_string(),
     });
-    println!("arbitrage-engine listening on 0.0.0.0:{}", port);
+    println!("arbitrage-engine on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(markets.clone())
@@ -303,7 +303,7 @@ async fn main() -> std::io::Result<()> {
             .route("/edges", web::get().to(edges))
             .route("/scan", web::get().to(scan_markets))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

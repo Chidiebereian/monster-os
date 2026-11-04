@@ -312,7 +312,7 @@ async fn main() -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let db = web::Data::new(Pg { url, client: Mutex::new(Arc::new(client)) });
 
-    println!("feature-store listening on 0.0.0.0:{}", port);
+    println!("feature-store on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(db.clone())
@@ -325,7 +325,7 @@ async fn main() -> std::io::Result<()> {
             .route("/features/{kind}/{scope}/{id}", web::put().to(put_features))
             .route("/features/{kind}/{scope}/{id}", web::get().to(get_features))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

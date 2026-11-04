@@ -1048,7 +1048,7 @@ async fn main() -> std::io::Result<()> {
         println!("sport-intelligence: auto-snapshot every {secs}s");
     }
 
-    println!("sport-intelligence listening on 0.0.0.0:{port}");
+    println!("sport-intelligence on port {port}");
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
@@ -1061,7 +1061,7 @@ async fn main() -> std::io::Result<()> {
             .route("/signals/active", web::get().to(active_signals))
             .route("/signals/history", web::get().to(signal_history))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

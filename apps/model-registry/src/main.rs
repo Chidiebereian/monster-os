@@ -161,7 +161,7 @@ async fn main() -> std::io::Result<()> {
     });
     let db = web::Data::new(Arc::new(client));
 
-    println!("model-registry listening on 0.0.0.0:{}", port);
+    println!("model-registry on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(db.clone())
@@ -171,7 +171,7 @@ async fn main() -> std::io::Result<()> {
             .route("/models/{id}", web::get().to(get_model))
             .route("/models/{id}/status", web::patch().to(set_status))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

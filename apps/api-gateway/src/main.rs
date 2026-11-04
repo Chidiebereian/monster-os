@@ -139,7 +139,7 @@ async fn main() -> std::io::Result<()> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
         upstreams: SERVICES.iter().map(|&(n, p)| (n, upstream_url(n, p))).collect(),
     });
-    println!("api-gateway listening on 0.0.0.0:{}", port);
+    println!("api-gateway on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(gw.clone())
@@ -149,7 +149,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/{service}/{tail:.*}", web::to(proxy))
             .route("/ws/{service}/{tail:.*}", web::get().to(ws::ws_proxy))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

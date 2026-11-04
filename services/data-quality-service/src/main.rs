@@ -43,14 +43,14 @@ async fn check(req: web::Json<CheckRequest>) -> impl Responder {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8113);
-    println!("data-quality-service listening on 0.0.0.0:{}", port);
+    println!("data-quality-service on port {}", port);
     HttpServer::new(|| {
         App::new()
             .app_data(web::JsonConfig::default().limit(64 * 1024 * 1024))
             .route("/healthz", web::get().to(healthz))
             .route("/check", web::post().to(check))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

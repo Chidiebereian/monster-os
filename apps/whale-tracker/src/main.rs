@@ -889,7 +889,7 @@ async fn main() -> std::io::Result<()> {
         ch_key: env_opt("CLICKHOUSE_PASSWORD"),
     });
 
-    println!("whale-tracker listening on 0.0.0.0:{port} (polymarket {}, clickhouse {})", state.pm_url, state.ch_url);
+    println!("whale-tracker on port {port} (polymarket {}, clickhouse {})", state.pm_url, state.ch_url);
     signals::spawn_loop(state.clone());
     bots::spawn_loop(state.clone());
     HttpServer::new(move || {
@@ -926,7 +926,7 @@ async fn main() -> std::io::Result<()> {
             .route("/bots/{id}", web::patch().to(bots::update))
             .route("/bots/{id}", web::delete().to(bots::remove))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

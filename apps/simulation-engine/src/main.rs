@@ -418,14 +418,14 @@ async fn main() -> std::io::Result<()> {
             .trim_end_matches('/')
             .to_string(),
     });
-    println!("simulation-engine listening on 0.0.0.0:{} (feature-store {})", port, fs.base_url);
+    println!("simulation-engine on port {} (feature-store {})", port, fs.base_url);
     HttpServer::new(move || {
         App::new()
             .app_data(fs.clone())
             .route("/healthz", web::get().to(healthz))
             .route("/simulate", web::get().to(simulate))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

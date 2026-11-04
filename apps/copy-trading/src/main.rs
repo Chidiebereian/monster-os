@@ -660,7 +660,7 @@ async fn main() -> std::io::Result<()> {
         key: std::env::var("CLICKHOUSE_PASSWORD").ok().filter(|v| !v.is_empty()),
     });
 
-    println!("copy-trading listening on 0.0.0.0:{} (clickhouse {})", port, ch.url);
+    println!("copy-trading on port {} (clickhouse {})", port, ch.url);
     HttpServer::new(move || {
         App::new()
             .app_data(db.clone())
@@ -674,7 +674,7 @@ async fn main() -> std::io::Result<()> {
             .route("/copy/{id}/close", web::post().to(close_copy))
             .route("/autofollow", web::post().to(autofollow))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

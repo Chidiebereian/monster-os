@@ -44,6 +44,14 @@ inputs are the optional odds feeds (see "External data").
 | 8100-8113 | services/* (several are health-check stubs) | 8120 | odds-service |
 | 5434 | Postgres (127.0.0.1 only) | 8123 / 11434 | ClickHouse HTTP / Ollama |
 
+Every port is on this machine only. The services listen on 127.0.0.1 and ::1
+(`common::bind_addrs`; set `BIND_ADDR`, e.g. `0.0.0.0`, to serve a network on purpose), and
+Docker publishes on 127.0.0.1. None of the services checks who is calling, so they must not
+be reachable from a network: until 2026-11-04 they listened on every interface, and the
+firewall allowed all of them on the Public profile this PC uses on guest Wi-Fi (ops B2).
+`scripts\windows\close-lan-firewall.ps1` lists those inbound rules; `-Apply`, run as
+administrator, removes them.
+
 Health: `GET /healthz` on every service; `GET :8121/readyz` (database + autopilot) and
 `GET :8121/ops/status` (every service, data stores, jobs, data freshness, API budgets,
 disk and memory).

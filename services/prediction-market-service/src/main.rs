@@ -452,7 +452,7 @@ async fn main() -> std::io::Result<()> {
         polymarket: env_url("POLYMARKET_API_URL", "https://gamma-api.polymarket.com"),
         clob: env_url("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
     });
-    println!("prediction-market-service listening on 0.0.0.0:{}", port);
+    println!("prediction-market-service on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(venues.clone())
@@ -462,7 +462,7 @@ async fn main() -> std::io::Result<()> {
             .route("/markets/kalshi", web::get().to(kalshi_markets))
             .route("/markets/polymarket", web::get().to(polymarket_markets))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

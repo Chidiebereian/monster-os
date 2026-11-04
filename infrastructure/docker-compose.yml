@@ -1,5 +1,8 @@
 # MonsterOS infrastructure — all open source, no paid vendors.
 # Usage: docker compose -f infrastructure/docker-compose.yml --env-file .env up -d
+# Every host port is published on 127.0.0.1 only: nothing here has to be reachable from
+# another machine, and ClickHouse and Ollama would otherwise be open to the Wi-Fi (ops B2).
+# With a GPU: add -f infrastructure/docker-compose.gpu.yml (the live Ollama runs with it).
 services:
   postgres:
     image: postgres:16
@@ -22,7 +25,7 @@ services:
       # so host services can't query it. Mirror the Postgres monster/monster default.
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-monster}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-monster}
-    ports: ["8123:8123", "9000:9000"]
+    ports: ["127.0.0.1:8123:8123", "127.0.0.1:9000:9000"]
     volumes:
       - ch_data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -31,7 +34,7 @@ services:
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     command: ["redis-server", "--appendonly", "yes"]
     volumes: [redis_data:/data]
 
@@ -41,27 +44,27 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-monsteradmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-monsteradmin123}
-    ports: ["9002:9000", "9001:9001"]
+    ports: ["127.0.0.1:9002:9000", "127.0.0.1:9001:9001"]
     volumes: [minio_data:/data]
 
   nats:
     image: nats:2.10
     command: ["-js", "-m", "8222"]
-    ports: ["4222:4222", "8222:8222"]
+    ports: ["127.0.0.1:4222:4222", "127.0.0.1:8222:8222"]
 
   prometheus:
     image: prom/prometheus:latest
-    ports: ["9090:9090"]
+    ports: ["127.0.0.1:9090:9090"]
     volumes: [./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
 
   grafana:
     image: grafana/grafana:latest
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     volumes: [grafana_data:/var/lib/grafana]
 
   ollama:
     image: ollama/ollama:latest
-    ports: ["11434:11434"]
+    ports: ["127.0.0.1:11434:11434"]
     volumes: [ollama_data:/root/.ollama]
 
 volumes:

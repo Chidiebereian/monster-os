@@ -145,7 +145,7 @@ async fn parlay(q: web::Query<ParlayQuery>) -> impl Responder {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8111);
-    println!("kelly-service listening on 0.0.0.0:{}", port);
+    println!("kelly-service on port {}", port);
     HttpServer::new(|| {
         App::new()
             .route("/healthz", web::get().to(healthz))
@@ -154,7 +154,7 @@ async fn main() -> std::io::Result<()> {
             .route("/hedge", web::get().to(hedge))
             .route("/parlay", web::get().to(parlay))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

@@ -10,8 +10,8 @@ tests: `scripts/ops/test_governance.py`.
 MonsterOS has no user accounts. Administrative calls must come from this machine
 and carry `Authorization: Bearer <admin token>`:
 
-- projection-service listens on 127.0.0.1 and ::1 only (`BIND_ADDR` overrides it,
-  for tests). A call is local when the socket peer is loopback and every address in
+- projection-service, like every service, listens on 127.0.0.1 and ::1 only
+  (`common::bind_addrs`; `BIND_ADDR` overrides it, for tests). A call is local when the socket peer is loopback and every address in
   `X-Forwarded-For`, `X-Real-IP` and `Forwarded` is loopback too; headers can only
   make a call less local. The gateway replaces any client `X-Forwarded-For` with
   its own socket peer, so a remote browser behind it is refused.

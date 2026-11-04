@@ -77,7 +77,7 @@ async fn novig(q: web::Query<NoVigQuery>) -> impl Responder {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8082);
-    println!("pricing-engine listening on 0.0.0.0:{}", port);
+    println!("pricing-engine on port {}", port);
     HttpServer::new(|| {
         App::new()
             .route("/healthz", web::get().to(healthz))
@@ -85,7 +85,7 @@ async fn main() -> std::io::Result<()> {
             .route("/implied", web::get().to(implied))
             .route("/novig", web::get().to(novig))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

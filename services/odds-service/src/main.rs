@@ -523,7 +523,7 @@ async fn main() -> std::io::Result<()> {
         pool: Mutex::new(KeyPool::new(key_list)),
     });
     println!(
-        "odds-service listening on 0.0.0.0:{} ({} API keys loaded)",
+        "odds-service on port {} ({} API keys loaded)",
         port,
         api.pool.lock().unwrap().keys.len()
     );
@@ -535,7 +535,7 @@ async fn main() -> std::io::Result<()> {
             .route("/screen/{sport}", web::get().to(screen))
             .route("/keys", web::get().to(keys))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }

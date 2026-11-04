@@ -4,6 +4,30 @@ use actix_web::{HttpResponse, Responder};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Where a service listens: loopback only by default, 127.0.0.1 plus ::1 (so "localhost"
+/// resolving to IPv6 still connects). Every caller (the gateway, the dashboard proxy, the
+/// autopilot) is on this machine; the services have no authentication, so they are not
+/// served to the network (ops backlog B2: they were reachable from a public Wi-Fi).
+/// `BIND_ADDR` overrides it (e.g. `0.0.0.0` to serve the LAN deliberately).
+pub fn bind_addrs(port: u16) -> Vec<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let host = std::env::var("BIND_ADDR").ok().filter(|v| !v.trim().is_empty());
+    let ip = match host.as_deref().map(|h| h.trim().parse::<IpAddr>()) {
+        Some(Ok(ip)) => ip,
+        Some(Err(_)) => {
+            eprintln!("BIND_ADDR {:?} is not an IP address; listening on loopback", host.unwrap_or_default());
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+    };
+    let mut out = vec![SocketAddr::new(ip, port)];
+    if ip == IpAddr::V4(Ipv4Addr::LOCALHOST) && std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok() {
+        out.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port));
+    }
+    println!("listening on {}", out.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
+    out
+}
+
 /// Every sport implements this pipeline:
 /// ingest -> engineer_features -> fit_model -> simulate -> output_probabilities
 pub trait SportModel {
@@ -206,4 +230,23 @@ pub fn implied_probability(odds: i64) -> Option<f64> {
 /// Standard health check every service exposes at GET /healthz.
 pub async fn healthz() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::bind_addrs;
+
+    #[test]
+    fn loopback_unless_overridden() {
+        // one test: BIND_ADDR is process-wide
+        std::env::remove_var("BIND_ADDR");
+        let a = bind_addrs(18999);
+        assert!(a.iter().all(|x| x.ip().is_loopback()), "{a:?}");
+        assert_eq!(a[0].to_string(), "127.0.0.1:18999");
+        std::env::set_var("BIND_ADDR", "0.0.0.0");
+        assert_eq!(bind_addrs(18999).iter().map(|x| x.to_string()).collect::<Vec<_>>(), vec!["0.0.0.0:18999"]);
+        std::env::set_var("BIND_ADDR", "not-an-ip");
+        assert!(bind_addrs(18999)[0].ip().is_loopback());
+        std::env::remove_var("BIND_ADDR");
+    }
 }

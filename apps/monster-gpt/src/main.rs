@@ -655,11 +655,11 @@ async fn main() -> std::io::Result<()> {
     });
     match &llm.fallback {
         Some(fb) => println!(
-            "monster-gpt listening on 0.0.0.0:{port} (LLM {} @ {}; non-sensitive fallback {} @ {})",
+            "monster-gpt on port {port} (LLM {} @ {}; non-sensitive fallback {} @ {})",
             llm.primary.model, llm.primary.base_url, fb.model, fb.base_url
         ),
         None => println!(
-            "monster-gpt listening on 0.0.0.0:{port} (LLM {} @ {}; no fallback)",
+            "monster-gpt on port {port} (LLM {} @ {}; no fallback)",
             llm.primary.model, llm.primary.base_url
         ),
     }
@@ -768,7 +768,7 @@ async fn main() -> std::io::Result<()> {
             .route("/ask", web::post().to(ask))
             .route("/retrieve", web::get().to(retrieve_handler))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(&common::bind_addrs(port)[..])?
     .run()
     .await
 }
