@@ -5,7 +5,10 @@
 //! player's new status (`injury_status`, value = probability of playing), or
 //! `cleared` when a listed player drops off the report. `observed_at` and
 //! `available_at` are the fetch time, so the history shows what was known and
-//! when; nothing is back-filled. `event_at` is ESPN's own report date when given.
+//! when; nothing is back-filled. The rows belong to no game, so `event_at` (the
+//! time of the game a feature describes) is NULL; ESPN's own report date is kept
+//! as its own row, `injury_reported`. v1 and v2 wrote the report date into
+//! `event_at`; those immutable rows are known and excluded by the integrity check.
 //! The rows are the input for decision-time features and for the news circuit
 //! breaker below.
 //!
@@ -26,7 +29,7 @@ use tokio_postgres::types::Json;
 use crate::State;
 
 const SOURCE: &str = "espn_injuries";
-const EXTRACTOR: &str = "injury_snap v2";
+const EXTRACTOR: &str = "injury_snap v3";
 /// A change of at least this much in the probability of playing trips the breaker.
 const MATERIAL: f64 = 0.25;
 const LEAGUES: [(&str, &str); 3] = [("nba", "basketball/nba"), ("nfl", "football/nfl"), ("nhl", "hockey/nhl")];
@@ -43,7 +46,7 @@ pub(crate) fn p_play(status: &str) -> f64 {
 #[derive(Clone, Default)]
 pub(crate) struct Listing { pub status: String, pub team: String, pub abbr: String, pub name: String, pub date: Option<String> }
 
-struct Entry { l: Listing, event_at: Option<chrono::DateTime<chrono::Utc>>, was: Option<String> }
+struct Entry { l: Listing, was: Option<String> }
 
 /// player id -> current listing, from one league report.
 pub(crate) fn parse(v: &Value) -> HashMap<String, Listing> {
@@ -91,10 +94,7 @@ pub(crate) async fn snapshot(state: &State) -> Result<Value, String> {
         let mut changes: Vec<(String, Entry)> = Vec::new();
         for (id, l) in &report {
             if last.get(id).map(|s| !s.eq_ignore_ascii_case(&l.status)).unwrap_or(true) {
-                let date = l.date.as_deref();
-                let event_at = date.and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok()).map(|d| d.with_timezone(&chrono::Utc))
-                    .or_else(|| date.and_then(|d| chrono::NaiveDateTime::parse_from_str(d, "%Y-%m-%dT%H:%MZ").ok()).map(|d| d.and_utc()));
-                changes.push((id.clone(), Entry { l: l.clone(), event_at, was: last.get(id).cloned() }));
+                changes.push((id.clone(), Entry { l: l.clone(), was: last.get(id).cloned() }));
             }
         }
         // listed before, gone now: back to available (name and team from the last listing; recorded from v2 on)
@@ -104,16 +104,17 @@ pub(crate) async fn snapshot(state: &State) -> Result<Value, String> {
                  FROM (SELECT DISTINCT ON (name) name, value_text FROM feature_snapshots WHERE sport=$1 AND source=$2 AND subject=$3 \
                        AND name IN ('injury_player','injury_team_abbr') ORDER BY name, observed_at DESC) x", &[&sport, &SOURCE, id]).await
                 .ok().flatten().map(|r| (r.get::<_, Option<String>>(0).unwrap_or_default(), r.get::<_, Option<String>>(1).unwrap_or_default())).unwrap_or_default();
-            changes.push((id.clone(), Entry { l: Listing { status: "cleared".into(), name: who.0, abbr: who.1, ..Default::default() }, event_at: None, was: last.get(id).cloned() }));
+            changes.push((id.clone(), Entry { l: Listing { status: "cleared".into(), name: who.0, abbr: who.1, ..Default::default() }, was: last.get(id).cloned() }));
         }
         let mut written = 0u64;
         for (id, e) in &changes {
             written += db.execute(
-                "INSERT INTO feature_snapshots (sport, game_id, subject, feature_set, name, value, value_text, event_at, observed_at, available_at, source, quality, extractor) \
-                 VALUES ($1, '', $2, 'availability', 'injury_status', $3, $4, $5, $6, $6, $7, 'observed', $8) ON CONFLICT DO NOTHING",
-                &[&sport, id, &p_play(&e.l.status), &e.l.status, &e.event_at, &now, &SOURCE, &EXTRACTOR]).await.map_err(|x| x.to_string())?;
+                "INSERT INTO feature_snapshots (sport, game_id, subject, feature_set, name, value, value_text, observed_at, available_at, source, quality, extractor) \
+                 VALUES ($1, '', $2, 'availability', 'injury_status', $3, $4, $5, $5, $6, 'observed', $7) ON CONFLICT DO NOTHING",
+                &[&sport, id, &p_play(&e.l.status), &e.l.status, &now, &SOURCE, &EXTRACTOR]).await.map_err(|x| x.to_string())?;
             if e.l.status == "cleared" { continue; }
-            for (name, text) in [("injury_team", &e.l.team), ("injury_team_abbr", &e.l.abbr), ("injury_player", &e.l.name)] {
+            let reported = e.l.date.clone().unwrap_or_default();
+            for (name, text) in [("injury_team", &e.l.team), ("injury_team_abbr", &e.l.abbr), ("injury_player", &e.l.name), ("injury_reported", &reported)] {
                 if text.is_empty() { continue; }
                 written += db.execute(
                     "INSERT INTO feature_snapshots (sport, game_id, subject, feature_set, name, value_text, observed_at, available_at, source, quality, extractor) \

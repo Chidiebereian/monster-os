@@ -78,10 +78,16 @@ def test_guards_are_installed():
 # ---------------------------------------------------------------- decision-time features
 
 def test_feature_rows_are_never_available_before_they_are_observed_or_after_the_event():
+    # injury_snap v1/v2 stored ESPN's report date (not a game time) in event_at on game-less rows;
+    # those rows are immutable and known, and v3 leaves event_at NULL (injury_snap.rs)
+    mislabelled = "(source = 'espn_injuries' AND game_id = '' AND extractor IN ('injury_snap v1','injury_snap v2'))"
     bad = q("SELECT feature_set, count(*) FROM feature_snapshots WHERE available_at < observed_at "
-            "OR (feature_set IN ('availability','lineup','minutes') AND event_at IS NOT NULL AND available_at > event_at) "
+            f"OR (feature_set IN ('availability','lineup','minutes') AND event_at IS NOT NULL AND available_at > event_at AND NOT {mislabelled}) "
             "OR (quality = 'missing' AND value IS NOT NULL) GROUP BY 1")
     assert bad == [], bad
+    # the exemption stays closed: nothing written after the fix carries a report date in event_at
+    assert q("SELECT count(*) FROM feature_snapshots WHERE source = 'espn_injuries' AND event_at IS NOT NULL "
+             "AND extractor NOT IN ('injury_snap v1','injury_snap v2')")[0][0] == 0
 
 
 def test_engine_inputs_keep_the_freeze_timestamp():
