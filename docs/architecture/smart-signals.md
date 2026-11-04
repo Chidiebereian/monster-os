@@ -40,7 +40,7 @@ on demand with `POST /pm/signals/run`. A cycle takes 3–4 minutes.
 
 | Part | Points | Full marks when |
 |---|---|---|
-| Category proof | 30 | Up all-time in this category; rank near the top (log scale to #5,000); return on volume ≥ 8%. **0 if not up all-time in this category.** |
+| Category proof | 30 | Up all-time in this category; rank near the top (log scale to #5,000); return on volume ≥ 8% (P&L per share traded: Polymarket reports category volume in shares). **0 if not up all-time in this category.** |
 | Overall record | 10 | Up all-time overall; high overall rank |
 | Slippage | 20 | Best ask within 0.5¢ of the trader's entry. Paying more costs fully. A drop below entry costs half as much: the market moved against them. |
 | Relative size | 15 | 10× the wallet's normal bet (1× = 30%) |
@@ -53,7 +53,7 @@ on demand with `POST /pm/signals/run`. A cycle takes 3–4 minutes.
 
 **Flags:**
 - `unproven_in_category`: not up all-time in this category.
-- `arber_or_maker`: more than $5M volume at under 0.5% return on it.
+- `arber_or_maker`: more than 5M shares of volume at under 0.5% return on it (P&L per share).
 - `bot_pace`: 100 fills within 30 minutes at a small per-market size.
 
 ## Modes

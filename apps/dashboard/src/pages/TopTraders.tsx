@@ -7,7 +7,7 @@ import { Card, Msg, Pills } from "../components/ui";
 import { Avatar, Money } from "../components/pm";
 import { formatPct, formatUsd } from "../lib/odds";
 import {
-  PM_CATEGORIES, PM_WINDOWS, cents, displayName, pm, shortAddr, timeAgo, walletAge,
+  PM_CATEGORIES, PM_WINDOWS, cents, displayName, formatShares, pm, shortAddr, timeAgo, walletAge,
   type BoardRow, type Mover, type TradeCard, type WalletStats,
 } from "../lib/pm";
 import { CopyBots } from "./CopyBots";
@@ -183,7 +183,7 @@ function BoardLine({ r, window, onOpen }: { r: BoardRow; window: string; onOpen:
         </div>
       </td>
       <td className="px-3 py-2 text-right"><Money v={r.pnl} /></td>
-      <td className="px-3 py-2 text-right font-mono text-gray-300">{formatUsd(r.vol)}</td>
+      <td className="px-3 py-2 text-right font-mono text-gray-300">{r.vol != null ? formatUsd(r.vol) : formatShares(r.vol_shares)}</td>
       <td className="px-3 py-2 text-right whitespace-nowrap"><WinRate s={s} /></td>
       <td className="px-3 py-2 text-right font-mono text-gray-300">{s?.markets_traded?.toLocaleString() ?? "—"}</td>
       <td className="px-3 py-2 text-right font-mono text-gray-300">{s?.active_positions?.toLocaleString() ?? "—"}</td>

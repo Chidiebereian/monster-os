@@ -238,4 +238,7 @@ def test_holds_do_not_change_evidence_or_unrelated_markets():
     assert tiers[("nhl_team", "team_total_home")][0] == "baseline"  # still baseline underneath, only hidden
     pub = http("/picks?status=open&limit=1000")[1]["picks"]
     internal = http("/picks?status=open&limit=1000&include_held=true")[1]["picks"]
-    assert [p["id"] for p in internal if (p["engine"], p["market"]) not in HELD] == [p["id"] for p in pub]
+    # unrelated = not held and in a public market (published or leans-only); a market never
+    # published (no publication_state row, e.g. a new NFL market) stays hidden whatever the holds
+    public = {(e, m) for e, m in q("SELECT engine, market FROM publication_state WHERE status IN ('published', 'leans_only')")}
+    assert [p["id"] for p in internal if (p["engine"], p["market"]) not in HELD and (p["engine"], p["market"]) in public] == [p["id"] for p in pub]

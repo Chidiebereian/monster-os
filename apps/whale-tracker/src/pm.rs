@@ -2,12 +2,18 @@
 //! Discover feeds (whale moves, new-wallet spotlight, momentum movers).
 //!
 //! Everything comes from Polymarket's public APIs; no key is needed:
-//!   data-api  /v1/leaderboard   rank, P&L, volume by category and window
-//!                               (`user=` gives one wallet's rank in any category)
-//!             /positions /closed-positions /activity /value /traded /trades
-//!             /v2/user-pnl      P&L time series (realized_pnl matches the
-//!                               leaderboard's all-time P&L to the cent)
-//!   gamma     /public-profile   name, avatar, join date
+//!   data-api v2  /leaderboard   rank, P&L, volume (in shares) by category and window
+//!                               (`user=` gives one wallet's standing in a category)
+//!                /positions (status OPEN | REDEEMABLE | REDEEMABLE_LOST | CLOSED)
+//!                /activity /trades /value /user-volume (USD) /user-pnl
+//!   gamma        /public-profile   name, avatar, join date
+//!
+//! Polymarket retired Data API v1 (and lb-api) on 2026-11-02: every v1 path answers
+//! HTTP 410. v2 wraps payloads in `data`, pages by cursor only (no offset), names
+//! fields in snake_case and reports leaderboard volume in shares, not USD. `v2_rows`
+//! and `v2_data` hide the envelope and paging; `legacy` maps rows back to the v1
+//! field names this service reads. USD volume comes from /user-volume; v1's
+//! markets-traded count (/traded) has no v2 equivalent and is no longer filled.
 //!
 //! Per-wallet stats that need many calls (win rate from closed positions,
 //! per-category P&L) are cached in Postgres `pm_wallet_stats` and refreshed in
@@ -149,22 +155,85 @@ pub(crate) async fn get_json(state: &State, url: &str) -> Result<Value, String> 
     Err(format!("{url}: still throttled after retries"))
 }
 
-fn lb_url(state: &State, category: &str, window: &str, order: &str, limit: usize, offset: usize) -> String {
-    format!(
-        "{}/v1/leaderboard?category={category}&timePeriod={window}&orderBy={order}&limit={limit}&offset={offset}",
-        state.pm_url
-    )
+/// Largest page v2 serves.
+const V2_PAGE: usize = 1000;
+
+fn camel(k: &str) -> String {
+    let mut out = String::with_capacity(k.len());
+    let mut up = false;
+    for c in k.chars() {
+        if c == '_' { up = true; } else if up { out.extend(c.to_uppercase()); up = false; } else { out.push(c); }
+    }
+    out
 }
 
-/// One wallet's standing on one leaderboard (rank, pnl, vol), if it has one.
+/// A Data API v2 row with the v1 field names added next to its own: every snake_case
+/// key also under its camelCase name, plus the fields v1 named differently.
+pub(crate) fn legacy(row: &Value) -> Value {
+    let Some(obj) = row.as_object() else { return row.clone() };
+    let mut out = obj.clone();
+    for (k, v) in obj {
+        if k.contains('_') {
+            out.entry(camel(k)).or_insert_with(|| v.clone());
+        }
+    }
+    for (v2, v1) in [
+        ("token_id", "asset"), ("user_id", "proxyWallet"), ("verified", "verifiedBadge"),
+        ("current_price", "curPrice"), ("current_size", "size"), ("total_size", "totalBought"),
+        ("entry_cost_usdc", "initialValue"), ("unrealized_pnl", "cashPnl"), ("last_event_at", "timestamp"),
+    ] {
+        if let Some(v) = obj.get(v2) {
+            out.entry(v1.to_string()).or_insert_with(|| v.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Rows `skip..skip + take` of a v2 list endpoint (`path` without `/v2/`), walking its
+/// cursor: v2 has no offset. `query` is resent with every page (cursors bind to it).
+pub(crate) async fn v2_rows(state: &State, path: &str, query: &str, skip: usize, take: usize) -> Result<Vec<Value>, String> {
+    let want = skip + take;
+    let mut out: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    while out.len() < want {
+        let url = match &cursor {
+            Some(c) => format!("{}/v2/{path}?{query}&cursor={}", state.pm_url, urlencode(c)),
+            None => format!("{}/v2/{path}?{query}&limit={}", state.pm_url, want.clamp(1, V2_PAGE)),
+        };
+        let v = get_json(state, &url).await?;
+        let page = v["data"].as_array().cloned().unwrap_or_default();
+        let got = page.len();
+        out.extend(page);
+        cursor = v["pagination"]["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() || got == 0 {
+            break;
+        }
+    }
+    Ok(out.into_iter().skip(skip).take(take).map(|r| legacy(&r)).collect())
+}
+
+/// The `data` object of a v2 endpoint that returns one record (Null on a documented miss).
+pub(crate) async fn v2_data(state: &State, path: &str, query: &str) -> Result<Value, String> {
+    let v = get_json(state, &format!("{}/v2/{path}?{query}", state.pm_url)).await?;
+    Ok(legacy(&v["data"]))
+}
+
+/// v2 leaderboard spellings of our (v1-style) category and window names.
+fn board_args(category: &str, window: &str) -> String {
+    format!("category={}&time_period={}", category.to_lowercase(), window.to_lowercase())
+}
+
+/// One wallet's all-time standing on a category's P&L board: (rank, pnl, volume in
+/// shares), if it has one.
 pub(crate) async fn standing(state: &State, wallet: &str, category: &str, window: &str) -> Option<(i32, f64, f64)> {
-    let url = format!(
-        "{}/v1/leaderboard?category={category}&timePeriod={window}&orderBy=PNL&user={wallet}",
-        state.pm_url
-    );
-    let v = get_json(state, &url).await.ok()?;
-    let r = v.as_array()?.first()?.clone();
-    Some((num(&r, "rank")? as i32, num(&r, "pnl").unwrap_or(0.0), num(&r, "vol").unwrap_or(0.0)))
+    let r = v2_data(state, "leaderboard", &format!("{}&sort_by=PNL&user={wallet}", board_args(category, window))).await.ok()?;
+    Some((num(&r, "rank_pnl")? as i32, num(&r, "pnl").unwrap_or(0.0), num(&r, "volume").unwrap_or(0.0)))
+}
+
+/// A wallet's traded volume in USD since `start` (epoch seconds; 0 = all time).
+pub(crate) async fn usd_volume(state: &State, wallet: &str, start: i64) -> Option<f64> {
+    let q = if start > 0 { format!("user={wallet}&start={start}") } else { format!("user={wallet}") };
+    num(&v2_data(state, "user-volume", &q).await.ok()?, "volume_usdc")
 }
 
 // ---------- wallet stats cache ----------
@@ -221,24 +290,24 @@ async fn load_stats(state: &State, wallets: &[String]) -> Result<Vec<Value>, Str
     Ok(rows.iter().map(stats_json).collect())
 }
 
-/// Profile, positions value, markets traded and all-time standing: 4 calls.
+/// Profile, positions value, all-time USD volume and all-time standing: 4 calls.
 async fn refresh_lite(state: &State, wallet: &str) -> Result<(), String> {
     let prof_url = format!("{}/public-profile?address={wallet}", state.gamma_url);
-    let value_url = format!("{}/value?user={wallet}", state.pm_url);
-    let traded_url = format!("{}/traded?user={wallet}", state.pm_url);
-    let (prof, value, traded, all) = futures::join!(
+    let user = format!("user={wallet}");
+    let (prof, value, vol, all) = futures::join!(
         get_json(state, &prof_url),
-        get_json(state, &value_url),
-        get_json(state, &traded_url),
+        v2_data(state, "value", &user),
+        usd_volume(state, wallet, 0),
         standing(state, wallet, "OVERALL", "ALL"),
     );
     let prof = prof.unwrap_or(Value::Null);
     let joined: Option<DateTime<Utc>> = text(&prof, "createdAt").and_then(|s| s.parse().ok());
-    let value = value.ok().and_then(|v| v.as_array().and_then(|a| a.first().cloned())).and_then(|r| num(&r, "value"));
-    let traded = traded.ok().and_then(|v| num(&v, "traded")).map(|n| n as i32);
-    let (rank, pnl, vol) = match all {
-        Some((r, p, v)) => (Some(r), Some(p), Some(v)),
-        None => (None, None, None),
+    let value = value.ok().and_then(|r| num(&r, "value"));
+    // v1's /traded (markets traded) has no v2 equivalent
+    let traded: Option<i32> = None;
+    let (rank, pnl) = match all {
+        Some((r, p, _shares)) => (Some(r), Some(p)),
+        None => (None, None),
     };
     let name = text(&prof, "name");
     let pseudonym = text(&prof, "pseudonym");
@@ -259,7 +328,7 @@ async fn refresh_lite(state: &State, wallet: &str) -> Result<(), String> {
                  verified = COALESCE(EXCLUDED.verified, pm_wallet_stats.verified),
                  joined_at = COALESCE(EXCLUDED.joined_at, pm_wallet_stats.joined_at),
                  positions_value = EXCLUDED.positions_value,
-                 markets_traded = EXCLUDED.markets_traded,
+                 markets_traded = COALESCE(EXCLUDED.markets_traded, pm_wallet_stats.markets_traded),
                  all_pnl = EXCLUDED.all_pnl, all_vol = EXCLUDED.all_vol, all_rank = EXCLUDED.all_rank,
                  lite_at = now()",
             &[&wallet, &name, &pseudonym, &image, &x, &verified, &joined, &value, &traded, &pnl, &vol, &rank],
@@ -275,47 +344,31 @@ async fn refresh_full(state: &State, wallet: &str) -> Result<(), String> {
     refresh_lite(state, wallet).await?;
 
     let mut rec = Record::default();
-    let mut counted = 0usize;
-    let mut capped = false;
-    while counted < CLOSED_CAP {
-        let url = format!(
-            "{}/closed-positions?user={wallet}&limit=50&offset={counted}&sortBy=TIMESTAMP&sortDirection=DESC",
-            state.pm_url
-        );
-        let page = get_json(state, &url).await?;
-        let page = page.as_array().cloned().unwrap_or_default();
-        for p in &page {
-            rec.add(num(p, "realizedPnl").unwrap_or(0.0));
-        }
-        counted += page.len();
-        if page.len() < 50 {
-            break;
-        }
-        if counted >= CLOSED_CAP {
-            capped = true;
-        }
+    let closed = v2_rows(state, "positions", &format!("user={wallet}&status=CLOSED&sort_by=TIMESTAMP&sort_direction=DESC"), 0, CLOSED_CAP).await?;
+    for p in &closed {
+        rec.add(num(p, "realizedPnl").unwrap_or(0.0));
     }
+    let mut counted = closed.len();
+    let capped = counted >= CLOSED_CAP;
 
-    // Lost bets are rarely redeemed (redeeming pays nothing), so Polymarket
-    // keeps them under /positions at 0c with `redeemable` set, never in
-    // /closed-positions. Counting only closed positions would skip most losses
-    // and inflate the win rate (one top wallet: 89% closed-only vs 43% real).
-    // So resolved-but-unredeemed positions join the record at their cash P&L.
-    let (mut active, mut scanned) = (0usize, 0usize);
-    while scanned < ACTIVE_CAP {
-        let url = format!("{}/positions?user={wallet}&limit=500&offset={scanned}&sizeThreshold=0.01", state.pm_url);
-        let page = get_json(state, &url).await?.as_array().cloned().unwrap_or_default();
-        for p in &page {
-            if p.get("redeemable").and_then(|b| b.as_bool()).unwrap_or(false) {
-                rec.add(num(p, "cashPnl").unwrap_or(0.0));
-                counted += 1;
-            } else {
-                active += 1;
-            }
+    // Lost bets are rarely redeemed (redeeming pays nothing), so they never reach
+    // CLOSED. Counting only closed positions would skip most losses and inflate the
+    // win rate (one top wallet: 89% closed-only vs 43% real). So resolved-but-
+    // unredeemed positions join the record at their cash P&L: winners sit in OPEN
+    // with `redeemable` set, losers under REDEEMABLE_LOST.
+    let open = v2_rows(state, "positions", &format!("user={wallet}&status=OPEN"), 0, ACTIVE_CAP).await?;
+    let lost = v2_rows(state, "positions", &format!("user={wallet}&status=REDEEMABLE_LOST"), 0, ACTIVE_CAP).await?;
+    let mut seen = HashSet::new();
+    let mut active = 0usize;
+    for p in open.iter().chain(lost.iter()) {
+        if !seen.insert(text(p, "asset").unwrap_or_default()) {
+            continue;
         }
-        scanned += page.len();
-        if page.len() < 500 {
-            break;
+        if p.get("redeemable").and_then(|b| b.as_bool()).unwrap_or(false) || text(p, "status").as_deref() == Some("REDEEMABLE") {
+            rec.add(num(p, "cashPnl").unwrap_or(0.0));
+            counted += 1;
+        } else {
+            active += 1;
         }
     }
 
@@ -323,7 +376,7 @@ async fn refresh_full(state: &State, wallet: &str) -> Result<(), String> {
         .map(|c| async move {
             standing(state, wallet, c, "ALL")
                 .await
-                .map(|(rank, pnl, vol)| json!({"category": c, "rank": rank, "pnl": pnl, "vol": vol}))
+                .map(|(rank, pnl, shares)| json!({"category": c, "rank": rank, "pnl": pnl, "vol": null, "vol_shares": shares}))
         })
         .buffer_unordered(5)
         .filter_map(|x| async move { x })
@@ -416,29 +469,23 @@ async fn fetch_board(
     offset: usize,
     q: Option<&str>,
 ) -> Result<Vec<Value>, String> {
+    let args = format!("{}&sort_by={order}", board_args(category, window));
     if let Some(q) = q.filter(|q| !q.is_empty()) {
-        let key = if is_address(q) { "user" } else { "userName" };
-        let url = format!(
-            "{}/v1/leaderboard?category={category}&timePeriod={window}&orderBy={order}&{key}={}",
-            state.pm_url,
-            urlencode(q)
-        );
-        return Ok(get_json(state, &url).await?.as_array().cloned().unwrap_or_default());
-    }
-    let mut out = Vec::new();
-    let mut off = offset;
-    while out.len() < limit {
-        let n = (limit - out.len()).min(50);
-        let page = get_json(state, &lb_url(state, category, window, order, n, off)).await?;
-        let page = page.as_array().cloned().unwrap_or_default();
-        let got = page.len();
-        out.extend(page);
-        off += got;
-        if got < n {
-            break;
+        if is_address(q) {
+            // one wallet's standing: a single record carrying both ranks
+            let mut r = v2_data(state, "leaderboard", &format!("{args}&user={}", q.to_lowercase())).await?;
+            if r.is_null() {
+                return Ok(vec![]);
+            }
+            r["rank"] = r[if order == "VOLUME" { "rank_volume" } else { "rank_pnl" }].clone();
+            return Ok(vec![r]);
         }
+        // v2 has no name search: match names within the board's first page
+        let q = q.to_lowercase();
+        let rows = v2_rows(state, "leaderboard", &args, 0, V2_PAGE).await?;
+        return Ok(rows.into_iter().filter(|r| text(r, "userName").map(|n| n.to_lowercase().contains(&q)).unwrap_or(false)).take(limit).collect());
     }
-    Ok(out)
+    v2_rows(state, "leaderboard", &args, offset, limit).await
 }
 
 pub(crate) fn urlencode(s: &str) -> String {
@@ -459,7 +506,7 @@ pub async fn leaderboard(state: web::Data<State>, q: web::Query<LbQ>) -> HttpRes
     };
     let order = match q.order.as_deref().unwrap_or("pnl").to_lowercase().as_str() {
         "pnl" => "PNL",
-        "vol" | "volume" => "VOL",
+        "vol" | "volume" => "VOLUME",
         _ => return bad_request("order must be pnl or vol"),
     };
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
@@ -480,7 +527,7 @@ pub async fn leaderboard(state: web::Data<State>, q: web::Query<LbQ>) -> HttpRes
                      VALUES ($1,$2,$3,current_date,$4,$5,$6,$7)
                      ON CONFLICT (category, time_window, order_by, as_of, wallet)
                      DO UPDATE SET rank=EXCLUDED.rank, pnl=EXCLUDED.pnl, vol=EXCLUDED.vol",
-                    &[&category, &window, &order, &w, &(rank as i32), &num(r, "pnl"), &num(r, "vol")],
+                    &[&category, &window, &order, &w, &(rank as i32), &num(r, "pnl"), &None::<f64>],
                 )
                 .await;
         }
@@ -524,7 +571,9 @@ pub async fn leaderboard(state: web::Data<State>, q: web::Query<LbQ>) -> HttpRes
                 "x_username": text(r, "xUsername"),
                 "verified": r.get("verifiedBadge").and_then(|b| b.as_bool()).unwrap_or(false),
                 "pnl": num(r, "pnl"),
-                "vol": num(r, "vol"),
+                // v2 reports board volume in shares only
+                "vol": null,
+                "vol_shares": num(r, "volume"),
                 "stats": by_wallet.get(&w).cloned(),
             })
         })
@@ -587,39 +636,48 @@ pub async fn positions(state: web::Data<State>, path: web::Path<String>, q: web:
         Ok(w) => w,
         Err(r) => return r,
     };
-    let closed = q.status.as_deref() == Some("closed");
-    let limit = q.limit.unwrap_or(50).clamp(1, if closed { 50 } else { 500 });
+    let status = q.status.as_deref().unwrap_or("active");
+    let closed = status == "closed";
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let offset = q.offset.unwrap_or(0);
     let dir = if q.dir.as_deref() == Some("asc") { "ASC" } else { "DESC" };
+    // v2 sorts: CURRENT_VALUE, PRICE, TOKENS, UNREALIZED_PNL, REALIZED_PNL, TOTAL_PNL, TIMESTAMP
     let sort = match (closed, q.sort.as_deref().unwrap_or("")) {
-        (false, "pnl") => "CASHPNL",
-        (false, "pnl_pct") => "PERCENTPNL",
+        (false, "pnl" | "pnl_pct") => "UNREALIZED_PNL",
         (false, "price") => "PRICE",
-        (false, "avg") => "AVGPRICE",
-        (false, "title") => "TITLE",
-        (false, _) => "CURRENT",
-        (true, "pnl") => "REALIZEDPNL",
-        (true, "title") => "TITLE",
-        (true, "price") => "PRICE",
-        (true, "avg") => "AVGPRICE",
+        (false, _) => "CURRENT_VALUE",
+        (true, "pnl") => "REALIZED_PNL",
         (true, _) => "TIMESTAMP",
     };
-    let path = if closed { "closed-positions" } else { "positions" };
-    let mut url = format!(
-        "{}/{path}?user={w}&limit={limit}&offset={offset}&sortBy={sort}&sortDirection={dir}",
-        state.pm_url
-    );
-    if !closed {
-        // "active" = still trading; "resolved" = settled but not yet redeemed
-        // (mostly lost bets, which pay nothing to redeem).
-        let resolved = q.status.as_deref() == Some("resolved");
-        url.push_str(&format!("&sizeThreshold=0.01&redeemable={resolved}"));
-    }
+    let mut args = format!("user={w}&sort_by={sort}&sort_direction={dir}");
     if let Some(t) = q.q.as_deref().filter(|t| !t.is_empty()) {
-        url.push_str(&format!("&title={}", urlencode(t)));
+        args.push_str(&format!("&title={}", urlencode(t)));
     }
-    let rows = match get_json(&state, &url).await {
-        Ok(v) => v.as_array().cloned().unwrap_or_default(),
+    // "active" = still trading; "resolved" = settled but not yet redeemed (mostly lost
+    // bets, which pay nothing to redeem): v2 keeps unredeemed winners inside OPEN and
+    // losers under REDEEMABLE_LOST.
+    let fetched = match status {
+        "closed" => v2_rows(&state, "positions", &format!("{args}&status=CLOSED"), offset, limit).await,
+        "resolved" => {
+            let (won_q, lost_q) = (format!("{args}&status=REDEEMABLE"), format!("{args}&status=REDEEMABLE_LOST"));
+            let (won, lost) = futures::join!(
+                v2_rows(&state, "positions", &won_q, 0, offset + limit),
+                v2_rows(&state, "positions", &lost_q, 0, offset + limit),
+            );
+            match (won, lost) {
+                (Ok(mut a), Ok(b)) => {
+                    a.extend(b);
+                    a.sort_by(|x, y| num(y, "currentValue").partial_cmp(&num(x, "currentValue")).unwrap_or(std::cmp::Ordering::Equal));
+                    Ok(a.into_iter().skip(offset).take(limit).collect())
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        _ => v2_rows(&state, "positions", &format!("{args}&status=OPEN"), 0, (offset + limit + 200).min(5000)).await
+            .map(|rows| rows.into_iter().filter(|p| p["redeemable"].as_bool() != Some(true)).skip(offset).take(limit).collect()),
+    };
+    let rows: Vec<Value> = match fetched {
+        Ok(r) => r,
         Err(e) => return internal(e),
     };
     let out: Vec<Value> = rows
@@ -648,7 +706,7 @@ pub async fn positions(state: web::Data<State>, path: web::Path<String>, q: web:
             })
         })
         .collect();
-    HttpResponse::Ok().json(json!({"wallet": w, "status": q.status.as_deref().unwrap_or("active"), "rows": out}))
+    HttpResponse::Ok().json(json!({"wallet": w, "status": status, "rows": out}))
 }
 
 #[derive(Deserialize)]
@@ -665,12 +723,12 @@ pub async fn activity(state: web::Data<State>, path: web::Path<String>, q: web::
         Err(r) => return r,
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let mut url = format!("{}/activity?user={w}&limit={limit}&offset={}", state.pm_url, q.offset.unwrap_or(0));
+    let mut args = format!("user={w}");
     if let Some(t) = q.kind.as_deref().filter(|t| !t.is_empty()) {
-        url.push_str(&format!("&type={}", t.to_uppercase()));
+        args.push_str(&format!("&type={}", urlencode(&t.to_uppercase())));
     }
-    let rows = match get_json(&state, &url).await {
-        Ok(v) => v.as_array().cloned().unwrap_or_default(),
+    let rows = match v2_rows(&state, "activity", &args, q.offset.unwrap_or(0), limit).await {
+        Ok(r) => r,
         Err(e) => return internal(e),
     };
     let out: Vec<Value> = rows
@@ -760,11 +818,7 @@ pub struct WhaleQ {
 /// the wallet's cached lite stats. Wallets with missing stats are fetched now
 /// (lite only: 4 calls each) so filters on value and age are real.
 async fn big_trades(state: &web::Data<State>, min_trade: f64) -> Result<(Vec<Value>, Vec<Value>), String> {
-    let url = format!(
-        "{}/trades?limit=500&takerOnly=true&filterType=CASH&filterAmount={min_trade}",
-        state.pm_url
-    );
-    let trades = get_json(state, &url).await?.as_array().cloned().unwrap_or_default();
+    let trades = v2_rows(state, "trades", &format!("taker_only=true&filter_type=CASH&filter_amount={min_trade}"), 0, 500).await?;
     let mut seen = HashSet::new();
     let latest: Vec<Value> = trades
         .into_iter()
@@ -891,7 +945,8 @@ pub async fn movers(state: web::Data<State>, q: web::Query<MoversQ>) -> HttpResp
                 "climb": all_rank.map(|a| a - now_rank),
                 "all_pnl": all_pnl,
                 "pnl": num(&r, "pnl"),
-                "vol": num(&r, "vol"),
+                "vol": null,
+                "vol_shares": num(&r, "volume"),
             }))
         })
         .buffer_unordered(8)
@@ -950,6 +1005,36 @@ mod tests {
         assert_eq!(slice_range(&pts, "ytd").len(), 1);
         assert_eq!(slice_range(&pts, "1y").len(), 2);
         assert_eq!(slice_range(&pts, "all").len(), 4);
+    }
+
+    #[test]
+    fn v2_rows_keep_their_fields_and_gain_the_v1_names() {
+        let trade = json!({"proxy_wallet": "0xa", "condition_id": "0xc", "token_id": "123", "transaction_hash": "0xt",
+                           "usdc_size": 33.6, "outcome_index": 1, "event_slug": "e", "size": 40.0, "timestamp": 5});
+        let t = legacy(&trade);
+        assert_eq!(t["proxyWallet"], "0xa");
+        assert_eq!(t["conditionId"], "0xc");
+        assert_eq!(t["asset"], "123");
+        assert_eq!(t["transactionHash"], "0xt");
+        assert_eq!(t["usdcSize"], 33.6);
+        assert_eq!(t["outcomeIndex"], 1);
+        assert_eq!(t["eventSlug"], "e");
+        assert_eq!((t["size"].as_f64(), t["timestamp"].as_i64()), (Some(40.0), Some(5)));
+        assert_eq!(t["proxy_wallet"], "0xa", "v2 names stay");
+        // positions: current size and price under v1 names; a trade's own size is never replaced
+        let pos = legacy(&json!({"current_size": 24296.5, "current_price": 0.725, "current_value": 17615.0,
+                                 "unrealized_pnl": -1927.9, "avg_price": 0.8043, "total_size": 24296.5,
+                                 "entry_cost_usdc": 19542.9, "realized_pnl": 0.0, "last_event_at": 9, "end_date": "2026-11-05"}));
+        assert_eq!((num(&pos, "size"), num(&pos, "curPrice"), num(&pos, "currentValue")), (Some(24296.5), Some(0.725), Some(17615.0)));
+        assert_eq!((num(&pos, "cashPnl"), num(&pos, "avgPrice"), num(&pos, "initialValue")), (Some(-1927.9), Some(0.8043), Some(19542.9)));
+        assert_eq!((num(&pos, "totalBought"), num(&pos, "timestamp")), (Some(24296.5), Some(9.0)));
+        assert_eq!(text(&pos, "endDate").as_deref(), Some("2026-11-05"));
+        let lb = legacy(&json!({"rank": 1, "user_id": "0xw", "user_name": "Theo4", "profile_image": "i", "x_username": "x", "verified": true}));
+        assert_eq!((text(&lb, "proxyWallet"), text(&lb, "userName")), (Some("0xw".into()), Some("Theo4".into())));
+        assert_eq!((text(&lb, "profileImage"), text(&lb, "xUsername")), (Some("i".into()), Some("x".into())));
+        assert_eq!(lb["verifiedBadge"], true);
+        assert_eq!(legacy(&Value::Null), Value::Null);
+        assert_eq!(board_args("OVERALL", "ALL"), "category=overall&time_period=all");
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! A cycle (every PM_SIGNALS_INTERVAL_SECS, default 600; or POST /pm/signals/run):
 //!  1. Sharp set: the top 50 all-time and top 50 this-month P&L wallets in each
 //!     of Polymarket's 10 categories (month entries must also be up all-time in
-//!     that category). Refreshed every 6 h into `pm_standings`.
+//!     that category). Refreshed every 6 h into `pm_standings`. Its `vol` is the
+//!     category volume in SHARES, as Polymarket's leaderboard reports it (v1's `vol`
+//!     was the same share count; v2 names it so, and has no per-category USD).
 //!  2. Poll each sharp's latest 100 trades into `pm_sharp_trades`, and note its
 //!     normal (median) trade size and pace (bot check).
 //!  3. Group the last 48 h of buys per (wallet, outcome token) into a position:
@@ -33,7 +35,7 @@ use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::pm::{category_param, get_json, num, standing, text, urlencode};
+use crate::pm::{category_param, get_json, num, standing, text, urlencode, v2_rows};
 use crate::{bad_request, internal, State};
 
 pub const SIGNAL_CATS: [&str; 10] = [
@@ -105,6 +107,7 @@ fn rank_score(rank: Option<i32>) -> f64 {
 pub struct Inputs {
     pub cat_rank: Option<i32>,
     pub cat_pnl: Option<f64>,
+    /// all-time volume in the category, in shares (Polymarket v2)
     pub cat_vol: Option<f64>,
     pub overall_rank: Option<i32>,
     pub overall_pnl: Option<f64>,
@@ -171,6 +174,8 @@ pub fn score(i: &Inputs) -> Scored {
         wallet_score: (100.0 * (0.75 * proof + 0.25 * overall)).round() as i32,
         proven,
         // Huge volume at a tiny return on it: market making / arbitrage, not a view.
+        // Volume is in shares (a share costs at most $1, so this is never below the
+        // dollar volume, and the return per share never above the return per dollar).
         arber: i.cat_vol.unwrap_or(0.0) > 5e6 && roi < 0.005,
         slippage,
         parts,
@@ -233,19 +238,18 @@ async fn refresh_boards(state: &State) -> Result<usize, String> {
     }
     let mut n = 0;
     for cat in SIGNAL_CATS {
-        let all = get_json(state, &format!(
-            "{}/v1/leaderboard?category={cat}&timePeriod=ALL&orderBy=PNL&limit={BOARD_N}", state.pm_url)).await?;
-        let month = get_json(state, &format!(
-            "{}/v1/leaderboard?category={cat}&timePeriod=MONTH&orderBy=PNL&limit={BOARD_N}", state.pm_url)).await?;
+        let board = |window: &str| format!("category={}&time_period={window}&sort_by=PNL", cat.to_lowercase());
+        let all = v2_rows(state, "leaderboard", &board("all"), 0, BOARD_N).await?;
+        let month = v2_rows(state, "leaderboard", &board("month"), 0, BOARD_N).await?;
         let mut rows: HashMap<String, (Option<i32>, f64, f64, Option<f64>, Option<String>, Option<String>)> = HashMap::new();
-        for r in all.as_array().into_iter().flatten() {
+        for r in &all {
             if let Some(w) = text(r, "proxyWallet") {
-                rows.insert(w, (num(r, "rank").map(|x| x as i32), num(r, "pnl").unwrap_or(0.0), num(r, "vol").unwrap_or(0.0),
+                rows.insert(w, (num(r, "rank").map(|x| x as i32), num(r, "pnl").unwrap_or(0.0), num(r, "volume").unwrap_or(0.0),
                     None, text(r, "userName"), text(r, "profileImage")));
             }
         }
         // Month leaders not already in the all-time top: need their all-time standing.
-        let month_rows: Vec<Value> = month.as_array().cloned().unwrap_or_default();
+        let month_rows: Vec<Value> = month;
         let month_pnl: HashMap<String, f64> = month_rows.iter()
             .filter_map(|r| Some((text(r, "proxyWallet")?, num(r, "pnl")?))).collect();
         let missing: Vec<(String, Option<String>, Option<String>)> = month_rows.iter()
@@ -292,8 +296,7 @@ async fn refresh_boards(state: &State) -> Result<usize, String> {
 }
 
 async fn poll_wallet(state: &State, wallet: &str) -> Result<usize, String> {
-    let url = format!("{}/trades?user={wallet}&limit=100&takerOnly=false", state.pm_url);
-    let trades = get_json(state, &url).await?.as_array().cloned().unwrap_or_default();
+    let trades = v2_rows(state, "trades", &format!("user={wallet}&taker_only=false"), 0, 100).await?;
     let cutoff = Utc::now().timestamp() - 72 * 3600;
     // Normal bet = median dollars put into one market (outcome token) across
     // these trades. The API returns fills, and one order often fills in many

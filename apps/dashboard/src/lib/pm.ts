@@ -28,7 +28,18 @@ export const PM_WINDOWS = [
   { key: "all", label: "All" },
 ];
 
-export interface CategoryStanding { category: string; rank: number; pnl: number; vol: number }
+// Polymarket's Data API v2 (2026-11) reports board and category volume in shares only:
+// `vol` (USD) is then null and `vol_shares` carries it.
+export interface CategoryStanding { category: string; rank: number; pnl: number; vol: number | null; vol_shares?: number | null }
+
+export function formatShares(n: number | null | undefined): string {
+  if (n == null) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `${(abs / 1e9).toFixed(2)}B sh`;
+  if (abs >= 1e6) return `${(abs / 1e6).toFixed(2)}M sh`;
+  if (abs >= 1e3) return `${(abs / 1e3).toFixed(1)}K sh`;
+  return `${abs.toFixed(0)} sh`;
+}
 
 export interface WalletStats {
   wallet: string;
@@ -67,6 +78,7 @@ export interface BoardRow {
   verified: boolean;
   pnl: number | null;
   vol: number | null;
+  vol_shares?: number | null;
   stats: WalletStats | null;
 }
 export interface Board { category: string; window: string; order: string; rows: BoardRow[]; refreshing: number }
@@ -109,7 +121,7 @@ export interface TradeCard {
 }
 export interface Mover {
   wallet: string; name: string | null; profile_image: string | null; rank: number; all_rank: number | null;
-  climb: number | null; pnl: number | null; vol: number | null; all_pnl: number | null; stats: WalletStats | null;
+  climb: number | null; pnl: number | null; vol: number | null; vol_shares?: number | null; all_pnl: number | null; stats: WalletStats | null;
 }
 
 export const pm = {

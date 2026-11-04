@@ -153,8 +153,8 @@ function SignalCard({ s, mode }: { s: PmSignal; mode: string }) {
         <Chip label="Position" title={`${s.entry_shares?.toLocaleString(undefined, { maximumFractionDigits: 0 })} shares bought in the last 48 h`}>{formatUsd(s.entry_usdc)}</Chip>
         <Chip label="Best ask now">{cents(s.current_price)}</Chip>
         <Chip label="Rel. size" title={s.normal_bet ? `normal bet ${formatUsd(s.normal_bet)}` : undefined}>{s.rel_size != null ? `${s.rel_size.toFixed(1)}x` : "—"}</Chip>
-        <Chip label="Cat. ROI" title="P&L ÷ volume in this category, all-time" tone={(s.cat_roi ?? 0) > 0 ? "text-emerald-light" : "text-crimson-light"}>
-          {s.cat_roi != null ? `${s.cat_roi >= 0 ? "+" : ""}${(s.cat_roi * 100).toFixed(1)}%` : "—"}
+        <Chip label="Cat. P&L/share" title="All-time P&L in this category per share traded (Polymarket reports category volume in shares)" tone={(s.cat_roi ?? 0) > 0 ? "text-emerald-light" : "text-crimson-light"}>
+          {s.cat_roi != null ? `${s.cat_roi >= 0 ? "+" : ""}${(s.cat_roi * 100).toFixed(1)}¢` : "—"}
         </Chip>
         <Chip label="Slip" tone={slip == null ? undefined : slip <= 0.01 ? "text-emerald-light" : slip <= 0.03 ? "text-amber" : "text-crimson-light"}>
           {slip != null ? `${slip >= 0 ? "+" : ""}${(slip * 100).toFixed(1)}¢` : "—"}

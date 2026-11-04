@@ -7,7 +7,7 @@ import { CopyBotModal } from "../components/CopyBotModal";
 import { Card, Msg, Pills } from "../components/ui";
 import { Avatar, CAT_COLORS, CategoryDonut, Money, PnlChart, catLabel } from "../components/pm";
 import { formatPct, formatUsd } from "../lib/odds";
-import { cents, displayName, pm, shortAddr, timeAgo, walletAge, type Position, type WalletStats } from "../lib/pm";
+import { cents, displayName, formatShares, pm, shortAddr, timeAgo, walletAge, type Position, type WalletStats } from "../lib/pm";
 
 // Wallet profile: who the wallet is, how it has actually done (record, P&L
 // history, categories), and what it holds now.
@@ -233,8 +233,8 @@ function Categories({ s }: { s: WalletStats }) {
             <tr key={c.category} className="border-t border-glass">
               <td className="px-3 py-2"><span className="inline-block w-2.5 h-2.5 rounded-sm mr-2" style={{ background: CAT_COLORS[c.category] }} />{catLabel(c.category)}</td>
               <td className="px-3 py-2 text-right"><Money v={c.pnl} signed /></td>
-              <td className="px-3 py-2 text-right font-mono text-gray-300">{formatUsd(c.vol)}</td>
-              <td className="px-3 py-2 text-right font-mono text-gray-300">{c.vol > 0 ? formatPct(c.pnl / c.vol, 2) : "—"}</td>
+              <td className="px-3 py-2 text-right font-mono text-gray-300">{c.vol != null ? formatUsd(c.vol) : formatShares(c.vol_shares)}</td>
+              <td className="px-3 py-2 text-right font-mono text-gray-300">{c.vol != null && c.vol > 0 ? formatPct(c.pnl / c.vol, 2) : "—"}</td>
               <td className="px-3 py-2 text-right font-mono text-gray-400">#{c.rank.toLocaleString()}</td>
             </tr>
           ))}

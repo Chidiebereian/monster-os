@@ -11,7 +11,7 @@
 //! /bots/*  Copy-trading bots (paper): see bots.rs.
 //!
 //! Config: DATABASE_URL, CLICKHOUSE_URL/USER/PASSWORD, POLYMARKET_DATA_URL
-//! (default https://data-api.polymarket.com). Kalshi is not covered: it does
+//! (default https://data-api.polymarket.com; Data API v2, see pm.rs). Kalshi is not covered: it does
 //! not expose per-wallet trades publicly.
 
 #![recursion_limit = "256"]
@@ -26,6 +26,7 @@ use std::sync::Arc;
 use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use chrono::{DateTime, Utc};
 use common::healthz;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_postgres::{Client, NoTls};
@@ -34,7 +35,6 @@ struct State {
     db: Arc<Client>,
     http: reqwest::Client,
     pm_url: String,
-    lb_url: String,
     gamma_url: String,
     ch_url: String,
     ch_user: Option<String>,
@@ -81,7 +81,7 @@ fn realized_pnl(trades: &[(String, f64, f64)], final_price: f64) -> (f64, f64) {
     (cash + shares * final_price, cost)
 }
 
-/// A trade as returned by Polymarket's Data API `/trades`.
+/// A trade from Polymarket's Data API `/v2/trades`, read through `pm::legacy` (v1 names).
 #[derive(Deserialize)]
 struct PmTrade {
     #[serde(rename = "proxyWallet")]
@@ -203,29 +203,17 @@ impl State {
         min_cash: Option<f64>,
         start: i64,
     ) -> Result<Vec<PmTrade>, String> {
-        let url = format!("{}/trades", self.pm_url);
-        let mut q: Vec<(&str, String)> =
-            vec![("user", wallet.to_string()), ("limit", limit.to_string())];
+        let mut q = format!("user={wallet}");
         if start > 0 {
-            q.push(("start", start.to_string()));
+            q.push_str(&format!("&start={start}"));
         }
         if let Some(c) = min_cash {
-            q.push(("filterType", "CASH".into()));
-            q.push(("filterAmount", c.to_string()));
+            q.push_str(&format!("&filter_type=CASH&filter_amount={c}"));
         }
-        let resp = self
-            .http
-            .get(&url)
-            .query(&q)
-            .send()
-            .await
-            .map_err(|e| format!("Polymarket request failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Polymarket returned {status}: {}", body.trim()));
-        }
-        resp.json::<Vec<PmTrade>>().await.map_err(|e| format!("Polymarket body unreadable: {e}"))
+        let rows = pm::v2_rows(self, "trades", &q, 0, limit as usize).await?;
+        rows.into_iter()
+            .map(|r| serde_json::from_value::<PmTrade>(r).map_err(|e| format!("Polymarket trade unreadable: {e}")))
+            .collect()
     }
 
     async fn insert_trades(&self, trades: &[PmTrade]) -> Result<(), String> {
@@ -263,23 +251,19 @@ impl State {
         Ok(self.ch(sql).await?.trim().parse::<i32>().unwrap_or(0))
     }
 
-    /// Top traders by realized profit from Polymarket's public leaderboard API.
-    /// One leaderboard page (`metric` is "profit" or "volume").
+    /// One page of Polymarket's overall leaderboard (`metric` is "profit" or "volume";
+    /// lb-api was retired with Data API v1, so this reads /v2/leaderboard). `amount`
+    /// is the P&L in USD; the volume board only says who trades most (in shares).
     async fn fetch_leaderboard(&self, metric: &str, window: &str, limit: u32) -> Result<Vec<LbEntry>, String> {
-        let url = format!("{}/{metric}", self.lb_url);
-        let resp = self
-            .http
-            .get(&url)
-            .query(&[("window", window), ("limit", &limit.to_string())])
-            .send()
-            .await
-            .map_err(|e| format!("leaderboard request failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("leaderboard returned {status}: {}", body.trim()));
-        }
-        resp.json::<Vec<LbEntry>>().await.map_err(|e| format!("leaderboard body unreadable: {e}"))
+        let period = match window { "1d" => "day", "7d" => "week", "30d" => "month", _ => "all" };
+        let sort = if metric == "volume" { "VOLUME" } else { "PNL" };
+        let rows = pm::v2_rows(self, "leaderboard", &format!("category=overall&time_period={period}&sort_by={sort}"), 0, limit as usize).await?;
+        Ok(rows.iter().filter_map(|r| Some(LbEntry {
+            proxy_wallet: pm::text(r, "proxyWallet")?,
+            amount: pm::num(r, "pnl").unwrap_or(0.0),
+            name: pm::text(r, "userName").unwrap_or_default(),
+            pseudonym: String::new(),
+        })).collect())
     }
 
     /// Upsert today's performance snapshot (PK is wallet+as_of). `pnl`/`volume`/
@@ -400,15 +384,11 @@ impl State {
     }
 }
 
-/// One row of Polymarket's profit leaderboard.
-#[derive(Deserialize)]
+/// One row of Polymarket's leaderboard.
 struct LbEntry {
-    #[serde(rename = "proxyWallet")]
     proxy_wallet: String,
-    amount: f64, // realized profit in USD
-    #[serde(default)]
+    amount: f64, // P&L in USD over the window
     name: String,
-    #[serde(default)]
     pseudonym: String,
 }
 
@@ -425,7 +405,7 @@ struct RefreshRequest {
     category: Option<String>,
 }
 
-// Polymarket's leaderboard windows (lb-api rejects anything else).
+// Leaderboard windows (the names lb-api used; mapped to v2's day/week/month/all).
 const LB_WINDOWS: [&str; 4] = ["all", "1d", "7d", "30d"];
 
 /// Pull the top traders by profit, snapshot their performance, and (optionally)
@@ -467,12 +447,22 @@ async fn refresh_leaderboard(state: web::Data<State>, body: web::Json<RefreshReq
         merged.push((e.proxy_wallet.clone(), Some(e.amount), None, label_of(e)));
     }
     for e in &volume {
-        if let Some(&i) = index.get(&e.proxy_wallet) {
-            merged[i].2 = Some(e.amount);
-        } else {
+        if !index.contains_key(&e.proxy_wallet) {
             index.insert(e.proxy_wallet.clone(), merged.len());
-            merged.push((e.proxy_wallet.clone(), None, Some(e.amount), label_of(e)));
+            merged.push((e.proxy_wallet.clone(), None, None, label_of(e)));
         }
+    }
+    // Volume in USD over the window, for every wallet (v2's board volume is in shares).
+    let start = match window.as_str() { "1d" => 1, "7d" => 7, "30d" => 30, _ => 0 };
+    let start = if start > 0 { (Utc::now() - chrono::Duration::days(start)).timestamp() } else { 0 };
+    let st = &state;
+    let vols: Vec<Option<f64>> = futures::stream::iter(merged.iter().map(|m| m.0.clone()))
+        .map(|w| async move { pm::usd_volume(st, &w, start).await })
+        .buffered(6)
+        .collect()
+        .await;
+    for (m, v) in merged.iter_mut().zip(vols) {
+        m.2 = v;
     }
 
     let mut results = Vec::new();
@@ -888,10 +878,6 @@ async fn main() -> std::io::Result<()> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
         pm_url: env_opt("POLYMARKET_DATA_URL")
             .unwrap_or_else(|| "https://data-api.polymarket.com".into())
-            .trim_end_matches('/')
-            .to_string(),
-        lb_url: env_opt("POLYMARKET_LB_URL")
-            .unwrap_or_else(|| "https://lb-api.polymarket.com".into())
             .trim_end_matches('/')
             .to_string(),
         gamma_url: env_opt("POLYMARKET_GAMMA_URL")

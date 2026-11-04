@@ -709,6 +709,17 @@ struct Outcome {
     reason: Option<String>,
 }
 
+/// A leader buy older than this is not copied: the cycle runs every 15 s, so normal lag
+/// is minutes; an older one means the feed was down (Polymarket's v1 retirement left
+/// 42 h of leader trades that would otherwise be "copied" at prices hours later).
+const COPY_MAX_LAG_SECS: i64 = 1800;
+
+/// Why a leader buy at `trade_ts` is too old to copy at `now`, if it is.
+pub fn too_late(trade_ts: i64, now: i64) -> Option<String> {
+    let lag = now - trade_ts;
+    (lag > COPY_MAX_LAG_SECS).then(|| format!("leader traded {:.1} h ago; too late to copy at a comparable price", lag as f64 / 3600.0))
+}
+
 /// `mirror`: the trades are the leader's existing open positions, bought into
 /// once at creation. They don't move the cursor and don't raise alerts.
 async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mutex<HashMap<String, String>>, mirror: bool) -> Result<usize, String> {
@@ -752,8 +763,8 @@ async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mu
         let h = hold.get(&t.asset).copied().unwrap_or_default();
 
         let outcome = if t.side == "BUY" {
-            let mut skip: Option<String> = None;
-            if !category_passes(c, &category) {
+            let mut skip: Option<String> = if mirror { None } else { too_late(t.ts, Utc::now().timestamp()) };
+            if skip.is_none() && !category_passes(c, &category) {
                 skip = Some(format!("category {} filtered out", category.to_lowercase()));
             }
             if skip.is_none() && (c.min_volume.is_some() || c.min_liquidity.is_some() || c.max_resolution_days.is_some()) {
@@ -778,8 +789,8 @@ async fn process_bot(state: &State, bot: &Bot, trades: &[LeaderTrade], cats: &Mu
                 None => {
                     let fill = book(state, &t.asset).await.and_then(|b| ask_side(&b).0);
                     if c.buy_mode == "portfolio" && portfolio.is_none() {
-                        let v = get_json(state, &format!("{}/value?user={}", state.pm_url, bot.wallet)).await.ok();
-                        portfolio = Some(v.as_ref().and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|r| num(r, "value")));
+                        let v = crate::pm::v2_data(state, "value", &format!("user={}", bot.wallet)).await.ok();
+                        portfolio = Some(v.as_ref().and_then(|r| num(r, "value")));
                     }
                     let ctx = BuyCtx {
                         trader_usdc: t.usdc,
@@ -915,8 +926,8 @@ async fn cycle(state: &State) -> Result<Value, String> {
     let mut copied = 0;
     for (wallet, group) in by_wallet {
         let since = group.iter().map(|b| b.cursor_ts).min().unwrap_or(0);
-        let url = format!("{}/activity?user={wallet}&type=TRADE&limit=200", state.pm_url);
-        let fetched = get_json(state, &url).await.map(|v| merge_trades(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]), since));
+        let fetched = crate::pm::v2_rows(state, "activity", &format!("user={wallet}&type=TRADE"), 0, 200).await
+            .map(|rows| merge_trades(&rows, since));
         for b in group {
             let res = match &fetched {
                 Ok(trades) => process_bot(state, b, trades, &cats, false).await,
@@ -1031,8 +1042,8 @@ pub fn positions_as_trades(rows: &[Value], bot_id: i64, now: i64) -> Vec<LeaderT
 }
 
 async fn mirror_positions(state: &State, bot: &Bot) -> Result<usize, String> {
-    let v = get_json(state, &format!("{}/positions?user={}&sizeThreshold=1&limit=500", state.pm_url, bot.wallet)).await?;
-    let trades = positions_as_trades(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]), bot.id, Utc::now().timestamp().max(bot.cursor_ts));
+    let rows = crate::pm::v2_rows(state, "positions", &format!("user={}&status=OPEN&filter_amount=1", bot.wallet), 0, 500).await?;
+    let trades = positions_as_trades(&rows, bot.id, Utc::now().timestamp().max(bot.cursor_ts));
     process_bot(state, bot, &trades, &Mutex::new(HashMap::new()), true).await
 }
 
@@ -1049,8 +1060,8 @@ pub async fn create(state: web::Data<State>, body: web::Json<NewBot>) -> HttpRes
         return bad_request(e);
     }
     // Start at the leader's latest trade so only new trades are copied.
-    let latest = get_json(&state, &format!("{}/activity?user={wallet}&type=TRADE&limit=1", state.pm_url)).await;
-    let first = latest.as_ref().ok().and_then(|v| v.as_array()).and_then(|a| a.first()).cloned();
+    let latest = crate::pm::v2_rows(&state, "activity", &format!("user={wallet}&type=TRADE"), 0, 1).await;
+    let first = latest.ok().and_then(|rows| rows.into_iter().next());
     let cursor = first.as_ref().and_then(|a| num(a, "timestamp")).map(|t| t as i64 + 1).unwrap_or_else(|| Utc::now().timestamp());
     let prof = get_json(&state, &format!("{}/public-profile?address={wallet}", state.gamma_url)).await.ok();
     let name = prof.as_ref().and_then(|p| text(p, "name"))
@@ -1219,6 +1230,13 @@ pub async fn run_http(state: web::Data<State>) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_leader_buys_are_not_copied() {
+        assert_eq!(too_late(1_000, 1_000 + 240), None);
+        assert_eq!(too_late(1_000, 1_000 + 1800), None);
+        assert!(too_late(1_000, 1_000 + 38 * 3600).unwrap().starts_with("leader traded 38.0 h ago"));
+    }
 
     fn ctx(usdc: f64) -> BuyCtx {
         BuyCtx { trader_usdc: usdc, trader_price: 0.50, fill_price: Some(0.50), trader_portfolio: None, spent_total: 0.0, spent_market: 0.0 }
