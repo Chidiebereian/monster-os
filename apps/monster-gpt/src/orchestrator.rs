@@ -436,7 +436,25 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
                 ask = crate::research::detect(&original);
             }
         }
-        if ask.is_none() { ask = crate::research::detect(&req.text); }
+        if ask.is_none() {
+            if let Some(topic) = crate::research::unsupported_topic(&req.text) {
+                let reply = format!("I can't verify that: Monster OS keeps no records of {topic}. I hold game results, standings, champions, player and team game logs, \
+                    injury reports, market prices and model forecasts for the NBA, NFL, NHL and MLB, and I won't answer from memory where I can't show the source.");
+                send(ServerMsg::Status { request_id: rid.clone(), stage: "route".into(), name: "no_record".into(), state: "completed".into(), detail: Some(topic.into()), ms: Some(0) }).await;
+                send(ServerMsg::Sources { request_id: rid.clone(), sources: json!([]) }).await;
+                send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
+                let usage = json!({ "no_answer": true, "topic": topic });
+                let state = json!({ "intent": "no_record", "filters": route.filters });
+                let message_id = match (&g.store, &conv) {
+                    (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &Value::Null, &json!([]), &state, None, &usage, false).await.ok(),
+                    _ => None,
+                };
+                g.claims(&tx, &rid, &message_id, &reply, &[]).await;
+                send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
+                return None;
+            }
+            ask = crate::research::detect(&req.text);
+        }
         if ask.is_none() {
             if let Ok(p) = serde_json::from_value::<crate::research::Ask>(prev_state["research"].clone()) { ask = crate::research::follow_up(&req.text, &p); }
         }
@@ -637,6 +655,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
             let reply = if let (Some(sp), false) = (&sport, leans.is_empty()) {
                 crate::lean::reply(sp, market, &leans, &crate::lean::why_no_pick(results.get("picks.record"), sp, market), limit, game)
             } else { format!("{}\n\nI only suggest bets the models actually priced, so there's nothing to recommend for this request. Try changing the sport, risk or day.", c.notes.join(" ")) };
+            send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
             send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
             if let Some(src) = sources.iter().find(|s| s.tool == "hub.slate").cloned() {
                 facts.push(crate::verify::fact_from_text(crate::verify::FactKind::ModelEstimate, &crate::lean::evidence(&leans, 50), &src, facts.len() + 1));
@@ -746,6 +765,32 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         return None;
     }
 
+    // a single-game matchup answer opens with the matchup, built in code from the brief and the
+    // entity lookup (the model is not trusted to name both teams)
+    let mut matchup_line: Option<String> = None;
+    if let (Intent::Game, [b]) = (route.intent, briefs.as_slice()) {
+        let sp = b["sport"].as_str().map(String::from);
+        let codes: Vec<String> = b["game"].as_str().unwrap_or("").split(" @ ").map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if codes.len() == 2 {
+            let mut names = Vec::new();
+            for code in &codes {
+                let c = g.tools.call(Tool::Resolve { q: code.clone(), sport: sp.clone(), kind: Some("team".into()), focus: vec![] }).await;
+                g.record_tool(c.tool, c.ok, c.ms);
+                if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), &rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
+                names.push((c.value["status"] == "resolved").then(|| c.value["entity"]["name"].as_str().map(String::from)).flatten());
+                if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); facts.extend(crate::verify::facts_from(c.tool, &c.value, &src, facts.len(), today)); sources.push(src); }
+            }
+            if let [Some(away), Some(home)] = names.as_slice() {
+                let line = format!("{away} at {home}, {}.", b["status"].as_str().unwrap_or("upcoming"));
+                if let Some(src) = sources.iter().find(|s| s.tool == "hub.brief").cloned() {
+                    facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Observed, &line, &src, facts.len() + 1));
+                }
+                matchup_line = Some(line);
+            }
+        }
+        send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
+    }
+
     // 6. model: draft, check, at most one rewrite
     let m = g.model(req.model.as_deref()).clone();
     let (msgs, ctx_info) = llm::fit_context(CHAT_SYSTEM, &history, &ev, &req.text, m.num_ctx, m.max_tokens + 64);
@@ -765,15 +810,20 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         detail: Some(format!("~{} prompt tokens of {}", ctx_info["used_est"], m.num_ctx)), ms: None }).await;
     g.metrics.generations.fetch_add(1, Ordering::Relaxed);
     let seq = Arc::new(AtomicU64::new(0));
+    if let Some(line) = &matchup_line {
+        send(ServerMsg::Delta { request_id: rid.clone(), seq: seq.fetch_add(1, Ordering::Relaxed), text: format!("{line}\n\n") }).await;
+    }
     let (res, mut text) = generate(g, &m, &msgs, &cancel, &tx, &rid, &seq).await;
     let mut model_used = Some(m.id.clone());
     let mut revised = false;
+    let mut trimmed = false;
     let (mut usage, cancelled) = match res {
         Ok(st) => {
             let mut st = st;
             // cut off by the token cap: end at the last full sentence
             if !st.cancelled && st.completion_tokens >= m.max_tokens as u64 {
                 if let Some(t) = crate::judge::trim_unfinished(&text) {
+                    trimmed = true;
                     send(ServerMsg::Reset { request_id: rid.clone(), reason: "trimmed an unfinished sentence".into() }).await;
                     send(ServerMsg::Delta { request_id: rid.clone(), seq: seq.fetch_add(1, Ordering::Relaxed), text: t.clone() }).await;
                     text = t;
@@ -862,6 +912,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
             let mut u = json!(st);
             u["unsupported_numbers"] = json!(unsupported);
             u["judge"] = json!({ "revised": revised, "repaired": repaired, "scrubbed": scrubbed, "issues": issues, "draft_issues": draft_issues });
+            u["trimmed"] = json!(trimmed);
             (u, st.cancelled)
         }
         Err(e) => {
@@ -880,6 +931,15 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
     };
     drop(permit);
     if cancelled { g.metrics.cancelled.fetch_add(1, Ordering::Relaxed); }
+    if let (Some(line), Some(_)) = (&matchup_line, &model_used) {
+        let was_reset = usage["judge"]["revised"] == true || usage["judge"]["repaired"].as_u64().unwrap_or(0) > 0
+            || usage["judge"]["scrubbed"].as_u64().unwrap_or(0) > 0 || usage["trimmed"] == true;
+        text = format!("{line}\n\n{text}");
+        if was_reset {
+            send(ServerMsg::Reset { request_id: rid.clone(), reason: "restored the matchup line".into() }).await;
+            send(ServerMsg::Delta { request_id: rid.clone(), seq: seq.fetch_add(1, Ordering::Relaxed), text: text.clone() }).await;
+        }
+    }
     usage["context"] = ctx_info;
     let state = json!({ "intent": intent_name, "filters": route.filters, "inherited": route.inherited, "from_memory": from_memory });
     let message_id = match (&g.store, &conv) {

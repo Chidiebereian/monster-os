@@ -22,8 +22,8 @@ Runs, in order, and fails closed (exit 1) on the first broken guarantee:
  10. sim-repro       the simulators reproduce a run from its seed, and two seeds agree within the
                      Monte Carlo error MonsterGPT states (apps/monster-gpt/tests/test_sim_repro.py)
  11. golden          golden.json is valid and every truth query computes (read-only);
-                     --golden also asks every question on a scratch MonsterGPT and grades it
-                     (reported, not gating, until the v2 tools exist)
+                     --golden also asks every question on a scratch MonsterGPT, grades it and
+                     fails unless every release gate is met
  12. secrets         tracked, staged and to-be-added files plus git history: database URLs
                      with passwords, the live .env credentials, private keys, API-key shapes.
                      Files that already carried the local owner login before this gate
@@ -140,8 +140,8 @@ def main():
     if a.e2e:
         steps.append(("e2e", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "apps/monster-gpt/tests/e2e_ws.py"], timeout=3600)))
     if a.golden:
-        # graded and reported; not gating until the v2 tools exist (monster-gpt-v2.md section 12)
-        steps.append(("golden-run", lambda: (0, run([py, "apps/monster-gpt/tests/golden.py", "--run"], timeout=3600)[1])))
+        # gated: the release gates of monster-gpt-v2.md section 11 (golden.py prints which are not met)
+        steps.append(("golden-run", lambda: run([py, "apps/monster-gpt/tests/golden.py", "--run"], timeout=3600)))
     os.makedirs(LOGDIR, exist_ok=True)
     path = os.path.join(LOGDIR, f"checks_{dt.datetime.now():%Y%m%d_%H%M%S}.log")
     with open(path, "w", encoding="utf-8") as log:

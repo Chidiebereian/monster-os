@@ -121,8 +121,9 @@ fn walk(v: &Value, path: &mut Vec<String>, tool: &str, out: &mut HashMap<FactKin
 }
 
 /// How long a tool's data counts as current, against the record's own date.
+/// Only a table that changes as games are played goes out of date; a past result is permanent.
 fn freshness_days(tool: &str) -> Option<i64> {
-    match tool { "kb.standings" => Some(3), "kb.results" | "kb.schedule" => Some(14), _ => None }
+    match tool { "kb.standings" => Some(3), _ => None }
 }
 
 fn as_of_of(v: &Value) -> Option<String> {
@@ -137,8 +138,9 @@ pub fn facts_from(tool: &str, v: &Value, src: &Source, start: usize, today: Naiv
     let mut parts: HashMap<FactKind, (HashSet<String>, String)> = HashMap::new();
     walk(v, &mut Vec::new(), tool, &mut parts);
     let as_of = as_of_of(v);
+    // a finished season's record is final, however old it is
     let stale = match (freshness_days(tool), as_of.as_deref().and_then(|d| NaiveDate::parse_from_str(&d[..d.len().min(10)], "%Y-%m-%d").ok())) {
-        (Some(days), Some(d)) => (today - d).num_days() > days,
+        (Some(days), Some(d)) => (today - d).num_days() > days && v["complete"] != true,
         _ => false,
     };
     let source_id = v["source"]["source_id"].as_str().unwrap_or("monster_os").to_string();
@@ -170,7 +172,9 @@ pub fn sentences(text: &str) -> Vec<String> {
             cur.push(*c);
             let end = matches!(c, '.' | '?' | '!') && chars.get(i + 1).map(|n| n.is_whitespace()).unwrap_or(true)
                 // "C. McDavid", "vs. Boston": a single capital or "vs" before the dot is not an end
-                && !(cur.trim_end_matches('.').rsplit(' ').next().map(|w| (w.len() == 1 && w.chars().all(|x| x.is_uppercase())) || w == "vs").unwrap_or(false));
+                && !(cur.trim_end_matches('.').rsplit(' ').next().map(|w| (w.len() == 1 && w.chars().all(|x| x.is_uppercase())) || w == "vs").unwrap_or(false))
+                // "21. Utah Jazz: 1-6": a list number is not a sentence
+                && !cur.trim_end_matches('.').trim().chars().all(|x| x.is_ascii_digit());
             if end { if !cur.trim().is_empty() { out.push(cur.trim().to_string()); } cur.clear(); }
         }
         if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
@@ -181,7 +185,15 @@ pub fn sentences(text: &str) -> Vec<String> {
 /// Names a sentence states as fact: capitalised multi-word names plus single team or
 /// player words that a fact also holds are checked; ordinary words are not claims.
 fn sentence_names(s: &str) -> Vec<String> {
-    crate::judge::names(s).into_iter().map(|n| n.trim_end_matches(['\'', '\u{2019}']).to_string()).collect()
+    // a list ("Utah Jazz, Sacramento Kings and Brooklyn Nets") is several names, not one
+    let parts: Vec<&str> = s.split([',', ';']).flat_map(|p| p.split(" and ")).collect();
+    // sentence openers capitalised in front of a name ("Lastly, Jared McCain") are not part of it
+    const OPENERS: &[&str] = &["Lastly", "Finally", "Next", "Meanwhile", "However", "Additionally", "Overall", "Then", "Plus", "First", "Second", "Third", "Also", "Instead"];
+    parts.iter().flat_map(|p| crate::judge::names(p)).map(|n| {
+        let mut w: Vec<&str> = n.split_whitespace().collect();
+        while w.len() > 2 && OPENERS.contains(&w[0]) { w.remove(0); }
+        w.join(" ").trim_end_matches(['\'', '\u{2019}']).to_string()
+    }).filter(|n| n.split_whitespace().count() >= 2).collect()
 }
 
 pub fn check(answer: &str, facts: &[Fact]) -> Vec<Claim> {
@@ -197,6 +209,8 @@ pub fn check(answer: &str, facts: &[Fact]) -> Vec<Claim> {
             let core = w.trim_matches(|c: char| !c.is_alphanumeric());
             if core.chars().any(|c| c.is_ascii_digit()) && core.chars().any(|c| c.is_ascii_alphabetic()) && !core.ends_with('%') { " " } else { w }
         }).collect::<Vec<_>>().join(" ");
+        // a list number ("21. Miami Heat: 2-5") is a position, not a claim
+        let bare = match bare.split_once(". ") { Some((n, rest)) if !n.is_empty() && n.trim().chars().all(|c| c.is_ascii_digit()) => rest.to_string(), _ => bare };
         let nums: Vec<String> = crate::validate::numbers(&bare).into_iter().filter(|n| crate::validate::checkable(n)).collect();
         let names = sentence_names(&bare);
         if nums.is_empty() && names.is_empty() { continue; }
@@ -316,6 +330,9 @@ mod tests {
         let v = json!({ "as_of": "2026-10-20", "standings": [{ "name": "Houston Rockets", "w": 7, "l": 1, "pct": 0.875 }], "source": { "source_id": "espn_site" } });
         let facts = facts_from("kb.standings", &v, &src("S1", "standings"), 0, today());
         assert_eq!(check("Houston Rockets have the best record at 7-1.", &facts)[0].status, Status::Stale);
+        let done = json!({ "as_of": "2025-09-28", "complete": true, "standings": [{ "name": "Milwaukee Brewers", "w": 97, "l": 65 }], "source": { "source_id": "mlb_statsapi" } });
+        let f = facts_from("kb.standings", &done, &src("S1", "standings"), 0, today());
+        assert_eq!(check("Milwaukee Brewers has the best record at 97-65.", &f)[0].status, Status::Verified, "a finished season is not stale");
         let fresh = json!({ "as_of": "2026-11-02", "standings": [{ "name": "Houston Rockets", "pct": 0.875 }], "source": { "source_id": "espn_site" } });
         let other = json!({ "teams": [{ "name": "Houston Rockets", "winPercent": 0.875 }], "source": { "source_id": "nba_stats" } });
         let mut f = facts_from("kb.standings", &fresh, &src("S1", "computed"), 0, today());
@@ -339,6 +356,21 @@ mod tests {
         let c = check("Nikola Jokic, last 20 games: 23.4 points per game.", &f);
         assert_eq!(c[0].citations.len(), 1, "{:?}", c[0].citations);
         assert_eq!(c[0].citations[0]["source"], "S1");
+    }
+
+    #[test]
+    fn lists_numbers_and_openers_are_read_as_people_read_them() {
+        let v = json!({ "standings": [{ "name": "Utah Jazz" }, { "name": "Sacramento Kings" }, { "name": "Brooklyn Nets" }], "as_of": "2026-11-02", "source": { "source_id": "espn_site" } });
+        let f = facts_from("kb.standings", &v, &src("S1", "standings"), 0, today());
+        assert_eq!(check("Utah Jazz, Sacramento Kings and Brooklyn Nets share the worst record.", &f)[0].status, Status::Verified);
+        assert_eq!(sentences("21. Utah Jazz: 1-6\n22. Sacramento Kings: 1-6"), vec!["21. Utah Jazz: 1-6", "22. Sacramento Kings: 1-6"]);
+        assert_eq!(check("21. Utah Jazz: 1-6", &f)[0].status, Status::Verified, "the list number is not checked");
+        let p = facts_from("picks.today", &json!({ "picks": [{ "subject_name": "Jared McCain" }] }), &src("S2", "picks"), 0, today());
+        assert!(check("Lastly, Jared McCain is a lean.", &p)[0].issues.is_empty());
+        let old = json!({ "games": [{ "date": "2025-11-01", "opponent_name": "Toronto Blue Jays" }], "source": { "source_id": "mlb_statsapi" } });
+        let r = facts_from("kb.results", &old, &src("S3", "results"), 0, today());
+        assert_eq!(check("The Los Angeles Dodgers beat the Toronto Blue Jays.", &r)[0].status, Status::PartiallyVerified, "Dodgers not in this record");
+        assert!(r.iter().all(|x| !x.stale), "a past result never goes stale");
     }
 
     #[test]

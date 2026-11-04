@@ -19,6 +19,17 @@ Grading per question (all must hold):
   abstain  the answer says it could not verify, and holds no number the question lacks
   claims   (questions with a truth query) every expected fact sits in a sentence the
            verifier marked verified or cross_verified; an abstain answer has no verified sentence
+  cites    every citation points at a source the turn actually returned (no invented citations)
+
+Questions marked "stretch" are phrasings the system is not expected to handle yet; they
+are reported but not gated. `entity_cases` check the resolver (live, read-only).
+
+Release gates (monster-gpt-v2.md 11), over every non-stretch run: facts correct 100%,
+facts outside a verified sentence 0, invented citations 0, unverifiable questions
+answered with a number 0, tool selection >= 90%, entity resolution >= 95% with every
+ambiguous case asked, median answer time <= 8 s (simulations excluded).
+
+  python apps/monster-gpt/tests/golden.py --run --repeat 3
 A question with "turns" is a conversation: every turn is sent in order in one
 conversation, and the checks apply to the last answer (tools: called on any turn).
 """
@@ -31,6 +42,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -88,6 +100,9 @@ def expected(q, row, aliases):
     for f in q.get("facts", []):
         s = f.format(*row) if row else f
         alts = [s] + aliases.get(s, [])
+        # a full team name also passes as its nickname ("New York Jets" -> "Jets")
+        if re.fullmatch(r"[A-Z][A-Za-z.]+( [A-Z0-9][A-Za-z0-9.]+)+", s) and len(s.split()[-1]) > 3:
+            alts.append(s.split()[-1])
         if re.fullmatch(r"-?\d+\.\d+", s):            # 27.40 also passes as 27.4
             alts.append(s.rstrip("0").rstrip("."))
         exp.append(alts)
@@ -111,7 +126,8 @@ def grade(q, answer, events, row, aliases):
     claims = [c for e in events if e.get("type") == "claims" for c in (e.get("claims") or [])]
     last_claims = next((e.get("claims") or [] for e in reversed(events) if e.get("type") == "claims"), [])
     if q.get("truth"):
-        verified = " ".join(c["text"] for c in last_claims if c["status"] in ("verified", "cross_verified"))
+        # backed by a record: verified, or named beside the model's numbers in a model-estimate sentence
+        verified = " ".join(c["text"] for c in last_claims if c["status"] in ("verified", "cross_verified", "model_estimated", "hypothetical"))
         for alts in expected(q, row, aliases):
             if any(a.lower() in answer.lower() for a in alts) and not any(a.lower() in verified.lower() for a in alts):
                 fails.append(f"fact {alts[0]} is in the answer but not in a verified sentence")
@@ -124,6 +140,11 @@ def grade(q, answer, events, row, aliases):
             fails.append(f"a sentence is {bad}")
     if q.get("abstain") and any(c["status"] in ("verified", "cross_verified") for c in last_claims):
         fails.append("an unverifiable answer has a verified sentence")
+    # a citation must point at a source this turn returned
+    returned = {x.get("id") for e in events if e.get("type") == "sources" for x in (e.get("sources") or [])}
+    invented = [ci.get("source") for c in claims for ci in c.get("citations", []) if ci.get("source") not in returned]
+    if invented:
+        fails.append(f"invented citation(s): {sorted(set(invented))}")
     if q.get("abstain"):
         if not ABSTAIN.search(answer):
             fails.append("did not say it could not verify")
@@ -185,14 +206,51 @@ def post(path, body, tok=None, timeout=300):
         return json.loads(r.read())
 
 
-def run(g, rows):
+def entity_checks(g):
+    # the resolver, live and read-only (projection-service /entities/resolve)
+    proj = os.environ.get("PROJECTION_URL", "http://localhost:8121")
+    out = []
+    for c in g.get("entity_cases", []):
+        qs = urllib.parse.urlencode({k: v for k, v in (("q", c["q"]), ("sport", c.get("sport")), ("focus", c.get("focus"))) if v})
+        try:
+            v = json.loads(urllib.request.urlopen(f"{proj}/entities/resolve?{qs}", timeout=30).read())
+        except OSError as e:
+            v = {"status": f"error {e}"}
+        got = v["entity"]["entity_id"] if v.get("status") == "resolved" else v.get("status")
+        out.append({"q": c["q"], "sport": c.get("sport"), "expect": c["expect"], "got": got, "pass": got == c["expect"], "stretch": bool(c.get("stretch"))})
+    return out
+
+
+def gates(results, qs, ents):
+    core = [(r, qs[r["id"]]) for r in results if not qs[r["id"]].get("stretch")]
+    fact_q = [(r, q) for r, q in core if q.get("truth")]
+    secs = sorted(r["seconds"] for r, q in core if "sim.run" not in q.get("tools", []))
+    ent = [e for e in ents if not e["stretch"]]
+    amb = [e for e in ent if e["expect"] == "ambiguous"]
+    m = {
+        "facts_correct": round(sum(not any(f.startswith("fact missing") for f in r["fails"]) for r, _ in fact_q) / max(len(fact_q), 1), 3),
+        "facts_not_verified": sum(any("not in a verified sentence" in f for f in r["fails"]) for r, _ in core),
+        "invented_citations": sum(any(f.startswith("invented citation") for f in r["fails"]) for r, _ in core),
+        "abstain_violations": sum(1 for r, q in core if q.get("abstain") and not r["pass"]),
+        "tool_selection": round(sum(all(t in r["tools_called"] for t in q.get("tools", [])) for r, q in core) / max(len(core), 1), 3),
+        "entity_accuracy": round(sum(e["pass"] for e in ent) / max(len(ent), 1), 3),
+        "ambiguous_asked": round(sum(e["pass"] for e in amb) / max(len(amb), 1), 3),
+        "median_seconds": secs[len(secs) // 2] if secs else None,
+    }
+    need = {"facts_correct": lambda v: v == 1.0, "facts_not_verified": lambda v: v == 0, "invented_citations": lambda v: v == 0,
+            "abstain_violations": lambda v: v == 0, "tool_selection": lambda v: v >= 0.9, "entity_accuracy": lambda v: v >= 0.95,
+            "ambiguous_asked": lambda v: v == 1.0, "median_seconds": lambda v: v is not None and v <= 8}
+    return m, {k: bool(need[k](v)) for k, v in m.items()}
+
+
+def run(g, rows, repeat=1):
     os.makedirs(REPORTS, exist_ok=True)
     scratch_db()
     proc = start()
     results, stored = [], {}
     try:
         tok = post("/session", {"user": "golden"})["token"]
-        for q in g["questions"]:
+        for q in [q for _ in range(repeat) for q in g["questions"]]:
             t0 = time.time()
             answer, events, conv = "", [], None
             try:
@@ -204,9 +262,9 @@ def run(g, rows):
             except (urllib.error.URLError, TimeoutError) as e:
                 answer, events = "", events + [{"type": "error", "message": str(e)}]
             fails, called, statuses, flagged = grade(q, answer, events, rows.get(q["id"]), g.get("aliases", {}))
-            results.append({"id": q["id"], "workflow": q["workflow"], "pass": not fails, "fails": fails, "tools_called": called, "claims": statuses, "flagged": flagged,
+            results.append({"id": q["id"], "workflow": q["workflow"], "stretch": bool(q.get("stretch")), "pass": not fails, "fails": fails, "tools_called": called, "claims": statuses, "flagged": flagged,
                             "expected": rows.get(q["id"]), "answer": answer, "seconds": round(time.time() - t0, 1)})
-            print(f"{'PASS' if not fails else 'FAIL'}  {q['id']}  {round(time.time() - t0, 1):>5}s  {'; '.join(fails)[:160]}", flush=True)
+            print(f"{'PASS' if not fails else 'FAIL'}  {q['id']}{' (stretch)' if q.get('stretch') else ''}  {round(time.time() - t0, 1):>5}s  {'; '.join(fails)[:160]}", flush=True)
         import psycopg
         with psycopg.connect(dbenv.url("OPS_DATABASE_URL").rsplit("/", 1)[0] + "/" + DB) as cx:
             stored = dict(cx.execute("SELECT status, count(*) FROM gpt_claims GROUP BY 1").fetchall())
@@ -214,8 +272,20 @@ def run(g, rows):
     finally:
         proc.kill()
         subprocess.run(ADMIN + [f"DROP DATABASE IF EXISTS {DB} WITH (FORCE)"], capture_output=True)
+    ents = entity_checks(g)
+    for e in ents:
+        if not e["pass"]:
+            print(f"FAIL  entity {e['q']!r}{' ' + e['sport'] if e['sport'] else ''}: expected {e['expect']}, got {e['got']}{' (stretch)' if e['stretch'] else ''}")
+    qs = {q["id"]: q for q in g["questions"]}
+    metrics, ok = gates(results, qs, ents)
+    stable = {}
+    for r in results:
+        stable.setdefault(r["id"], []).append(r["pass"])
     by = {w: [r for r in results if r["workflow"] == w] for w in WORKFLOWS}
-    summary = {"passed": sum(r["pass"] for r in results), "total": len(results),
+    summary = {"passed": sum(r["pass"] for r in results), "total": len(results), "repeat": repeat,
+               "core_passed": sum(r["pass"] for r in results if not r["stretch"]), "core_total": sum(1 for r in results if not r["stretch"]),
+               "unstable": sorted(k for k, v in stable.items() if len(set(v)) > 1),
+               "entities": f"{sum(e['pass'] for e in ents)}/{len(ents)}", "gates": metrics, "gates_ok": ok,
                "by_workflow": {w: f"{sum(r['pass'] for r in v)}/{len(v)}" for w, v in by.items()},
                "tool_selection": round(sum(all(t in r["tools_called"] for t in q.get("tools", [])) for r, q in zip(results, g["questions"])) / len(results), 3),
                "abstain_violations": sum(1 for r, q in zip(results, g["questions"]) if q.get("abstain") and not r["pass"]),
@@ -224,18 +294,21 @@ def run(g, rows):
     path = os.path.join(REPORTS, f"golden_{dt.datetime.now():%Y%m%d_%H%M%S}.json")
     json.dump({"at": dt.datetime.now(dt.timezone.utc).isoformat(), "summary": summary, "results": results}, open(path, "w", encoding="utf-8"), indent=1)
     print(json.dumps(summary), f"\nreport: {path}")
-    return 0 if summary["passed"] == summary["total"] else 1
+    failed = [k for k, v in ok.items() if not v]
+    print("release gates: " + ("all met" if not failed else "NOT met: " + ", ".join(f"{k}={metrics[k]}" for k in failed)))
+    return 0 if not failed else 1
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--run", action="store_true")
+    ap.add_argument("--repeat", type=int, default=1)
     a = ap.parse_args()
     g = load()
     rows = truths(g)
     if a.run:
-        return run(g, rows)
+        return run(g, rows, max(1, a.repeat))
     for q in g["questions"]:
         print(f"{q['id']}  {q['text'][:60]:60}  expect {expected(q, rows.get(q['id']), g.get('aliases', {})) or '(no facts)'}")
     print(f"\n{len(g['questions'])} questions valid, {len(rows)} truths computed")

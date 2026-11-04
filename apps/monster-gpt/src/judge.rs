@@ -34,7 +34,9 @@ pub fn names(text: &str) -> Vec<String> {
     let cap = |w: &str| {
         let w = w.trim_end_matches(['.', '\'', 's']).trim_end_matches('\'');
         let mut c = w.chars();
-        matches!(c.next(), Some(f) if f.is_uppercase()) && w.len() > 1 && w.chars().skip(1).all(|x| x.is_lowercase() || x == '-' || x == '\'')
+        // "Makar", "McCain", "DeRozan", "Gilgeous-Alexander"; not acronyms ("NBA", "KC")
+        matches!(c.next(), Some(f) if f.is_uppercase()) && w.len() > 1 && w.chars().skip(1).all(|x| x.is_alphabetic() || x == '-' || x == '\'')
+            && w.chars().skip(1).any(|x| x.is_lowercase())
     };
     let mut i = 0;
     while i < words.len() {

@@ -218,7 +218,10 @@ pub fn mentions(text: &str) -> Vec<String> {
         out
     };
     let caps = runs(&|t: &str| t.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) || (t.len() == 2 && t.ends_with('.')));
-    let found = if caps.is_empty() { runs(&|t: &str| t.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'') && t.len() >= 3) } else { caps };
+    // names typed in lowercase ("jokic vs doncic") are guessed only when the whole question is
+    // lowercase; a capitalised question without capitalised names has none ("How many tickets...")
+    let lowercase = !text.chars().any(|c| c.is_uppercase());
+    let found = if caps.is_empty() && lowercase { runs(&|t: &str| t.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'') && t.len() >= 3) } else { caps };
     let mut seen = Vec::new();
     for m in found { if m.len() >= 3 && !seen.contains(&m) { seen.push(m); } }
     seen.truncate(4);
@@ -234,7 +237,9 @@ pub fn pick(reply: &str, candidates: &[Value]) -> Option<String> {
         if let Some((_, i)) = ord.iter().find(|(w, _)| ws.iter().any(|x| x == w)) { return candidates.get(*i).and_then(|c| c["entity_id"].as_str()).map(String::from); }
     }
     let n = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
-    let r = n(reply);
+    let trimmed = reply.trim().trim_end_matches(['.', '!', '?']);
+    let bare = ["the ", "The ", "I mean ", "i mean "].iter().fold(trimmed, |t, a| t.strip_prefix(a).unwrap_or(t));
+    let r = n(bare);
     if r.len() < 3 { return None; }
     let hits: Vec<&Value> = candidates.iter().filter(|c| { let name = n(c["name"].as_str().unwrap_or("")); name.contains(&r) || (r.contains(&name) && !name.is_empty()) }).collect();
     (hits.len() == 1).then(|| hits[0]["entity_id"].as_str().map(String::from)).flatten()
@@ -268,6 +273,28 @@ pub fn looks_factual(text: &str) -> bool {
     let starts = ["who ", "when ", "where ", "which ", "how many", "how much", "did ", "was ", "were ", "what was", "what were", "what year", "in what year", "has ", "have "];
     starts.iter().any(|s| l.starts_with(s))
         && !has(&l, &["you", "monster", "explain", " mean", "why", "how does", "how do", "should i", "can i", "what is a ", "what's a "])
+}
+
+/// Things people ask about that Monster OS keeps no record of; such a question gets a
+/// plain "I can't verify that" instead of a near-miss answer from the records it does hold.
+pub fn unsupported_topic(text: &str) -> Option<&'static str> {
+    let l = text.to_lowercase();
+    const TOPICS: &[(&[&str], &str)] = &[
+        (&["attendance", "crowd size", "how many fans attended", "sellout"], "attendance"),
+        (&["tickets", "ticket price", "ticket sales"], "ticket sales"),
+        (&["viewers", "viewership", "watched", "tv ratings", "television ratings", "nielsen"], "TV audiences"),
+        (&["salary", "salaries", "contract", "paid", "earnings", "net worth", "endorsement"], "salaries or contracts"),
+        (&["shoe size", "height", "how tall", "weight", "how much does he weigh", "wingspan", "birthday", "born", "how old"], "player biographies"),
+        (&["referee", "refereed", "umpire", "officiated"], "game officials before the seasons Monster OS tracks"),
+        (&["hot dog", "concession", "beer", "parking"], "stadium operations"),
+    ];
+    // officials are tracked for recent NBA seasons; only older seasons are out of scope
+    // single words match whole words only ("born" is not in "Osborne"); phrases match as written
+    let ws: Vec<&str> = l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let hit = |k: &str| if k.contains(' ') { l.contains(k) } else { ws.contains(&k) };
+    TOPICS.iter().find(|(keys, topic)| keys.iter().any(|k| hit(k))
+        && !(topic.starts_with("game officials") && !l.split(|c: char| !c.is_ascii_digit()).any(|y| y.len() == 4 && y.parse::<i32>().map(|y| y < 2019).unwrap_or(false))))
+        .map(|(_, t)| *t)
 }
 
 /// A per-game average as shown: one decimal, two below 1 (0.35 goals, 23.4 points).
@@ -425,6 +452,8 @@ fn source_line(v: &Value) -> String {
 
 pub fn standings_reply(v: &Value, question: &str) -> String {
     let rows: Vec<&Value> = v["standings"].as_array().into_iter().flatten().collect();
+    let ql = question.to_lowercase();
+    let worst = has(&ql, &["worst", "last place", "bottom of", "fewest wins", "fewest points"]);
     let sport = v["sport"].as_str().unwrap_or("");
     if rows.is_empty() { return format!("I have no final scores stored for that {} season, so I can't give standings.", sport.to_uppercase()); }
     let nhl = sport == "nhl";
@@ -434,13 +463,22 @@ pub fn standings_reply(v: &Value, question: &str) -> String {
         else if sport == "nfl" && r["t"].as_u64().unwrap_or(0) > 0 { format!("{}. {name}: {}-{}-{}", i + 1, r["w"], r["l"], r["t"]) }
         else { format!("{}. {name}: {}-{}", i + 1, r["w"], r["l"]) }
     };
-    let top = &rows[0];
     let key = |r: &Value| if nhl { r["pts"].to_string() } else { format!("{}-{}", r["w"], r["l"]) };
-    let leaders: Vec<String> = rows.iter().take_while(|r| key(r) == key(top)).map(|r| r["name"].as_str().or(r["team"].as_str()).unwrap_or("").to_string()).collect();
-    let lead = if nhl { format!("{} lead{} the NHL with {} points.", join_and(&leaders), if leaders.len() == 1 { "s" } else { "" }, top["pts"]) }
-        else { format!("{} {} the best record at {}.", join_and(&leaders), if leaders.len() == 1 { "has" } else { "share" }, key(top)) };
-    let n = if question.to_lowercase().contains("full") || question.to_lowercase().contains("all ") { rows.len() } else { 10.min(rows.len()) };
-    let table: Vec<String> = rows.iter().take(n).enumerate().map(|(i, r)| line(i, r)).collect();
+    let ends: Vec<&Value> = if worst { rows.iter().rev().copied().collect() } else { rows.clone() };
+    let top = ends[0];
+    let leaders: Vec<String> = ends.iter().take_while(|r| key(r) == key(top)).map(|r| r["name"].as_str().or(r["team"].as_str()).unwrap_or("").to_string()).collect();
+    let one = leaders.len() == 1;
+    let lead = match (nhl, worst) {
+        (true, false) => format!("{} lead{} the NHL with {} points.", join_and(&leaders), if one { "s" } else { "" }, top["pts"]),
+        (true, true) => format!("{} {} the fewest points in the NHL: {}.", join_and(&leaders), if one { "has" } else { "have" }, top["pts"]),
+        (false, false) => format!("{} {} the best record at {}.", join_and(&leaders), if one { "has" } else { "share" }, key(top)),
+        (false, true) => format!("{} {} the worst record at {}.", join_and(&leaders), if one { "has" } else { "share" }, key(top)),
+    };
+    let n = if ql.contains("full") || ql.contains("all ") { rows.len() } else { 10.min(rows.len()) };
+    // the top of the table, and the bottom of it when that is what was asked
+    let mut idx: Vec<usize> = (0..n).collect();
+    if worst && n < rows.len() { idx = (rows.len() - n..rows.len()).collect(); }
+    let table: Vec<String> = idx.into_iter().map(|i| line(i, rows[i])).collect();
     format!("{lead}\n\n{} {} regular season, through {} ({} games), whole league ranked by {}; no division or conference data is stored:\n{}\n\n{}",
         sport.to_uppercase(), v["season_label"].as_str().unwrap_or(""), v["as_of"].as_str().unwrap_or("?"), v["games"], v["ranking"].as_str().unwrap_or(""),
         table.join("\n"), source_line(v))
@@ -585,6 +623,20 @@ mod tests {
             "source": { "table": "sports_games", "source_id": "espn_site" } });
         let r = standings_reply(&s, "who has the best record?");
         assert!(r.starts_with("Houston Rockets and Philadelphia 76ers share the best record at 7-1."), "{r}");
+        let w = standings_reply(&s, "what is the worst record in the NBA?");
+        assert!(w.starts_with("Detroit Pistons has the worst record at 6-1."), "{w}");
+        assert_eq!(unsupported_topic("What was the attendance at last night's Knicks game?"), Some("attendance"));
+        assert_eq!(unsupported_topic("What is LeBron James's shoe size?"), Some("player biographies"));
+        assert_eq!(unsupported_topic("Who refereed Game 7 of the 1988 NBA Finals?"), Some("game officials before the seasons Monster OS tracks"));
+        assert_eq!(unsupported_topic("Who are tonight's NBA referees?"), None, "recent NBA crews are tracked");
+        assert_eq!(unsupported_topic("Compare Jokic and Doncic in points"), None);
+        assert_eq!(unsupported_topic("What is Gerrit Cole's earned run average this season?"), None, "ERA is a stat, not earnings");
+        assert_eq!(unsupported_topic("How many points has Osborne scored?"), None, "a name containing 'born'");
+        assert_eq!(unsupported_topic("weighted points per game for Jokic"), None);
+        assert_eq!(unsupported_topic("Where was Connor McDavid born?"), Some("player biographies"));
+        assert!(mentions("How many tickets did the last Super Bowl sell?").is_empty(), "no name in a capitalised question without capitalised names");
+        let c = vec![json!({ "entity_id": "tm:nba:BOS", "name": "Boston Celtics" }), json!({ "entity_id": "tm:nhl:BOS", "name": "Boston Bruins" })];
+        assert_eq!(pick("the Celtics", &c).as_deref(), Some("tm:nba:BOS"));
         let c = json!({ "sport": "mlb", "event": "World Series", "source": { "table": "sports_games", "source_id": "mlb_statsapi" }, "champions": [{ "season_label": "2025",
             "champion": "LAD", "champion_name": "Los Angeles Dodgers", "runner_up": "TOR", "runner_up_name": "Toronto Blue Jays",
             "final_game": { "date": "2025-11-01", "home": "TOR", "away": "LAD", "home_score": 4, "away_score": 5 }, "series": { "champion_wins": 4, "runner_up_wins": 3 } }] });

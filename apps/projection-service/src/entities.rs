@@ -285,7 +285,10 @@ pub struct SearchQ { q: String, sport: Option<String>, kind: Option<String>, #[s
 fn d_limit() -> usize { 10 }
 
 async fn candidates(db: &tokio_postgres::Client, q: &SearchQ) -> Result<Vec<Cand>, String> {
-    let n = norm(&q.q);
+    // "the Lakers" is the Lakers
+    let raw = q.q.trim();
+    let raw = ["the ", "The ", "THE "].iter().fold(raw, |t, a| t.strip_prefix(a).unwrap_or(t));
+    let n = norm(raw);
     if n.is_empty() || n.len() > 60 { return Ok(Vec::new()); }
     let focus: HashSet<String> = q.focus.as_deref().unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     let first = n.chars().next().map(|c| c.to_string()).unwrap_or_default();

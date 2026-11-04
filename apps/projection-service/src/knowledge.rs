@@ -115,12 +115,18 @@ async fn standings_for(db: &tokio_postgres::Client, sport: &str, season: Option<
     let as_of: Option<NaiveDate> = rows.iter().map(|r| r.get::<_, NaiveDate>(5)).max();
     let season_start: Option<i32> = rows.first().map(|r| r.get(6));
     let names = team_names(db, sport).await;
+    // a season with no regular-season game left to play is final: its table never goes stale
+    let remaining: i64 = match season_start {
+        Some(s) if sport == "nhl" => db.query_one("SELECT count(*) FROM nhl_games_api WHERE game_type = 2 AND NOT completed AND season = $1", &[&(s * 10000 + s + 1)]).await.map(|r| r.get(0)).unwrap_or(1),
+        Some(s) => db.query_one("SELECT count(*) FROM sports_games WHERE sport = $1 AND game_type = 'REG' AND home_score IS NULL AND season = $2", &[&sport, &s]).await.map(|r| r.get(0)).unwrap_or(1),
+        None => 1,
+    };
     let table = standings(sport, &finals);
     let out: Vec<Value> = table.iter().map(|r| row_json(sport, r, &table[0], &names)).collect();
     Ok(json!({ "sport": sport, "season": season_start, "season_label": season_start.map(|s| season_label(sport, s)),
         "scope": "whole league, regular season (no division or conference data is stored)",
         "ranking": if sport == "nhl" { "points (2 per win, 1 per overtime/shootout loss)" } else { "win percentage" },
-        "games": finals.len(), "as_of": as_of, "standings": out,
+        "games": finals.len(), "as_of": as_of, "complete": remaining == 0, "standings": out,
         "source": { "source_id": source_of(sport), "table": if sport == "nhl" { "nhl_games_api" } else { "sports_games" } } }))
 }
 

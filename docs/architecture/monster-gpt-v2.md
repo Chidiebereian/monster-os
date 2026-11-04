@@ -423,6 +423,26 @@ P7 (frontend, `apps/dashboard/src/components/GptEvidence.tsx`, `pages/MonsterGpt
 Citations are scoped to the sentence's subject: when a sentence names a player or team,
 a number held by several records ("last 20 games") is cited from the named one's record.
 
+P8 (evaluation, `apps/monster-gpt/tests/golden.{json,py}`): 56 conversational questions
+(54 gated, 2 marked stretch) across history, standings, player stats, matchups,
+simulations, model reliability, unverifiable questions, multi-turn conversations and bets,
+plus 42 resolver cases (39 gated). `--repeat N` runs everything N times and lists
+unstable questions; the release gates (facts correct 100%, facts outside a record-backed
+sentence 0, invented citations 0, numbers or verified sentences in unverifiable answers 0,
+tool selection >= 90%, resolution >= 95% with every ambiguous case asked, median answer
+<= 8 s) decide the exit code, and `research_checks.py --golden` now gates on them.
+
+What the evaluation found and fixed: the empty-card answer cited sources it never sent;
+a finished season's standings were marked stale; "worst record" led with the best; past
+results were marked stale; questions about records Monster OS does not hold
+(attendance, tickets, TV audiences, salaries, biographies, old officials) got near-miss
+answers or model guesses and now get a code-built "I can't verify that"; a capitalised
+question with no names had words guessed as names ("sell" -> Russell); "the Celtics" and
+"the Lakers" missed their teams; the verifier read lists as one name, list numbers as
+sentences and "Lastly, Jared McCain" as a name; the checker's name finder never
+recognised names with an inner capital (McCain, McDavid, DeRozan); a matchup answer
+could leave out the opponent (a code-built matchup line now goes first when it does).
+
 Not yet: news; tactical analysis,
 parlay research, odds comparison beyond the existing bet card; injuries as a research
 answer; the model-based intent fallback (not needed by the golden set so far).

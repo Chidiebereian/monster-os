@@ -79,7 +79,8 @@ pub fn inputs_fingerprint(v: &Value) -> String { format!("fnv64:{}", crate::rag:
 
 /// A share as a percentage, rounded half away from zero the way the verifier rounds it.
 fn pct(x: f64) -> String { format!("{:.1}%", (x * 1000.0).round() / 10.0) }
-fn r1(x: f64) -> String { format!("{:.1}", x) }
+/// One decimal, half away from zero (as the verifier rounds; `{:.1}` rounds 6.25 to 6.2).
+fn r1(x: f64) -> String { format!("{:.1}", (x * 10.0).round() / 10.0) }
 
 /// Variance of a win share between parameter draws, per run of 200 draws. The engines
 /// sample 200 posterior parameter draws per run, so games within a draw are correlated
@@ -246,5 +247,6 @@ mod tests {
     fn counts_print_with_separators() {
         assert_eq!(fmt_count(100000), "100,000");
         assert_eq!(fmt_count(1000000), "1,000,000");
+        assert_eq!(r1(6.25), "6.3");
     }
 }

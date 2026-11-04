@@ -159,7 +159,7 @@
         "{0}"
       ],
       "forbid": [
-        "(?i)guarantee"
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
       ]
     },
     {
@@ -174,7 +174,7 @@
         "{0}"
       ],
       "forbid": [
-        "(?i)guarantee"
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
       ]
     },
     {
@@ -189,7 +189,7 @@
         "100,000"
       ],
       "forbid": [
-        "(?i)guarantee",
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)",
         "(?i)lock of the"
       ]
     },
@@ -205,7 +205,7 @@
         "200,000"
       ],
       "forbid": [
-        "(?i)guarantee"
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
       ]
     },
     {
@@ -327,7 +327,7 @@
         "verified"
       ],
       "forbid": [
-        "(?i)guarantee",
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)",
         "(?i)can't lose",
         "(?i)sure thing"
       ],
@@ -353,8 +353,702 @@
         "hypothetical"
       ],
       "forbid": [
-        "(?i)guarantee"
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
       ]
+    },
+    {
+      "id": "A3",
+      "workflow": "A",
+      "text": "Who won the 2024 Stanley Cup?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nhl' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home ELSE away END FROM nhl_games_api WHERE game_type=3 AND completed AND season / 10000 = (2023) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A4",
+      "workflow": "A",
+      "text": "Who won the 2023 World Series?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='mlb' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home_team ELSE away_team END FROM sports_games WHERE sport='mlb' AND game_type='POST' AND home_score IS NOT NULL AND season = (2023) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A5",
+      "workflow": "A",
+      "text": "Who won the Super Bowl after the 2023 season?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nfl' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home_team ELSE away_team END FROM sports_games WHERE sport='nfl' AND game_type='SB' AND home_score IS NOT NULL AND season = (2023) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A6",
+      "workflow": "A",
+      "text": "Who won the 2022 NBA championship?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nba' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home_team ELSE away_team END FROM sports_games WHERE sport='nba' AND game_type='POST' AND home_score IS NOT NULL AND season = (2021) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A7",
+      "workflow": "A",
+      "text": "Which team won the most recent Stanley Cup?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nhl' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home ELSE away END FROM nhl_games_api WHERE game_type=3 AND completed AND season / 10000 = (SELECT max(season / 10000) FROM nhl_games_api WHERE game_type=3 AND completed) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A8",
+      "workflow": "A",
+      "text": "Who won the last Super Bowl?",
+      "tools": [
+        "kb.champions"
+      ],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nfl' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN home_team ELSE away_team END FROM sports_games WHERE sport='nfl' AND game_type='SB' AND home_score IS NOT NULL AND season = (SELECT max(season) FROM sports_games WHERE sport='nfl' AND game_type='SB' AND home_score IS NOT NULL) ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "A9",
+      "workflow": "A",
+      "text": "Who did the Dodgers beat in the 2025 World Series?",
+      "tools": [
+        "kb.champions"
+      ],
+      "stretch": true,
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='mlb' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN away_team ELSE home_team END FROM sports_games WHERE sport=$$mlb$$ AND game_type=$$POST$$ AND season=2025 AND home_score IS NOT NULL ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "B3",
+      "workflow": "B",
+      "text": "Who had the best record in MLB in 2025?",
+      "tools": [
+        "kb.standings"
+      ],
+      "truth": "WITH g AS (SELECT home_team t, (home_score > away_score)::int w, (home_score < away_score)::int l FROM sports_games WHERE sport='mlb' AND game_type='REG' AND home_score IS NOT NULL AND season = (2025) UNION ALL SELECT away_team, (away_score > home_score)::int, (away_score < home_score)::int FROM sports_games WHERE sport='mlb' AND game_type='REG' AND home_score IS NOT NULL AND season = (2025)) SELECT sum(w)::int, sum(l)::int FROM g GROUP BY t ORDER BY (sum(w) + 0.5 * (count(*) - sum(w) - sum(l)))::float / count(*) DESC LIMIT 1",
+      "facts": [
+        "{0}-{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "B4",
+      "workflow": "B",
+      "text": "What are the current NFL standings?",
+      "tools": [
+        "kb.standings"
+      ],
+      "truth": "WITH g AS (SELECT home_team t, (home_score > away_score)::int w, (home_score < away_score)::int l FROM sports_games WHERE sport='nfl' AND game_type='REG' AND home_score IS NOT NULL AND season = (SELECT max(season) FROM sports_games WHERE sport='nfl' AND game_type='REG' AND home_score IS NOT NULL) UNION ALL SELECT away_team, (away_score > home_score)::int, (away_score < home_score)::int FROM sports_games WHERE sport='nfl' AND game_type='REG' AND home_score IS NOT NULL AND season = (SELECT max(season) FROM sports_games WHERE sport='nfl' AND game_type='REG' AND home_score IS NOT NULL)) SELECT sum(w)::int, sum(l)::int FROM g GROUP BY t ORDER BY (sum(w) + 0.5 * (count(*) - sum(w) - sum(l)))::float / count(*) DESC LIMIT 1",
+      "facts": [
+        "{0}-{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "B5",
+      "workflow": "B",
+      "text": "Who is leading the NHL standings?",
+      "tools": [
+        "kb.standings"
+      ],
+      "truth": "WITH g AS (SELECT home t, CASE WHEN home_score > away_score THEN 2 WHEN last_period IN ('OT','SO') THEN 1 ELSE 0 END p FROM nhl_games_api WHERE game_type=2 AND completed AND season=(SELECT max(season) FROM nhl_games_api WHERE game_type=2 AND completed) UNION ALL SELECT away, CASE WHEN away_score > home_score THEN 2 WHEN last_period IN ('OT','SO') THEN 1 ELSE 0 END FROM nhl_games_api WHERE game_type=2 AND completed AND season=(SELECT max(season) FROM nhl_games_api WHERE game_type=2 AND completed)) SELECT sum(p)::int FROM g GROUP BY t ORDER BY sum(p) DESC LIMIT 1",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "B6",
+      "workflow": "B",
+      "text": "What is the worst record in the NBA right now?",
+      "tools": [
+        "kb.standings"
+      ],
+      "truth": "WITH g AS (SELECT home_team t, (home_score > away_score)::int w, (home_score < away_score)::int l FROM sports_games WHERE sport='nba' AND game_type='REG' AND home_score IS NOT NULL AND season = (SELECT max(season) FROM sports_games WHERE sport='nba' AND game_type='REG' AND home_score IS NOT NULL) UNION ALL SELECT away_team, (away_score > home_score)::int, (away_score < home_score)::int FROM sports_games WHERE sport='nba' AND game_type='REG' AND home_score IS NOT NULL AND season = (SELECT max(season) FROM sports_games WHERE sport='nba' AND game_type='REG' AND home_score IS NOT NULL)) SELECT sum(w)::int, sum(l)::int FROM g GROUP BY t ORDER BY (sum(w) + 0.5 * (count(*) - sum(w) - sum(l)))::float / count(*) ASC LIMIT 1",
+      "facts": [
+        "{0}-{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C3",
+      "workflow": "C",
+      "text": "How many goals per game has Auston Matthews scored over his last 5 games?",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'goals')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8479318' ORDER BY game_date DESC LIMIT 5) x)) < 1 THEN round((SELECT avg((stats->>'goals')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8479318' ORDER BY game_date DESC LIMIT 5) x), 2) ELSE round((SELECT avg((stats->>'goals')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8479318' ORDER BY game_date DESC LIMIT 5) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C4",
+      "workflow": "C",
+      "text": "How many home runs per game did Aaron Judge average in the 2025 season?",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'hr')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='592450' AND season=2025 ORDER BY game_date DESC) x)) < 1 THEN round((SELECT avg((stats->>'hr')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='592450' AND season=2025 ORDER BY game_date DESC) x), 2) ELSE round((SELECT avg((stats->>'hr')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='592450' AND season=2025 ORDER BY game_date DESC) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C5",
+      "workflow": "C",
+      "text": "What are Patrick Mahomes' passing yards per game over his last 5 games?",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'passing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0033873' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 5) x)) < 1 THEN round((SELECT avg((stats->>'passing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0033873' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 5) x), 2) ELSE round((SELECT avg((stats->>'passing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0033873' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 5) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C6",
+      "workflow": "C",
+      "text": "How many rebounds is Victor Wembanyama averaging this season?",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'reb')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='5104157' AND season=2026 ORDER BY game_date DESC) x)) < 1 THEN round((SELECT avg((stats->>'reb')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='5104157' AND season=2026 ORDER BY game_date DESC) x), 2) ELSE round((SELECT avg((stats->>'reb')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='5104157' AND season=2026 ORDER BY game_date DESC) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C7",
+      "workflow": "C",
+      "text": "shai gilgeous-alexander points per game last 10 games",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'pts')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 10) x)) < 1 THEN round((SELECT avg((stats->>'pts')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 10) x), 2) ELSE round((SELECT avg((stats->>'pts')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 10) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C8",
+      "workflow": "C",
+      "text": "Compare Jayson Tatum and Shai Gilgeous-Alexander in assists over their last 15 games.",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4065648' ORDER BY game_date DESC LIMIT 15) x)) < 1 THEN round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4065648' ORDER BY game_date DESC LIMIT 15) x), 2) ELSE round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4065648' ORDER BY game_date DESC LIMIT 15) x), 1) END), (CASE WHEN abs((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 15) x)) < 1 THEN round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 15) x), 2) ELSE round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='4278073' ORDER BY game_date DESC LIMIT 15) x), 1) END)",
+      "facts": [
+        "{0}",
+        "{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C9",
+      "workflow": "C",
+      "text": "How many hits per game has Shohei Ohtani averaged over his last 20 games?",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'h')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='660271' ORDER BY game_date DESC LIMIT 20) x)) < 1 THEN round((SELECT avg((stats->>'h')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='660271' ORDER BY game_date DESC LIMIT 20) x), 2) ELSE round((SELECT avg((stats->>'h')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='mlb' AND player_id='660271' ORDER BY game_date DESC LIMIT 20) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "C10",
+      "workflow": "C",
+      "text": "Josh Allen rushing yards per game over his last 3 games",
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'rushing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0034857' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 3) x)) < 1 THEN round((SELECT avg((stats->>'rushing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0034857' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 3) x), 2) ELSE round((SELECT avg((stats->>'rushing_yards')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nfl' AND player_id='00-0034857' ORDER BY season DESC, (CASE WHEN week ~ '^[0-9]+$' THEN week::int END) DESC LIMIT 3) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "D3",
+      "workflow": "D",
+      "text": "Who won the last Lakers game?",
+      "tools": [
+        "kb.results"
+      ],
+      "truth": "SELECT CASE WHEN home_team='LAL' THEN home_score||'-'||away_score ELSE away_score||'-'||home_score END FROM sports_games WHERE sport='nba' AND 'LAL' IN (home_team, away_team) AND home_score IS NOT NULL AND game_type <> 'PRE' ORDER BY game_date DESC LIMIT 1",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "D4",
+      "workflow": "D",
+      "text": "Analyze the Chiefs' next game.",
+      "tools": [],
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='nfl' AND a.alias = (SELECT CASE WHEN home_team=$$KC$$ THEN away_team ELSE home_team END FROM sports_games WHERE sport=$$nfl$$ AND $$KC$$ IN (home_team, away_team) AND home_score IS NULL AND game_date >= (now() AT TIME ZONE $$America/New_York$$)::date ORDER BY game_date LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": [
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
+      ]
+    },
+    {
+      "id": "D5",
+      "workflow": "D",
+      "text": "How did the Celtics do in their last 5 games?",
+      "tools": [
+        "kb.results"
+      ],
+      "truth": "WITH x AS (SELECT CASE WHEN home_team='BOS' THEN home_score > away_score ELSE away_score > home_score END w FROM sports_games WHERE sport='nba' AND 'BOS' IN (home_team, away_team) AND home_score IS NOT NULL AND game_type <> 'PRE' ORDER BY game_date DESC LIMIT 5) SELECT count(*) FILTER (WHERE w), count(*) FILTER (WHERE NOT w) FROM x",
+      "facts": [
+        "{0}-{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "E4",
+      "workflow": "E",
+      "text": "Simulate the next Chiefs game 100,000 times.",
+      "tools": [
+        "sim.run"
+      ],
+      "truth": null,
+      "facts": [
+        "100,000"
+      ],
+      "statuses": [
+        "model_estimated"
+      ],
+      "forbid": [
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
+      ]
+    },
+    {
+      "id": "F3",
+      "workflow": "F",
+      "text": "How well calibrated is the NHL model?",
+      "tools": [
+        "model.validation"
+      ],
+      "truth": null,
+      "facts": [],
+      "must_any": [
+        "(?i)calibrat|brier"
+      ],
+      "forbid": [
+        "(?i)100% accurate"
+      ]
+    },
+    {
+      "id": "F4",
+      "workflow": "F",
+      "text": "Is the MLB model beating the closing line?",
+      "tools": [
+        "model.validation"
+      ],
+      "truth": null,
+      "facts": [],
+      "must_any": [
+        "(?i)closing|clv|market"
+      ],
+      "forbid": [
+        "(?i)100% accurate"
+      ]
+    },
+    {
+      "id": "F5",
+      "workflow": "F",
+      "text": "How accurate are the NBA player rebounds projections?",
+      "tools": [
+        "model.validation"
+      ],
+      "truth": null,
+      "facts": [],
+      "must_any": [
+        "(?i)brier|calibrat|mae|backtest|market"
+      ],
+      "forbid": [
+        "(?i)100% accurate"
+      ]
+    },
+    {
+      "id": "G3",
+      "workflow": "G",
+      "text": "What was the attendance at last night's Knicks game?",
+      "tools": [],
+      "truth": null,
+      "facts": [],
+      "abstain": true,
+      "forbid": []
+    },
+    {
+      "id": "G4",
+      "workflow": "G",
+      "text": "How many tickets did the last Super Bowl sell?",
+      "tools": [],
+      "truth": null,
+      "facts": [],
+      "abstain": true,
+      "forbid": []
+    },
+    {
+      "id": "G5",
+      "workflow": "G",
+      "text": "Who refereed Game 7 of the 1988 NBA Finals?",
+      "tools": [],
+      "truth": null,
+      "facts": [],
+      "abstain": true,
+      "forbid": []
+    },
+    {
+      "id": "G6",
+      "workflow": "G",
+      "text": "What is LeBron James's shoe size?",
+      "tools": [],
+      "truth": null,
+      "facts": [],
+      "abstain": true,
+      "forbid": []
+    },
+    {
+      "id": "G7",
+      "workflow": "G",
+      "text": "How many people watched the 2025 World Series on TV?",
+      "tools": [],
+      "truth": null,
+      "facts": [],
+      "abstain": true,
+      "forbid": []
+    },
+    {
+      "id": "H4",
+      "workflow": "H",
+      "text": "How has Connor McDavid done in points over his last 10 games?",
+      "turns": [
+        "How has Connor McDavid done in points over his last 10 games?",
+        "and over the last 5?"
+      ],
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'points')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8478402' ORDER BY game_date DESC LIMIT 5) x)) < 1 THEN round((SELECT avg((stats->>'points')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8478402' ORDER BY game_date DESC LIMIT 5) x), 2) ELSE round((SELECT avg((stats->>'points')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nhl' AND player_id='8478402' ORDER BY game_date DESC LIMIT 5) x), 1) END)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "H5",
+      "workflow": "H",
+      "text": "Show me the Boston results over the last 5 games",
+      "turns": [
+        "Show me the Boston results over the last 5 games",
+        "the Celtics"
+      ],
+      "tools": [
+        "entities.resolve",
+        "kb.results"
+      ],
+      "truth": "WITH x AS (SELECT CASE WHEN home_team='BOS' THEN home_score > away_score ELSE away_score > home_score END w FROM sports_games WHERE sport='nba' AND 'BOS' IN (home_team, away_team) AND home_score IS NOT NULL AND game_type <> 'PRE' ORDER BY game_date DESC LIMIT 5) SELECT count(*) FILTER (WHERE w), count(*) FILTER (WHERE NOT w) FROM x",
+      "facts": [
+        "{0}-{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "H6",
+      "workflow": "H",
+      "text": "Compare Nikola Jokic and Luka Doncic in points over their last 20 games.",
+      "turns": [
+        "Compare Nikola Jokic and Luka Doncic in points over their last 20 games.",
+        "what about assists?"
+      ],
+      "tools": [
+        "kb.player_stats"
+      ],
+      "truth": "SELECT (CASE WHEN abs((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3112335' ORDER BY game_date DESC LIMIT 20) x)) < 1 THEN round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3112335' ORDER BY game_date DESC LIMIT 20) x), 2) ELSE round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3112335' ORDER BY game_date DESC LIMIT 20) x), 1) END), (CASE WHEN abs((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3945274' ORDER BY game_date DESC LIMIT 20) x)) < 1 THEN round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3945274' ORDER BY game_date DESC LIMIT 20) x), 2) ELSE round((SELECT avg((stats->>'ast')::numeric) FROM (SELECT stats FROM player_game_logs WHERE sport='nba' AND player_id='3945274' ORDER BY game_date DESC LIMIT 20) x), 1) END)",
+      "facts": [
+        "{0}",
+        "{1}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "H7",
+      "workflow": "H",
+      "text": "Who won the 2025 World Series?",
+      "turns": [
+        "Who won the 2025 World Series?",
+        "who did they beat?"
+      ],
+      "tools": [
+        "kb.champions"
+      ],
+      "stretch": true,
+      "truth": "SELECT (SELECT e.name FROM entity_aliases a JOIN entities e USING (entity_id) WHERE e.kind='team' AND e.sport='mlb' AND a.alias = (SELECT CASE WHEN home_score > away_score THEN away_team ELSE home_team END FROM sports_games WHERE sport=$$mlb$$ AND game_type=$$POST$$ AND season=2025 AND home_score IS NOT NULL ORDER BY game_date DESC LIMIT 1) ORDER BY a.valid_to NULLS FIRST LIMIT 1)",
+      "facts": [
+        "{0}"
+      ],
+      "forbid": []
+    },
+    {
+      "id": "I2",
+      "workflow": "I",
+      "text": "Any plus-money NBA props?",
+      "tools": [
+        "picks.today"
+      ],
+      "truth": null,
+      "facts": [],
+      "statuses": [
+        "model_estimated",
+        "verified"
+      ],
+      "no_statuses": [
+        "unverified",
+        "partially_verified"
+      ],
+      "statuses_model_only": true,
+      "forbid": [
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
+      ]
+    },
+    {
+      "id": "I3",
+      "workflow": "I",
+      "text": "Make me a 3-leg parlay with $20.",
+      "tools": [
+        "picks.today"
+      ],
+      "truth": null,
+      "facts": [],
+      "no_statuses": [
+        "unverified",
+        "partially_verified"
+      ],
+      "forbid": [
+        "(?i)per leg",
+        "(?i)(?<!no )(?<!not a )(?<!not )\\bguarantee(d|s)?\\b(?! of)"
+      ]
+    }
+  ],
+  "entity_cases": [
+    {
+      "q": "LeBron",
+      "expect": "pl:nba:1966"
+    },
+    {
+      "q": "LeBron James",
+      "expect": "pl:nba:1966"
+    },
+    {
+      "q": "Lebron Jams",
+      "expect": "pl:nba:1966"
+    },
+    {
+      "q": "Nikola Jokic",
+      "expect": "pl:nba:3112335"
+    },
+    {
+      "q": "Jokić",
+      "expect": "pl:nba:3112335"
+    },
+    {
+      "q": "Jokic",
+      "sport": "nba",
+      "expect": "pl:nba:3112335"
+    },
+    {
+      "q": "Connor McDavid",
+      "expect": "pl:nhl:8478402"
+    },
+    {
+      "q": "McDavid",
+      "expect": "pl:nhl:8478402"
+    },
+    {
+      "q": "C. McDavid",
+      "expect": "pl:nhl:8478402"
+    },
+    {
+      "q": "Patrick Mahomes",
+      "expect": "pl:nfl:00-0033873"
+    },
+    {
+      "q": "Mahomes",
+      "expect": "pl:nfl:00-0033873"
+    },
+    {
+      "q": "Mahommes",
+      "expect": "pl:nfl:00-0033873"
+    },
+    {
+      "q": "Aaron Judge",
+      "expect": "pl:mlb:592450"
+    },
+    {
+      "q": "Shohei Ohtani",
+      "expect": "pl:mlb:660271"
+    },
+    {
+      "q": "Ohtani",
+      "expect": "pl:mlb:660271"
+    },
+    {
+      "q": "Shai Gilgeous-Alexander",
+      "expect": "pl:nba:4278073"
+    },
+    {
+      "q": "Wembanyama",
+      "expect": "pl:nba:5104157"
+    },
+    {
+      "q": "Jayson Tatum",
+      "expect": "pl:nba:4065648"
+    },
+    {
+      "q": "Auston Matthews",
+      "expect": "pl:nhl:8479318"
+    },
+    {
+      "q": "Lakers",
+      "expect": "tm:nba:LAL"
+    },
+    {
+      "q": "the Lakers",
+      "expect": "tm:nba:LAL"
+    },
+    {
+      "q": "Los Angeles Lakers",
+      "expect": "tm:nba:LAL"
+    },
+    {
+      "q": "Knicks",
+      "expect": "tm:nba:NYK"
+    },
+    {
+      "q": "Leafs",
+      "expect": "tm:nhl:TOR"
+    },
+    {
+      "q": "Maple Leafs",
+      "expect": "tm:nhl:TOR"
+    },
+    {
+      "q": "Yankees",
+      "expect": "tm:mlb:NYY"
+    },
+    {
+      "q": "NYY",
+      "expect": "tm:mlb:NYY"
+    },
+    {
+      "q": "Chiefs",
+      "expect": "tm:nfl:KC"
+    },
+    {
+      "q": "Oakland Raiders",
+      "expect": "tm:nfl:LV"
+    },
+    {
+      "q": "Washington Redskins",
+      "expect": "tm:nfl:WAS"
+    },
+    {
+      "q": "Arizona Coyotes",
+      "expect": "tm:nhl:ARI"
+    },
+    {
+      "q": "Rangers",
+      "sport": "nhl",
+      "expect": "tm:nhl:NYR"
+    },
+    {
+      "q": "Boston",
+      "sport": "nhl",
+      "expect": "tm:nhl:BOS"
+    },
+    {
+      "q": "James",
+      "sport": "nba",
+      "focus": "pl:nba:1966",
+      "expect": "pl:nba:1966"
+    },
+    {
+      "q": "James",
+      "sport": "nba",
+      "expect": "ambiguous"
+    },
+    {
+      "q": "Boston",
+      "expect": "ambiguous"
+    },
+    {
+      "q": "Rangers",
+      "expect": "ambiguous"
+    },
+    {
+      "q": "Kansas City",
+      "expect": "ambiguous"
+    },
+    {
+      "q": "Xyzzy Foo",
+      "expect": "none"
+    },
+    {
+      "q": "Steph Curry",
+      "expect": "pl:nba:3975",
+      "stretch": true
+    },
+    {
+      "q": "Habs",
+      "expect": "tm:nhl:MTL",
+      "stretch": true
+    },
+    {
+      "q": "SGA",
+      "expect": "pl:nba:4278073",
+      "stretch": true
     }
   ]
 }
