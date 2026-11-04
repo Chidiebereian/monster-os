@@ -9,6 +9,8 @@
 //!
 //! GET /futures/kalshi?series=KXSB,KXNBA         every outcome of open futures events
 //! GET /futures/polymarket?tag=nfl               (champion, conference, division), see futures.rs
+//! GET /games/kalshi?series=KXNBAGAME            game winners, one entry per team
+//! GET /games/polymarket?league=nba              (see games.rs)
 //!
 //! All return common::MarketQuote (YES side, dollars per $1 contract, with
 //! the venue's taker fee) from the venues' public, unauthenticated
@@ -16,6 +18,7 @@
 //! POLYMARKET_API_URL.
 
 mod futures;
+mod games;
 
 use std::time::Duration;
 
@@ -468,6 +471,8 @@ async fn main() -> std::io::Result<()> {
             .route("/markets/polymarket", web::get().to(polymarket_markets))
             .route("/futures/kalshi", web::get().to(futures::kalshi))
             .route("/futures/polymarket", web::get().to(futures::polymarket))
+            .route("/games/kalshi", web::get().to(games::kalshi))
+            .route("/games/polymarket", web::get().to(games::polymarket))
     })
     .bind(&common::bind_addrs(port)[..])?
     .run()

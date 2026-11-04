@@ -19,6 +19,7 @@ export interface PmLeg {
 export interface PmStep { contracts: number; price_a: number; price_b: number; unit_cost: number }
 export interface PmOpportunity {
   id: string;
+  kind: "futures" | "game";
   league: string;
   family: string;
   team: string;

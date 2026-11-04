@@ -131,6 +131,13 @@ pub struct VenueMarket {
     /// Taker fee, when known. `None` means unknown, not free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taker_fee: Option<FeeSchedule>,
+    /// Game markets: the game's date in US Eastern time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_date: Option<chrono::NaiveDate>,
+    /// True when this outcome's YES is the NO side of the market's order book (the
+    /// second team of a Polymarket two-team market shares the first team's book).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub complement: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

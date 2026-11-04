@@ -1,6 +1,8 @@
-//! Prediction-market arbitrage: the same futures outcome (e.g. "Buffalo wins the 2027 AFC
-//! Championship") on Kalshi and Polymarket, where YES on one venue plus NO on the other
-//! costs less than the $1 the pair pays out, after each venue's taker fee.
+//! Prediction-market arbitrage: the same outcome on Kalshi and Polymarket, where YES on one
+//! venue plus NO on the other costs less than the $1 the pair pays out, after each venue's
+//! taker fee. Two kinds: futures ("Buffalo wins the 2027 AFC Championship") and game
+//! winners ("Atlanta beats Washington on Nov 4"; a game is matched by league, US date and
+//! both teams, and only before it starts).
 //!
 //! GET  /pm-arb            the latest scan (every PM_ARB_INTERVAL_SECS, default 180)
 //! POST /pm-arb/refresh    scan now (at most every 30 s)
@@ -54,10 +56,20 @@ pub const KALSHI_FAMILIES: [(&str, &str, &str, &str); 19] = [
     ("KXMLBWS", "mlb", "champion", ""),
 ];
 const POLYMARKET_TAGS: [&str; 4] = ["nfl", "nba", "nhl", "mlb"];
+/// Kalshi game-winner series -> league.
+pub const KALSHI_GAME_SERIES: [(&str, &str); 4] = [("KXNBAGAME", "nba"), ("KXNFLGAME", "nfl"), ("KXNHLGAME", "nhl"), ("KXMLBGAME", "mlb")];
+
+/// League of a Kalshi game event ("KXNBAGAME-26NOV04ATLWAS" -> nba).
+pub fn kalshi_game_league(event_id: &str) -> Option<&'static str> {
+    let series = event_id.split('-').next()?;
+    KALSHI_GAME_SERIES.iter().find(|g| g.0 == series).map(|g| g.1)
+}
 /// Two venues may date the same outcome differently (Kalshi: expected expiration;
 /// Polymarket: a deadline weeks later), but not by a season.
 pub const MAX_DATE_GAP_DAYS: i64 = 120;
 const MIN_REFRESH: Duration = Duration::from_secs(30);
+/// Smallest edge per pair worth showing (0.1 cent), and at least one full pair of depth.
+pub const MIN_EDGE: f64 = 0.001;
 /// Pairs closest to an arb, shown when there is none.
 const CLOSEST_N: usize = 12;
 
@@ -78,6 +90,7 @@ impl Family {
             "champion" => format!("{l} {season} champion"),
             "conference" if self.league == "nfl" => format!("{season} {} champion", self.scope.to_uppercase()),
             "conference" => format!("{l} {season} {} conference champion", title_case(&self.scope)),
+            "game" => format!("{l} game {}", self.scope.split(' ').next().unwrap_or("")),
             _ => format!("{l} {season} {} division winner", self.scope.to_uppercase()),
         }
     }
@@ -250,6 +263,8 @@ pub struct Check {
 #[derive(Clone, Debug, Serialize)]
 pub struct Opportunity {
     pub id: String,
+    /// "futures" or "game"
+    pub kind: String,
     pub league: String,
     pub family: String,
     pub team: String,
@@ -360,6 +375,20 @@ pub fn norm(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase()
 }
 
+/// Does a venue label name this team: equal to the alias the resolver matched, or the
+/// team name's first words in full ("Utah" = "Utah Mammoth")? "Los Angeles C" is not
+/// "Los Angeles Clippers", and "King" is not "Kings".
+pub fn label_names(label: &str, matched_alias: &str, team_name: &str) -> bool {
+    if norm(label).is_empty() {
+        return false;
+    }
+    if norm(label) == norm(matched_alias) {
+        return true;
+    }
+    let (l, n): (Vec<String>, Vec<String>) = (label.split_whitespace().map(norm).collect(), team_name.split_whitespace().map(norm).collect());
+    l.len() < n.len() && l.iter().zip(&n).all(|(a, b)| a == b)
+}
+
 /// (entity_id, name) for a venue outcome, or None. Strict, because a wrong team makes
 /// a fake arb: a Kalshi outcome is its ticker code (never the city label: "Los Angeles C"
 /// once resolved to the Lakers), and a Polymarket outcome must equal one of the team's
@@ -377,12 +406,23 @@ async fn team(u: &Urls, st: &ArbState, league: &str, label: &str, code: Option<&
             .filter(|e| e["kind"] == "team").collect();
         let hit = match &want {
             Some(id) => cands.into_iter().find(|e| e["entity_id"].as_str() == Some(id.as_str())),
-            None => (v["status"] == "resolved").then(|| &v["entity"])
-                .filter(|e| e["kind"] == "team" && e["matched"].as_str().map(norm) == Some(norm(label))),
+            // exactly one team whose name or alias is the label or begins with it as whole
+            // words ("Kings" is ambiguous to the resolver only because players named King
+            // match too; Polymarket's game markets say "Utah" for Utah Mammoth). Fuzzy
+            // spellings and labels that fit two teams ("New York" in the NFL) are rejected.
+            None => {
+                let mut hits: Vec<&Value> = cands.into_iter().filter(|e| label_names(label, e["matched"].as_str().unwrap_or(""), e["name"].as_str().unwrap_or(""))).collect();
+                hits.dedup_by(|a, b| a["entity_id"] == b["entity_id"]);
+                (hits.len() == 1).then(|| hits[0])
+            }
         }?;
         Some((hit["entity_id"].as_str()?.to_string(), hit["name"].as_str()?.to_string()))
     });
-    st.teams.lock().unwrap().insert(key, out.clone());
+    // only successes are kept: a failed lookup (resolver busy rebuilding, a network
+    // error) is retried next scan instead of hiding the team until a restart
+    if out.is_some() {
+        st.teams.lock().unwrap().insert(key, out.clone());
+    }
     out
 }
 
@@ -413,25 +453,57 @@ fn leg(m: &VenueMarket, yes: bool, ladder: &[Level]) -> Leg {
 pub async fn scan(u: &Urls, st: &ArbState) -> Snapshot {
     let t0 = Instant::now();
     let mut snap = Snapshot::default();
-    let mut all: Vec<VenueMarket> = Vec::new();
+    // (league hint, market): Polymarket game markets carry no league of their own
+    let mut all: Vec<(Option<&str>, VenueMarket)> = Vec::new();
     let series = KALSHI_FAMILIES.iter().map(|f| f.0).collect::<Vec<_>>().join(",");
-    let mut urls = vec![format!("{}/futures/kalshi?series={series}", u.markets)];
-    // every family title says "Champion"; game markets and props are left at the venue
-    urls.extend(POLYMARKET_TAGS.iter().map(|t| format!("{}/futures/polymarket?tag={t}&contains=champion", u.markets)));
-    for url in urls {
+    let games = KALSHI_GAME_SERIES.iter().map(|g| g.0).collect::<Vec<_>>().join(",");
+    let mut urls: Vec<(Option<&str>, String)> = vec![
+        (None, format!("{}/futures/kalshi?series={series}", u.markets)),
+        (None, format!("{}/games/kalshi?series={games}", u.markets)),
+    ];
+    // every family title says "Champion"; other markets and props are left at the venue
+    urls.extend(POLYMARKET_TAGS.iter().map(|t| (None, format!("{}/futures/polymarket?tag={t}&contains=champion", u.markets))));
+    urls.extend(POLYMARKET_TAGS.iter().map(|t| (Some(*t), format!("{}/games/polymarket?league={t}", u.markets))));
+    for (hint, url) in urls {
         match get(u, &url).await {
             Ok(v) => {
                 snap.errors.extend(v["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_string)));
-                all.extend(v["markets"].as_array().into_iter().flatten().filter_map(|m| serde_json::from_value::<VenueMarket>(m.clone()).ok()));
+                all.extend(v["markets"].as_array().into_iter().flatten()
+                    .filter_map(|m| serde_json::from_value::<VenueMarket>(m.clone()).ok()).map(|m| (hint, m)));
             }
             Err(e) => snap.errors.push(e),
         }
     }
+    let now = Utc::now();
     // (family, season, entity) -> one market per venue
     let mut groups: BTreeMap<(Family, i32, String), (Option<VenueMarket>, Option<VenueMarket>, String)> = BTreeMap::new();
     let mut seen_poly = std::collections::HashSet::new();
-    for m in all {
+    // games: (venue, event) -> its resolved teams, paired once both are known
+    let mut game_events: BTreeMap<(String, String), Vec<(String, String, String, VenueMarket)>> = BTreeMap::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    for (hint, m) in all {
         *snap.markets.entry(m.venue.clone()).or_default() += 1;
+        if let Some(day) = m.game_date {
+            let league = if m.venue == "kalshi" { kalshi_game_league(&m.event_id) } else { hint };
+            let Some(league) = league else { continue };
+            if m.venue == "polymarket" && m.resolves_at.map(|t| t <= now).unwrap_or(true) {
+                *snap.unmatched.entry("game started".into()).or_default() += 1;
+                continue;
+            }
+            match team(u, st, league, &m.outcome, m.code.as_deref()).await {
+                Some((id, name)) => {
+                    names.insert(id.clone(), name.clone());
+                    game_events.entry((m.venue.clone(), m.event_id.clone())).or_default().push((league.to_string(), day.to_string(), id, m));
+                }
+                None => {
+                    *snap.unmatched.entry("outcome not one team".into()).or_default() += 1;
+                    if snap.unresolved.len() < 40 {
+                        snap.unresolved.push(format!("{} {league} game: {}", m.venue, m.outcome));
+                    }
+                }
+            }
+            continue;
+        }
         let fam = if m.venue == "kalshi" { kalshi_family(&m.event_id) } else { polymarket_family(&m.event_title) };
         let Some(fam) = fam else { continue };
         // Polymarket lists an event under several tags
@@ -454,7 +526,25 @@ pub async fn scan(u: &Urls, st: &ArbState) -> Snapshot {
             *slot = Some(m);
         }
     }
-    let now = Utc::now();
+    for ((venue, _), teams) in game_events {
+        let mut ids: Vec<String> = teams.iter().map(|t| t.2.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.len() != 2 {
+            *snap.unmatched.entry("game teams unclear".into()).or_default() += teams.len();
+            continue;
+        }
+        for (league, day, id, m) in teams {
+            let fam = Family::new(&league, "game", &format!("{day} {} {}", ids[0], ids[1]));
+            let g = groups.entry((fam, 0, id.clone())).or_insert((None, None, names.get(&id).cloned().unwrap_or_default()));
+            let slot = if venue == "kalshi" { &mut g.0 } else { &mut g.1 };
+            if slot.is_some() {
+                *snap.unmatched.entry("duplicate on one venue".into()).or_default() += 1;
+            } else {
+                *slot = Some(m);
+            }
+        }
+    }
     let mut keep_ids = Vec::new();
     for ((fam, season, id), (k, p, name)) in groups {
         let (Some(k), Some(p)) = (k, p) else {
@@ -465,12 +555,18 @@ pub async fn scan(u: &Urls, st: &ArbState) -> Snapshot {
             (Some(a), Some(b)) => Some((a - b).num_days().abs()),
             _ => None,
         };
-        if gap.map(|g| g > MAX_DATE_GAP_DAYS).unwrap_or(false) {
+        let game = fam.kind == "game";
+        if !game && gap.map(|g| g > MAX_DATE_GAP_DAYS).unwrap_or(false) {
             *snap.unmatched.entry("resolution dates too far apart".into()).or_default() += 1;
             continue;
         }
         snap.pairs += 1;
-        let label = fam.label(season);
+        let label = if game {
+            let opp = fam.scope.split(' ').skip(1).find(|x| *x != id).and_then(|o| names.get(o)).cloned().unwrap_or_default();
+            format!("{} vs {opp}", fam.label(season))
+        } else {
+            fam.label(season)
+        };
         let Some((k_yes, top_cost)) = best_direction(&k, &p) else { continue };
         if top_cost >= 1.0 {
             snap.closest.push(Near { family: label, team: name, kalshi: k.market_id.clone(), polymarket: p.market_id.clone(), unit_cost: top_cost });
@@ -482,14 +578,15 @@ pub async fn scan(u: &Urls, st: &ArbState) -> Snapshot {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => { snap.errors.push(e); continue }
         };
-        let (la, lb) = (ask_ladder(&kb, k_yes), ask_ladder(&pb, !k_yes));
+        // the second team of a Polymarket game trades on the first team's book, mirrored
+        let (la, lb) = (ask_ladder(&kb, k_yes != k.complement), ask_ladder(&pb, !k_yes != p.complement));
         let depth = walk(&la, k.taker_fee, &lb, p.taker_fee);
         let legs = [leg(&k, k_yes, &la), leg(&p, !k_yes, &lb)];
         let unit = match (legs[0].price, legs[1].price) {
             (Some(a), Some(b)) => a + b + legs[0].fee_per_contract.unwrap_or(0.0) + legs[1].fee_per_contract.unwrap_or(0.0),
             _ => continue,
         };
-        if unit >= 1.0 || depth.contracts <= 0.0 {
+        if unit > 1.0 - MIN_EDGE || depth.contracts < 1.0 {
             snap.closest.push(Near { family: label, team: name, kalshi: k.market_id.clone(), polymarket: p.market_id.clone(), unit_cost: unit });
             continue;
         }
@@ -497,16 +594,25 @@ pub async fn scan(u: &Urls, st: &ArbState) -> Snapshot {
         let first = *st.first_seen.lock().unwrap().entry(oid.clone()).or_insert(now);
         keep_ids.push(oid.clone());
         let resolves = [k.resolves_at, p.resolves_at].into_iter().flatten().max();
-        let checks = vec![
-            Check { name: "same competition and season".into(), ok: true, detail: format!("{} / {}", k.event_title, p.event_title) },
+        let mut checks = vec![
+            Check { name: if game { "same game" } else { "same competition and season" }.into(), ok: true, detail: format!("{} / {}", k.event_title, p.event_title) },
             Check { name: "same team".into(), ok: true, detail: format!("{} = {} ({id})", k.outcome, p.outcome) },
-            Check { name: "resolution dates close".into(), ok: gap.map(|g| g <= 31).unwrap_or(false),
-                    detail: gap.map(|g| format!("{g} days apart")).unwrap_or_else(|| "a venue gives no date".into()) },
-            Check { name: "both fees known".into(), ok: legs.iter().all(|l| l.fee_known),
-                    detail: legs.iter().map(|l| format!("{}: {}", l.venue, if l.fee_known { "known" } else { "unknown (not counted)" })).collect::<Vec<_>>().join(", ") },
         ];
+        if game {
+            checks.push(Check { name: "abandoned or postponed game".into(), ok: false,
+                detail: "the venues' no-result rules can settle it differently (one may void, the other resolve): read both".into() });
+            if fam.league == "nfl" {
+                checks.push(Check { name: "ties possible".into(), ok: false,
+                    detail: "an NFL game can end tied; a tie may pay neither leg on one venue and half on the other".into() });
+            }
+        } else {
+            checks.push(Check { name: "resolution dates close".into(), ok: gap.map(|g| g <= 31).unwrap_or(false),
+                detail: gap.map(|g| format!("{g} days apart")).unwrap_or_else(|| "a venue gives no date".into()) });
+        }
+        checks.push(Check { name: "both fees known".into(), ok: legs.iter().all(|l| l.fee_known),
+            detail: legs.iter().map(|l| format!("{}: {}", l.venue, if l.fee_known { "known" } else { "unknown (not counted)" })).collect::<Vec<_>>().join(", ") });
         snap.opportunities.push(Opportunity {
-            id: oid, league: fam.league.clone(), family: label, team: name, entity_id: id,
+            id: oid, kind: if game { "game" } else { "futures" }.into(), league: fam.league.clone(), family: label, team: name, entity_id: id,
             edge: 1.0 - unit, roi: (1.0 - unit) / unit, unit_cost: unit, depth,
             days_to_resolve: resolves.map(|r| (r - now).num_days()), resolves_at: resolves, first_seen: first, legs, checks,
         });
@@ -571,7 +677,34 @@ mod tests {
     fn vm(venue: &str, bid: Option<f64>, ask: Option<f64>, fee: Option<FeeSchedule>) -> VenueMarket {
         VenueMarket { venue: venue.into(), market_id: "m".into(), event_id: "e".into(), event_title: "t".into(), outcome: "o".into(),
                       code: None, season: Some(2027), yes_bid: bid, yes_ask: ask, resolves_at: None, rules: String::new(),
-                      url: String::new(), volume: None, taker_fee: fee }
+                      url: String::new(), volume: None, taker_fee: fee, game_date: None, complement: false }
+    }
+
+    #[test]
+    fn game_events_and_labels() {
+        assert_eq!(kalshi_game_league("KXNBAGAME-26NOV04ATLWAS"), Some("nba"));
+        assert_eq!(kalshi_game_league("KXSB-27"), None);
+        assert_eq!(Family::new("nba", "game", "2026-11-04 tm:nba:ATL tm:nba:WAS").label(0), "NBA game 2026-11-04");
+    }
+
+    #[test]
+    fn mirrored_side_reads_the_other_half_of_the_book() {
+        // Polymarket's second team: its YES asks are the first team's bids mirrored
+        let first = Book { bids: vec![Level { price: 0.44, size: 100.0 }], asks: vec![Level { price: 0.45, size: 80.0 }] };
+        let complement = true;
+        assert_eq!(ask_ladder(&first, true != complement), vec![Level { price: 0.56, size: 100.0 }]);
+        assert_eq!(ask_ladder(&first, false != complement), vec![Level { price: 0.45, size: 80.0 }]);
+    }
+
+    #[test]
+    fn venue_labels_match_team_names_only_whole() {
+        assert!(label_names("Kings", "kings", "Sacramento Kings"));
+        assert!(label_names("Utah", "utahmammoth", "Utah Mammoth"));
+        assert!(label_names("Los Angeles Clippers", "losangelesclippers", "LA Clippers"));
+        assert!(!label_names("Los Angeles C", "losangelesclippers", "LA Clippers"));
+        assert!(!label_names("Los Angeles C", "losangeles", "Los Angeles Lakers"));
+        assert!(!label_names("King", "kings", "Sacramento Kings"));
+        assert!(!label_names("Utah Mammoth Hockey", "utahmammoth", "Utah Mammoth"));
     }
 
     #[test]

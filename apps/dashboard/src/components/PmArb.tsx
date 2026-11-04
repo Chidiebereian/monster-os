@@ -11,9 +11,10 @@ import { VENUE_LABEL, ageLabel, cents, pmArb, sizeFor, type PmLeg, type PmOpport
 const usd = (n: number) => (Math.abs(n) < 1000 ? `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}` : formatUsd(n));
 
 // Prediction-market arbitrage: Kalshi vs Polymarket futures (champion, conference,
-// division). Research only: nothing here places orders.
+// division) and game winners. Research only: nothing here places orders.
 
 const LEAGUES = [{ key: "all", label: "All" }, { key: "nfl", label: "NFL" }, { key: "nba", label: "NBA" }, { key: "nhl", label: "NHL" }, { key: "mlb", label: "MLB" }];
+const KINDS = [{ key: "all", label: "All" }, { key: "futures", label: "Futures" }, { key: "game", label: "Games" }];
 const SORTS = [{ key: "roi", label: "% Return" }, { key: "profit", label: "$ Depth profit" }, { key: "end", label: "End date" }, { key: "age", label: "Newest" }];
 
 export function PmArb() {
@@ -21,6 +22,7 @@ export function PmArb() {
   const bankroll = useSettings((s) => s.bankroll);
   const setBankroll = useSettings((s) => s.setBankroll);
   const [league, setLeague] = useState("all");
+  const [kind, setKind] = useState("all");
   const [sort, setSort] = useState("roi");
   const [q, setQ] = useState("");
   const [refreshing, setRefreshing] = useState(false);
@@ -28,7 +30,7 @@ export function PmArb() {
   const { data, isLoading, error } = useQuery({ queryKey: ["pm-arb"], queryFn: pmArb.get, refetchInterval: 30_000 });
 
   const rows = useMemo(() => {
-    let r = (data?.opportunities ?? []).filter((o) => league === "all" || o.league === league);
+    let r = (data?.opportunities ?? []).filter((o) => (league === "all" || o.league === league) && (kind === "all" || o.kind === kind));
     const needle = q.trim().toLowerCase();
     if (needle) r = r.filter((o) => `${o.team} ${o.family}`.toLowerCase().includes(needle));
     const by: Record<string, (a: PmOpportunity, b: PmOpportunity) => number> = {
@@ -38,7 +40,7 @@ export function PmArb() {
       age: (a, b) => new Date(b.first_seen).getTime() - new Date(a.first_seen).getTime(),
     };
     return [...r].sort(by[sort]);
-  }, [data, league, sort, q]);
+  }, [data, league, kind, sort, q]);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -57,6 +59,7 @@ export function PmArb() {
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
+        <Pills options={KINDS} value={kind} onChange={setKind} />
         <Pills options={LEAGUES} value={league} onChange={setLeague} />
         <Pills options={SORTS} value={sort} onChange={setSort} />
         <div className="ml-auto flex items-center gap-2 text-xs text-gray-400">
@@ -120,7 +123,7 @@ function Row({ o, bankroll }: { o: PmOpportunity; bankroll: number }) {
       <button onClick={() => setOpen(!open)} className="w-full text-left px-4 py-3 grid grid-cols-12 gap-3 items-center hover:bg-white/[0.02]">
         <div className="col-span-12 md:col-span-5 min-w-0">
           <div className="text-sm text-gray-100 truncate">{o.team}</div>
-          <div className="text-xs text-gray-500 truncate">{o.family}{o.days_to_resolve != null && ` · ends in ${o.days_to_resolve} days`}</div>
+          <div className="text-xs text-gray-500 truncate">{o.family}{o.kind === "futures" && o.days_to_resolve != null && ` · ends in ${o.days_to_resolve} days`}</div>
           {warn.length > 0 && <div className="text-[11px] text-amber mt-0.5">check: {warn.map((w) => w.name).join(", ")}</div>}
         </div>
         <div className="col-span-1 text-center"><div className="text-[10px] text-gray-500 uppercase">Age</div><div className="text-sm text-emerald-light font-mono">{ageLabel(o.first_seen)}</div></div>

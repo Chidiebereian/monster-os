@@ -77,6 +77,8 @@ pub fn kalshi_event_markets(ev: &Value, series: &str) -> Vec<VenueMarket> {
             url: format!("https://kalshi.com/markets/{}", series.to_lowercase()),
             volume: num(&m["volume_fp"]).or_else(|| num(&m["volume"])),
             taker_fee: Some(KALSHI_FEE),
+            game_date: None,
+            complement: false,
         })
     }).collect()
 }
@@ -106,6 +108,8 @@ pub fn polymarket_event_markets(ev: &Value) -> Vec<VenueMarket> {
             url: format!("https://polymarket.com/event/{slug}"),
             volume: num(&m["volumeNum"]),
             taker_fee: polymarket_fee(m),
+            game_date: None,
+            complement: false,
         })
     }).collect()
 }
