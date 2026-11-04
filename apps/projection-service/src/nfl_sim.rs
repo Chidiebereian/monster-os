@@ -1240,9 +1240,16 @@ pub struct Hist {
     pub offset: i32,
     pub n: u64,
     pub sum: f64,
+    /// per parameter-draw batch (mc.rs)
+    pub batches: crate::mc::Batches,
 }
 impl Hist {
-    fn new(offset: i32) -> Self { Hist { counts: Vec::new(), offset, n: 0, sum: 0.0 } }
+    fn new(offset: i32) -> Self { Hist { counts: Vec::new(), offset, n: 0, sum: 0.0, batches: Default::default() } }
+    fn end_batch(&mut self) { self.batches.end(self.n as f64, self.sum); }
+    pub fn deff(&self) -> f64 {
+        let (n, m) = (self.n as f64, self.mean());
+        self.batches.deff(n, m, crate::mc::var_of(&self.counts.iter().map(|c| *c as f64).collect::<Vec<f64>>(), self.offset as f64, n, m))
+    }
     fn add(&mut self, v: i32) {
         let i = (v - self.offset).max(0) as usize;
         if i >= self.counts.len() { self.counts.resize(i + 1, 0); }
@@ -1255,6 +1262,7 @@ impl Hist {
         for (i, c) in o.counts.iter().enumerate() { self.counts[i] += c; }
         self.n += o.n;
         self.sum += o.sum;
+        self.batches.merge(&o.batches);
     }
     pub fn mean(&self) -> f64 { if self.n == 0 { 0.0 } else { self.sum / self.n as f64 } }
     pub fn quantile(&self, q: f64) -> i32 {
@@ -1275,7 +1283,7 @@ impl Hist {
         }
         let n = self.n.max(1) as f64;
         let po = o as f64 / n;
-        (po, u as f64 / n, p as f64 / n, (po * (1.0 - po) / n).sqrt())
+        (po, u as f64 / n, p as f64 / n, crate::mc::mcse(po, n, self.deff()))
     }
     pub fn pmf(&self) -> (i32, Vec<f64>) {
         let n = self.n.max(1) as f64;
@@ -1351,6 +1359,12 @@ impl Ensemble {
             if s[RUSH_TD] + s[REC_TD] > 0 { self.anytime_td[i] += 1; }
         }
     }
+    fn end_batch(&mut self) {
+        for k in 0..2 { self.score[k].end_batch(); self.plays[k].end_batch(); }
+        self.total.end_batch();
+        self.margin.end_batch();
+        for p in self.player.iter_mut() { for h in p.iter_mut() { h.end_batch(); } }
+    }
     fn merge(&mut self, o: &Ensemble) {
         self.n += o.n;
         for k in 0..2 { self.score[k].merge(&o.score[k]); self.plays[k].merge(&o.plays[k]); }
@@ -1416,6 +1430,7 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
                     let r = play_game(&gi, &mut rng, None);
                     e.add(&r);
                 }
+                e.end_batch();
             }
             e
         })).collect();

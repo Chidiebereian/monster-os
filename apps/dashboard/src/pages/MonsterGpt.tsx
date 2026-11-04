@@ -7,13 +7,16 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { GptLocks } from "../components/GptLocks";
+import { ClaimedText, ClaimPanel, EntityChips, EntityInput, JobLine, type Picked } from "../components/GptEvidence";
 import {
-  GptSocket, gptApi, newRequestId, type ConnState, type GptCard, type GptModel, type GptSource, type GptStatus, type GptUsage, type ServerMsg, type StoredMessage,
+  GptSocket, gptApi, newRequestId, type ConnState, type GptCard, type GptClaim, type GptEntity, type GptJob, type GptModel, type GptSource, type GptStatus, type GptUsage,
+  type ServerMsg, type StoredMessage,
 } from "../lib/gpt";
 
-// MonsterGPT: plain-English betting assistant over the monster-gpt WebSocket.
-// The bet card and sources are Monster OS data (built in code from AI Picks
-// and the Games hub); the streamed text is the model's explanation of them.
+// MonsterGPT: plain-English sports research over the monster-gpt WebSocket.
+// The bet card and sources are Monster OS data (built in code from AI Picks,
+// the Games hub and the stored records); each sentence of an answer comes
+// back with a verification status and citations (protocol v2 claims frame).
 
 interface Turn {
   request_id: string;
@@ -33,6 +36,10 @@ interface Turn {
   ended?: number;
   message_id?: string | null;
   feedback?: number | null;
+  /** v2: per-sentence status and citations, the resolved players/teams, simulation jobs */
+  claims?: GptClaim[];
+  entities?: GptEntity[];
+  jobs?: GptJob[];
 }
 
 const PILLS = [
@@ -58,7 +65,7 @@ function fromStored(ms: StoredMessage[]): Turn[] {
       const t = out.find((x) => x.request_id === m.request_id) ?? out[out.length - 1];
       if (!t) continue;
       Object.assign(t, { text: m.content, card: m.card ?? undefined, sources: m.sources ?? undefined, model: m.model, usage: m.usage ?? undefined, cancelled: m.cancelled, done: true,
-        message_id: m.id, feedback: m.feedback ?? null });
+        message_id: m.id, feedback: m.feedback ?? null, claims: m.claims ?? undefined });
     }
   }
   return out.map((t) => ({ ...t, done: true }));
@@ -67,6 +74,7 @@ function fromStored(ms: StoredMessage[]): Turn[] {
 export function MonsterGpt() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
+  const [picked, setPicked] = useState<Picked[]>([]);
   const [conv, setConv] = useState<string | null>(null);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [models, setModels] = useState<GptModel[]>([]);
@@ -98,6 +106,9 @@ export function MonsterGpt() {
       case "sources": patch(m.request_id, (t) => ({ ...t, sources: m.sources })); break;
       case "delta": patch(m.request_id, (t) => ({ ...t, text: t.text + m.text })); break;
       case "reset": patch(m.request_id, (t) => ({ ...t, text: "", rewriting: true })); break;
+      case "claims": patch(m.request_id, (t) => ({ ...t, claims: m.claims })); break;
+      case "entities": patch(m.request_id, (t) => ({ ...t, entities: m.entities })); break;
+      case "job": patch(m.request_id, (t) => ({ ...t, jobs: [...(t.jobs ?? []).filter((j) => j.job_id !== m.job_id), { job_id: m.job_id, kind: m.kind, state: m.state, detail: m.detail }] })); break;
       case "done":
         patch(m.request_id, (t) => ({ ...t, done: true, ended: Date.now(), model: m.model, usage: m.usage, cancelled: m.cancelled, message_id: m.message_id }));
         qc.invalidateQueries({ queryKey: ["gpt-conversations"] });
@@ -126,8 +137,12 @@ export function MonsterGpt() {
     const question = q.trim();
     if (!question || active || !sock.current) return;
     setInput("");
+    // names picked with @ travel as canonical ids, so MonsterGPT doesn't have to guess them
+    const ents = picked.filter((p) => question.includes(p.mention));
+    const ctx = ents.length > 0 ? { ...(typeof context === "object" && context ? context : {}), entities: ents } : context;
+    setPicked([]);
     setTurns((ts) => [...ts.filter((t) => t.request_id !== request_id), { request_id, question, statuses: [], text: "", done: false, started: Date.now() }]);
-    sock.current.send({ request_id, conversation_id: conv, text: question, context, model });
+    sock.current.send({ request_id, conversation_id: conv, text: question, context: ctx, model });
   }
 
   // Arriving from a matchup page: ?q=...&sport=&game= sends the question with that game's brief.
@@ -193,7 +208,7 @@ export function MonsterGpt() {
           <button onClick={() => setSidebar(true)} className="lg:hidden p-1.5 rounded-md border border-glass text-gray-400" aria-label="Conversations"><PanelLeft size={15} /></button>
           <Bot className="text-violet" size={20} />
           <h1 className="text-lg font-semibold">MonsterGPT</h1>
-          <span className="hidden sm:inline text-sm text-gray-500">ask in plain English · bets come from Monster OS data</span>
+          <span className="hidden sm:inline text-sm text-gray-500">ask in plain English · every sentence checked against Monster OS records</span>
           <div className="ml-auto flex items-center gap-2">
             {models.length > 1 && (
               <select value={model ?? ""} onChange={(e) => setModel(e.target.value)} disabled={!!active} className="bg-surface border border-glass rounded-md px-2 py-1 text-xs text-gray-300" aria-label="Model">
@@ -234,8 +249,8 @@ export function MonsterGpt() {
 
         <form onSubmit={(e) => { e.preventDefault(); send(input); }}
           className="mt-3 flex items-center gap-2 rounded-xl border border-amber-400/25 bg-surface/90 px-4 py-3 shadow-[0_0_24px_-8px_rgba(139,92,246,0.45)] focus-within:border-violet/50">
-          <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask MonsterGPT anything to get the best picks." maxLength={8000}
-            className="flex-1 bg-transparent text-sm focus:outline-none text-gray-100 placeholder:text-amber-200/50" aria-label="Message MonsterGPT" />
+          <EntityInput value={input} onChange={setInput} onPick={(p) => setPicked((ps) => [...ps.filter((x) => x.entity_id !== p.entity_id), p])}
+            placeholder="Ask anything about the NBA, NFL, NHL or MLB. Type @ to pick a player or team." />
           {active ? (
             <button type="button" onClick={() => sock.current?.cancel(active.request_id)} title="Stop"
               className="relative h-8 w-8 rounded-full text-gray-300 hover:text-crimson-light" aria-label="Stop">
@@ -370,6 +385,8 @@ function TurnView({ t, last, busy, onRetry, onAsk, onRate }: {
               <ChevronDown size={12} className={clsx(details && "rotate-180")} />
             </button>
           )}
+          {t.jobs && t.jobs.length > 0 && <JobLine jobs={t.jobs} />}
+          {t.entities && t.entities.length > 0 && <EntityChips entities={t.entities} />}
           {details && !researching && (
             <div className="flex flex-wrap gap-1.5">{t.statuses.map((s) => (
               <span key={`${s.stage}:${s.name}`} title={s.detail} className={clsx("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]",
@@ -386,8 +403,12 @@ function TurnView({ t, last, busy, onRetry, onAsk, onRate }: {
               {t.card && <Headline card={t.card} />}
               {t.text && (
                 <div className="text-[15px] text-gray-200 whitespace-pre-wrap leading-relaxed">
-                  <Rich text={t.text} />{!t.done && <span className="inline-block w-1.5 h-4 bg-violet-light/70 animate-pulse align-text-bottom ml-0.5" />}
+                  {t.done && t.claims && t.claims.length > 0
+                    ? <ClaimedText text={t.text} claims={t.claims} prefix={t.request_id} render={(s) => <Rich text={s} />} />
+                    : <Rich text={t.text} />}
+                  {!t.done && <span className="inline-block w-1.5 h-4 bg-violet-light/70 animate-pulse align-text-bottom ml-0.5" />}
                 </div>)}
+              {t.done && t.claims && <ClaimPanel claims={t.claims} idPrefix={t.request_id} />}
               {t.done && (issues.length > 0 || unsupported.length > 0) && (
                 <div className="mt-2 flex gap-1.5 text-[11px] text-amber-400"><AlertTriangle size={12} className="shrink-0 mt-0.5" />
                   <span>The checker still flags: {[...issues.map((i) => i.detail), ...(unsupported.length && !issues.some((i) => i.code === "unsupported_numbers") ? [`numbers not in the data: ${unsupported.join(", ")}`] : [])].join("; ")}. The bet card is the source of truth.</span></div>)}
@@ -403,7 +424,7 @@ function TurnView({ t, last, busy, onRetry, onAsk, onRate }: {
                 </div>)}
             </div>
           )}
-          {t.sources && t.sources.length > 0 && !t.card && t.done && <Sources sources={t.sources} />}
+          {t.sources && t.sources.length > 0 && !t.card && t.done && !(t.claims && t.claims.some((c) => c.citations.length > 0)) && <Sources sources={t.sources} />}
 
           {t.done && t.text && (
             <div className="flex items-center gap-0.5">

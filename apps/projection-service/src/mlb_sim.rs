@@ -731,10 +731,17 @@ pub struct Hist {
     pub n: u32,
     pub sum: f64,
     pub sum_sq: f64,
+    /// per parameter-draw batch (mc.rs)
+    pub batches: crate::mc::Batches,
 }
 impl Hist {
     pub fn new() -> Self {
-        Hist { counts: vec![0; HIST_CAP + 1], n: 0, sum: 0.0, sum_sq: 0.0 }
+        Hist { counts: vec![0; HIST_CAP + 1], n: 0, sum: 0.0, sum_sq: 0.0, batches: Default::default() }
+    }
+    pub fn end_batch(&mut self) { self.batches.end(self.n as f64, self.sum); }
+    pub fn deff(&self) -> f64 {
+        let (n, m) = (self.n as f64, self.mean());
+        self.batches.deff(n, m, (self.sum_sq / n.max(1.0) - m * m).max(0.0))
     }
     pub fn add(&mut self, v: u16) {
         let i = (v as usize).min(HIST_CAP);
@@ -773,7 +780,7 @@ impl Hist {
             if v > line { o += c as f64 } else if v < line { u += c as f64 } else { p += c as f64 }
         }
         let (o, u, p) = (o / n, u / n, p / n);
-        LineProbs { over: o, under: u, push: p, mcse_over: (o * (1.0 - o) / n).sqrt() }
+        LineProbs { over: o, under: u, push: p, mcse_over: crate::mc::mcse(o, n, self.deff()) }
     }
     pub fn pmf(&self) -> Vec<f64> {
         let n = self.n.max(1) as f64;
@@ -886,6 +893,13 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> SimOutput {
             let m = (r.runs[1] as i32 - r.runs[0] as i32).clamp(-MARGIN_OFFSET, MARGIN_OFFSET);
             out.margin_counts[(m + MARGIN_OFFSET) as usize] += 1;
         }
+        // close the parameter-draw batch on every histogram (mc.rs)
+        for side in 0..2 {
+            for slot in out.bat[side].iter_mut() { for h in slot.iter_mut() { h.end_batch(); } }
+            for h in out.starter[side].iter_mut() { h.end_batch(); }
+            out.team_runs[side].end_batch();
+        }
+        out.total_runs.end_batch();
     }
     out
 }

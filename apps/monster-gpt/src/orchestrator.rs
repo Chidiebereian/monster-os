@@ -203,13 +203,13 @@ pub async fn refresh_summary(g: &Gpt, m: &ModelCfg, conv: &str) {
 /// A simulation request (sim.rs): find the game, record the run, run it as a background
 /// job (one at a time), answer from the result with its seed and model version.
 #[allow(clippy::too_many_arguments)]
-async fn sim_turn(g: &Gpt, owner: &str, conv: &Option<String>, rid: &str, text: &str, sa: crate::sim::SimAsk, focus: &[String], filters: &router::Filters,
+async fn sim_turn(g: &Gpt, owner: &str, conv: &Option<String>, rid: &str, text: &str, sa: crate::sim::SimAsk, focus: &[String], forced: &HashMap<String, String>, filters: &router::Filters,
                   tx: &mpsc::Sender<ServerMsg>, cancel: &Arc<AtomicBool>, today: chrono::NaiveDate) {
     let send = |m: ServerMsg| { let tx = tx.clone(); async move { tx.send(m).await.is_ok() } };
     send(ServerMsg::Status { request_id: rid.into(), stage: "route".into(), name: "simulation".into(), state: "completed".into(),
         detail: Some(format!("{} simulations", crate::sim::fmt_count(sa.n as u64))), ms: Some(0) }).await;
     let mut calls: Vec<tools::ToolCall> = Vec::new();
-    let plan = crate::sim::plan(&g.tools, &sa, focus, &mut calls).await;
+    let plan = crate::sim::plan(&g.tools, &sa, focus, forced, &mut calls).await;
     let mut sources: Vec<Source> = Vec::new();
     let mut facts: Vec<crate::verify::Fact> = Vec::new();
     let mut entities: Vec<Value> = Vec::new();
@@ -418,6 +418,12 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
     if route.intent != Intent::Model {
         let focus: Vec<String> = prev_state["entities"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
         let mut forced: HashMap<String, String> = HashMap::new();
+        // players and teams the user picked with @ in the composer: no guessing for those names
+        for e in req.context.as_ref().and_then(|c| c["entities"].as_array()).into_iter().flatten() {
+            if let (Some(m), Some(id)) = (e["mention"].as_str(), e["entity_id"].as_str()) {
+                if m.len() <= 60 && (id.starts_with("pl:") || id.starts_with("tm:")) && id.len() <= 40 { forced.insert(m.to_string(), id.to_string()); }
+            }
+        }
         let mut original = req.text.clone();
         let mut ask: Option<crate::research::Ask> = None;
         // the reply to "which James do you mean?"
@@ -436,7 +442,7 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         }
         if ask.is_none() {
             if let Some(sa) = crate::sim::parse(&req.text) {
-                sim_turn(g, owner, &conv, &rid, &req.text, sa, &focus, &route.filters, &tx, &cancel, today).await;
+                sim_turn(g, owner, &conv, &rid, &req.text, sa, &focus, &forced, &route.filters, &tx, &cancel, today).await;
                 return None;
             }
         }

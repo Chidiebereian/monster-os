@@ -565,9 +565,16 @@ pub fn single_game(g: &GameInput, seed: u64) -> (GameResult, Vec<Event>) {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct Hist { pub counts: Vec<u64>, pub n: u64, pub sum: f64 }
+pub struct Hist { pub counts: Vec<u64>, pub n: u64, pub sum: f64, pub batches: crate::mc::Batches }
 impl Hist {
-    pub fn new() -> Self { Hist { counts: Vec::new(), n: 0, sum: 0.0 } }
+    pub fn new() -> Self { Hist { counts: Vec::new(), n: 0, sum: 0.0, batches: Default::default() } }
+    /// Close a parameter-draw batch (mc.rs): the simulate loops call it after each batch.
+    pub fn end_batch(&mut self) { self.batches.end(self.n as f64, self.sum); }
+    /// Design effect of the parameter draws for this histogram (1 = independent games).
+    pub fn deff(&self) -> f64 {
+        let (n, m) = (self.n as f64, self.mean());
+        self.batches.deff(n, m, crate::mc::var_of(&self.counts.iter().map(|c| *c as f64).collect::<Vec<f64>>(), 0.0, n, m))
+    }
     pub fn add(&mut self, v: i32) {
         let i = v.max(0) as usize;
         if i >= self.counts.len() { self.counts.resize(i + 1, 0); }
@@ -577,6 +584,7 @@ impl Hist {
         if o.counts.len() > self.counts.len() { self.counts.resize(o.counts.len(), 0); }
         for (i, c) in o.counts.iter().enumerate() { self.counts[i] += c; }
         self.n += o.n; self.sum += o.sum;
+        self.batches.merge(&o.batches);
     }
     pub fn mean(&self) -> f64 { if self.n == 0 { 0.0 } else { self.sum / self.n as f64 } }
     pub fn quantile(&self, q: f64) -> i32 {
@@ -585,7 +593,7 @@ impl Hist {
         for (i, c) in self.counts.iter().enumerate() { acc += c; if acc >= target { return i as i32; } }
         self.counts.len() as i32 - 1
     }
-    /// (P(over), P(under), P(push), mcse)
+    /// (P(over), P(under), P(push), mcse); mcse counts the parameter draws (mc.rs)
     pub fn line(&self, line: f64) -> (f64, f64, f64, f64) {
         let (mut o, mut u, mut p) = (0u64, 0u64, 0u64);
         for (i, c) in self.counts.iter().enumerate() {
@@ -594,7 +602,7 @@ impl Hist {
         }
         let n = self.n.max(1) as f64;
         let po = o as f64 / n;
-        (po, u as f64 / n, p as f64 / n, (po * (1.0 - po) / n).sqrt())
+        (po, u as f64 / n, p as f64 / n, crate::mc::mcse(po, n, self.deff()))
     }
     pub fn pmf(&self) -> Vec<f64> { let n = self.n.max(1) as f64; self.counts.iter().map(|c| *c as f64 / n).collect() }
 }
@@ -650,6 +658,10 @@ impl Ensemble {
                 for (k, v) in prop_values(s).iter().enumerate() { self.player[t][i][k].add(*v); }
             }
         }
+    }
+    fn end_batch(&mut self) {
+        for h in self.score.iter_mut().chain(std::iter::once(&mut self.total)) { h.end_batch(); }
+        for t in 0..2 { for p in self.player[t].iter_mut() { for h in p.iter_mut() { h.end_batch(); } } }
     }
     fn merge(&mut self, o: &Ensemble) {
         self.n += o.n;
@@ -727,6 +739,7 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
                     let gi = perturb(g, &mut prng);
                     let mut rng = Rng::new(derive_seed(seed, &["games", &b.to_string()]));
                     for _ in 0..m { let r = play_game(&gi, &mut rng, None); e.add(&r); }
+                    e.end_batch();
                 }
                 e
             })

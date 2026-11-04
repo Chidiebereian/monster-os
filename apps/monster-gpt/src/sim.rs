@@ -145,14 +145,20 @@ pub fn fmt_count(n: u64) -> String {
 /// Resolve the game and the ruled-out players for a request (no simulation yet).
 pub struct Plan { pub sport: String, pub game_id: String, pub names: Names, pub out_ids: Vec<String>, pub out_names: Vec<String>, pub entities: Vec<Value> }
 
-pub async fn plan(tools: &Tools, ask: &SimAsk, focus: &[String], calls: &mut Vec<ToolCall>) -> Result<Plan, String> {
+pub async fn plan(tools: &Tools, ask: &SimAsk, focus: &[String], forced: &std::collections::HashMap<String, String>, calls: &mut Vec<ToolCall>) -> Result<Plan, String> {
     let mut team: Option<String> = None;
     let mut players: Vec<(String, String)> = Vec::new();
     let mut entities = Vec::new();
     for m in &ask.mentions {
         let c = tools.call(Tool::Resolve { q: m.clone(), sport: ask.sport.clone(), kind: None, focus: focus.to_vec() }).await;
-        let v = c.value.clone();
+        let mut v = c.value.clone();
         calls.push(c);
+        // a name picked with @: take that candidate, whatever else shares the name
+        if let Some(id) = forced.get(m) {
+            if let Some(pick) = v["candidates"].as_array().and_then(|cs| cs.iter().find(|x| x["entity_id"] == id.as_str()).cloned()) {
+                v = json!({ "status": "resolved", "entity": pick });
+            }
+        }
         match v["status"].as_str() {
             Some("resolved") => {
                 let id = v["entity"]["entity_id"].as_str().unwrap_or("").to_string();

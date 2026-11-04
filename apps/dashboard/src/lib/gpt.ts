@@ -1,5 +1,5 @@
 // MonsterGPT client: session token (REST through the gateway), WebSocket
-// protocol v1 (Vite proxies /ws/monster-gpt to monster-gpt /ws), and the
+// protocol v1 (+ v2 frames: claims, entities, job) (Vite proxies /ws/monster-gpt to monster-gpt /ws), and the
 // conversation endpoints. See docs/architecture/monster-gpt.md.
 
 export interface GptSource { id: string; tool: string; label: string; url: string; fetched_at: string }
@@ -32,6 +32,16 @@ export interface GptUsage {
   unsupported_numbers?: string[]; judge?: { revised: boolean; repaired?: number; scrubbed?: number; issues: { code: string; detail: string; serious: boolean }[] }; memory?: unknown; context?: { used_est: number; budget: number; dropped_history_turns: number; evidence_truncated: boolean };
 }
 export interface GptModel { id: string; provider: string; num_ctx: number }
+/** v2: verification status of one sentence (monster-gpt verify.rs) */
+export type ClaimStatus = "verified" | "cross_verified" | "partially_verified" | "conflicting" | "unverified" | "stale" | "model_estimated" | "hypothetical";
+export interface GptCitation { source: string; fact?: string; source_id: string; label: string; ref: string; as_of: string | null; retrieved_at: string; kind: string; stale: boolean }
+export interface GptClaim { sentence_ix: number; text: string; status: ClaimStatus; citations: GptCitation[]; issues: string[] }
+/** v2: a player or team a question resolved to */
+export interface GptEntity { entity_id: string; name?: string | null; kind?: string; sport?: string; team_id?: string | null; mention?: string }
+/** v2: a background job (simulation) */
+export interface GptJob { job_id: string; kind: string; state: "queued" | "running" | "done" | "failed" | "cancelled"; detail?: string }
+/** /entities/search result (projection-service) */
+export interface EntityHit { entity_id: string; kind: "player" | "team"; sport: string; name: string; team_id: string | null; active: boolean; score: number }
 
 export type ServerMsg =
   | { type: "ready"; session: string; owner: string; models: GptModel[]; limits: Record<string, number> }
@@ -42,6 +52,9 @@ export type ServerMsg =
   | { type: "delta"; request_id: string; seq: number; text: string }
   | { type: "reset"; request_id: string; reason: string }
   | { type: "done"; request_id: string; message_id: string | null; model: string | null; cancelled: boolean; usage: GptUsage }
+  | { type: "claims"; request_id: string; message_id: string | null; claims: GptClaim[]; summary: Record<string, number> }
+  | { type: "entities"; request_id: string; entities: GptEntity[] }
+  | ({ type: "job"; request_id: string } & GptJob)
   | { type: "error"; request_id: string | null; code: string; message: string }
   | { type: "pong" };
 
@@ -71,7 +84,7 @@ async function authed<T>(path: string, init: RequestInit = {}, retry = true): Pr
 export interface ConversationRow { id: string; title: string; updated_at: string; messages: number }
 export interface StoredMessage {
   id: string; request_id: string | null; role: "user" | "assistant"; content: string; card: GptCard | null; sources: GptSource[] | null;
-  model: string | null; usage: GptUsage | null; cancelled: boolean; created_at: string; feedback?: number | null;
+  model: string | null; usage: GptUsage | null; cancelled: boolean; created_at: string; feedback?: number | null; claims?: GptClaim[] | null;
 }
 export interface MemoryItem { id: number; kind: "preference" | "note"; key: string; value: string; updated_at: string }
 export const gptApi = {
@@ -84,6 +97,13 @@ export const gptApi = {
   feedback: (messageId: string, rating: number) => authed<void>(`/messages/${messageId}/feedback`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rating }) }),
 };
+
+/** Players and teams by name, for the @ picker (canonical ids; no session needed). */
+export async function searchEntities(q: string, signal?: AbortSignal): Promise<EntityHit[]> {
+  const r = await fetch(`/api/projection-service/entities/search?q=${encodeURIComponent(q)}&limit=8`, { signal });
+  if (!r.ok) return [];
+  return ((await r.json()).results ?? []) as EntityHit[];
+}
 
 export type ConnState = "connecting" | "open" | "reconnecting" | "closed";
 

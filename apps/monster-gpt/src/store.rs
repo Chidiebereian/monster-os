@@ -53,12 +53,15 @@ impl Store {
     pub async fn messages(&self, owner: &str, conv: &str) -> Result<Value, String> {
         let ok = self.db.query_opt("SELECT 1 FROM gpt_conversations WHERE id=$1 AND owner=$2", &[&conv, &owner]).await.map_err(e)?;
         if ok.is_none() { return Err("conversation not found".into()); }
-        let rows = self.db.query("SELECT id, request_id, role, content, card, sources, model, usage, cancelled, created_at, feedback FROM gpt_messages \
-            WHERE conversation_id=$1 ORDER BY created_at, role DESC", &[&conv]).await.map_err(e)?;
+        let rows = self.db.query("SELECT m.id, m.request_id, m.role, m.content, m.card, m.sources, m.model, m.usage, m.cancelled, m.created_at, m.feedback, \
+            (SELECT json_agg(json_build_object('sentence_ix', c.sentence_ix, 'text', c.text, 'status', c.status, 'citations', c.facts, 'issues', c.issues) ORDER BY c.sentence_ix) \
+               FROM gpt_claims c WHERE c.message_id = m.id) \
+            FROM gpt_messages m WHERE m.conversation_id=$1 ORDER BY m.created_at, m.role DESC", &[&conv]).await.map_err(e)?;
         Ok(json!(rows.iter().map(|r| json!({ "id": r.get::<_, String>(0), "request_id": r.get::<_, Option<String>>(1), "role": r.get::<_, String>(2),
             "content": r.get::<_, String>(3), "card": r.get::<_, Option<Json<Value>>>(4).map(|j| j.0), "sources": r.get::<_, Option<Json<Value>>>(5).map(|j| j.0),
             "model": r.get::<_, Option<String>>(6), "usage": r.get::<_, Option<Json<Value>>>(7).map(|j| j.0), "cancelled": r.get::<_, bool>(8),
-            "created_at": r.get::<_, chrono::DateTime<chrono::Utc>>(9), "feedback": r.get::<_, Option<i16>>(10) })).collect::<Vec<_>>()))
+            "created_at": r.get::<_, chrono::DateTime<chrono::Utc>>(9), "feedback": r.get::<_, Option<i16>>(10),
+            "claims": r.get::<_, Option<Json<Value>>>(11).map(|j| j.0) })).collect::<Vec<_>>()))
     }
 
     /// Rate one of the owner's assistant messages: 1, -1, or 0 to clear (migration 0032).

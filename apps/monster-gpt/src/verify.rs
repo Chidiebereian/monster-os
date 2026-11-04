@@ -205,12 +205,17 @@ pub fn check(answer: &str, facts: &[Fact]) -> Vec<Claim> {
         let (mut supported, mut unsupported) = (0, 0);
         let mut kinds_per_claim: Vec<BTreeSet<FactKind>> = Vec::new();
         let mut sources_per_claim: Vec<BTreeSet<String>> = Vec::new();
+        // records about the subjects this sentence names: a number shared with another
+        // player's record ("last 20 games") is cited from the named player's record only
+        let about: BTreeSet<usize> = names.iter().flat_map(|nm| { let nl = nm.to_lowercase(); facts.iter().enumerate().filter(move |(_, f)| f.text.contains(&nl)).map(|(i, _)| i) }).collect();
         for n in &nums {
             let Some(c) = crate::validate::canon_value(n) else { continue };
             let pct_as_prob = n.ends_with('%').then(|| c.parse::<f64>().ok().map(|p| norm_num(p / 100.0))).flatten();
             let hits: Vec<usize> = facts.iter().enumerate().filter(|(_, f)| f.values.contains(&c) || pct_as_prob.as_ref().map(|p| f.values.contains(p)).unwrap_or(false))
                 .map(|(i, _)| i).collect();
             if hits.is_empty() { unsupported += 1; issues.push(format!("{n} is not in the records this answer used")); continue; }
+            let own: Vec<usize> = hits.iter().copied().filter(|i| about.contains(i)).collect();
+            let hits = if own.is_empty() { hits } else { own };
             supported += 1;
             kinds_per_claim.push(hits.iter().map(|i| facts[*i].kind).collect());
             sources_per_claim.push(hits.iter().filter(|i| matches!(facts[**i].kind, FactKind::Observed | FactKind::Computed)).map(|i| facts[*i].source_id.clone()).collect());
@@ -323,6 +328,17 @@ mod tests {
         let facts = facts_from("kb.player_stats", &json!({ "name": "LeBron James" }), &src("S1", "logs"), 0, today());
         assert!(check("Which James do you mean: LeBron James (PHI) or Jalen James?", &facts).is_empty());
         assert!(check("I looked for \"Madison Square Garden\" and found no match.", &facts).is_empty());
+    }
+
+    #[test]
+    fn a_shared_number_is_cited_from_the_named_players_record() {
+        let a = json!({ "name": "Nikola Jokic", "window": "last 20 games", "summary": { "pts": { "mean": 23.4 } }, "source": { "source_id": "espn_site" } });
+        let b = json!({ "name": "Luka Doncic", "window": "last 20 games", "summary": { "pts": { "mean": 37.7 } }, "source": { "source_id": "espn_site" } });
+        let mut f = facts_from("kb.player_stats", &a, &src("S1", "Jokic logs"), 0, today());
+        f.extend(facts_from("kb.player_stats", &b, &src("S2", "Doncic logs"), f.len(), today()));
+        let c = check("Nikola Jokic, last 20 games: 23.4 points per game.", &f);
+        assert_eq!(c[0].citations.len(), 1, "{:?}", c[0].citations);
+        assert_eq!(c[0].citations[0]["source"], "S1");
     }
 
     #[test]

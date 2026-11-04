@@ -66,6 +66,7 @@ mod nhl_sim;
 mod nhl_teams;
 mod entities;
 mod knowledge;
+mod mc;
 mod injury_snap;
 mod ops_status;
 mod proj_sync;

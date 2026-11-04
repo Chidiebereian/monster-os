@@ -549,6 +549,11 @@ impl Ensemble {
             }
         }
     }
+    fn end_batch(&mut self) {
+        for t in 0..2 { self.score[t].end_batch(); self.shots[t].end_batch(); self.saves[t].end_batch(); }
+        self.total.end_batch();
+        for t in 0..2 { for p in self.player[t].iter_mut() { for h in p.iter_mut() { h.end_batch(); } } }
+    }
     fn merge(&mut self, o: &Ensemble) {
         self.n += o.n;
         for t in 0..2 {
@@ -609,6 +614,7 @@ pub fn simulate(g: &GameInput, n: usize, draws: usize, seed: u64) -> Ensemble {
                     let gi = perturb(g, &mut prng);
                     let mut rng = Rng::new(derive_seed(seed, &["games", &b.to_string()]));
                     for _ in 0..m { let r = play_game(&gi, &mut rng, None); e.add(&r); }
+                    e.end_batch();
                 }
                 e
             })

@@ -393,6 +393,36 @@ Model diagnostics now end with definitions of the measures they use (Brier score
 loss, CLV, ROI, calibration, MAE, RMSE, drawdown, 95% interval, walk-forward), cited as
 a reference source. Golden: 19/19 (E1-E3 run real simulations).
 
+Engine Monte Carlo error (2026-11-03, projection-service `mc.rs`): every simulator
+histogram now records each parameter-draw batch's count and sum, and a line's `mcse` is
+the binomial error times the square root of the design effect estimated from the batch
+means (NBA/NHL `nba_sim::Hist`, NFL `nfl_sim::Hist`, MLB `mlb_sim::Hist`). It is display
+only (no pick or blend reads it). Measured against reruns: NBA total line 0.0044 vs a
+6-seed sd of 0.0047; NHL 0.0046 vs a 16-seed sd of 0.0037; NFL 0.0035 vs 0.0026; the old
+binomial figure was 0.0016. Using the mean's design effect for a line probability is an
+approximation that runs up to about 35% high, the safe side.
+
+P7 (frontend, `apps/dashboard/src/components/GptEvidence.tsx`, `pages/MonsterGpt.tsx`):
+- every sentence of an answer is matched to its claim: verified sentences read as plain
+  text with footnote numbers; model estimates (dashed violet), hypotheticals (dashed
+  sky), stale (dotted amber), partly verified (wavy amber), conflicting or unverified
+  (wavy red) are marked, with the status and issues as a tooltip and in screen-reader
+  text; under the answer a status count, the issues, and numbered sources (source,
+  as-of date, retrieval time); saved conversations reload their claims;
+- the players and teams an answer resolved to are chips above it; a simulation shows
+  "Simulation queued / running / done · 11.6 s";
+- the composer is a combobox: "@" plus two letters suggests players and teams from
+  `/entities/search` (arrow keys, Enter or Tab, Escape); picked names travel as
+  canonical ids (`context.entities`) and MonsterGPT uses them instead of resolving
+  the name again (research and simulations);
+- checked on a scratch stack (`apps/monster-gpt/tests/scratch_stack.py`: scratch
+  database, monster-gpt :8185, gateway :8191, dashboard :5191) so no test conversation
+  reaches production; at 390 px there is no horizontal page scroll and no chat element
+  wider than the viewport.
+
+Citations are scoped to the sentence's subject: when a sentence names a player or team,
+a number held by several records ("last 20 games") is cited from the named one's record.
+
 Not yet: news; tactical analysis,
 parlay research, odds comparison beyond the existing bet card; injuries as a research
 answer; the model-based intent fallback (not needed by the golden set so far).
