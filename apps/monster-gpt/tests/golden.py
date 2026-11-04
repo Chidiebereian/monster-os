@@ -117,8 +117,11 @@ def grade(q, answer, events, row, aliases):
                 fails.append(f"fact {alts[0]} is in the answer but not in a verified sentence")
     # only when the language model wrote the answer (with no open picks the reply is built in code)
     modeled = any(e.get("type") == "done" and e.get("model") for e in events)
-    if q.get("statuses") and modeled and not any(c["status"] in q["statuses"] for c in last_claims):
+    if q.get("statuses") and (modeled or not q.get("statuses_model_only")) and not any(c["status"] in q["statuses"] for c in last_claims):
         fails.append(f"no sentence marked {' or '.join(q['statuses'])} (got {sorted({c['status'] for c in last_claims})})")
+    for bad in q.get("no_statuses", []):
+        if any(c["status"] == bad for c in last_claims):
+            fails.append(f"a sentence is {bad}")
     if q.get("abstain") and any(c["status"] in ("verified", "cross_verified") for c in last_claims):
         fails.append("an unverifiable answer has a verified sentence")
     if q.get("abstain"):
@@ -207,6 +210,7 @@ def run(g, rows):
         import psycopg
         with psycopg.connect(dbenv.url("OPS_DATABASE_URL").rsplit("/", 1)[0] + "/" + DB) as cx:
             stored = dict(cx.execute("SELECT status, count(*) FROM gpt_claims GROUP BY 1").fetchall())
+            stored["sim_runs"] = dict(cx.execute("SELECT status, count(*) FROM gpt_sim_runs GROUP BY 1").fetchall())
     finally:
         proc.kill()
         subprocess.run(ADMIN + [f"DROP DATABASE IF EXISTS {DB} WITH (FORCE)"], capture_output=True)

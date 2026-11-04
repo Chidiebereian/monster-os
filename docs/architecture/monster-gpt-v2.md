@@ -364,6 +364,35 @@ expected facts outside a verified sentence. Not shown in the dashboard yet (P7).
 Cross-verified and conflicting need a second source for the same value; none is
 wired yet, so in practice answers are verified or model_estimated.
 
+P6 (done, `monster-gpt/src/sim.rs`, orchestrator `sim_turn`): "run 100,000 simulations
+of the next Lakers game", "simulate Edmonton's next game 200,000 times", "simulate the
+Nuggets without Jokic". The team's next game comes from `kb.schedule`; named players
+are ruled out. Each run is a `gpt_sim_runs` row (seed, n, overrides, model version,
+inputs fingerprint `fnv64:...` in `inputs_sha256`, compact result), run as a background
+task holding the one simulator slot, with `job` frames (queued, running, done, failed,
+cancelled); a dropped connection does not lose the run, cancel marks it cancelled. A
+scenario also runs the baseline with the same seed; its numbers are hypothetical and a
+change within twice the run-to-run error is called "no measurable effect". Counts are
+held to the engines' 100,000-1,000,000.
+
+Monte Carlo error: the engines sample 200 parameter draws per run, so the binomial
+error sqrt(p(1-p)/n) (also what the engines' `mcse` fields report) understates the
+seed-to-seed spread. Measured 2026-11-03 over six seeds x 100,000 games: sd of the home
+win share 0.33 (NBA), 0.37 (NHL), 0.33 (NFL) points, 2.1-2.4x binomial. MonsterGPT
+states `sqrt(p(1-p)/n + 1.0e-5)` (`sim::mc_error_pts`), which barely shrinks with more
+games; `tests/test_sim_repro.py` (CI step sim-repro) checks same-seed reproduction and
+that two seeds agree within it.
+
+Model finding (not changed here): ruling Nikola Jokic out of DEN v TOR (2026-11-04)
+moved Denver's simulated win share from 46.3% to 46.0% (seed 5), within noise. The
+`out` override reaches the engine (he leaves the player list), so the NBA possession
+simulator barely responds to losing a star, presumably because the team ratings carry
+his production. Worth a research item before scenario answers are trusted for the NBA.
+
+Model diagnostics now end with definitions of the measures they use (Brier score, log
+loss, CLV, ROI, calibration, MAE, RMSE, drawdown, 95% interval, walk-forward), cited as
+a reference source. Golden: 19/19 (E1-E3 run real simulations).
+
 Not yet: news; tactical analysis,
 parlay research, odds comparison beyond the existing bet card; injuries as a research
 answer; the model-based intent fallback (not needed by the golden set so far).

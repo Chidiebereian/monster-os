@@ -260,9 +260,9 @@ pub async fn results_http(state: web::Data<State>, q: web::Query<ResultsQ>) -> i
     if q.upcoming {
         let names = team_names(db, &sport).await;
         let rows = if sport == "nhl" {
-            db.query("SELECT game_date, home, away, start_time FROM nhl_games_api WHERE game_type IN (2, 3) AND NOT completed                       AND start_time > now() - interval '4 hours' AND (home = ANY($1) OR away = ANY($1)) ORDER BY start_time LIMIT $2", &[&codes, &last]).await
+            db.query("SELECT game_date, home, away, start_time, game_id::text FROM nhl_games_api WHERE game_type IN (2, 3) AND NOT completed                       AND start_time > now() - interval '4 hours' AND (home = ANY($1) OR away = ANY($1)) ORDER BY start_time LIMIT $2", &[&codes, &last]).await
         } else {
-            db.query("SELECT g.game_date, g.home_team, g.away_team, k.starts_at FROM sports_games g LEFT JOIN game_kickoffs k ON k.sport = g.sport AND k.game_id = g.game_id                       WHERE g.sport = $3 AND g.home_score IS NULL AND g.game_date >= (now() AT TIME ZONE 'America/New_York')::date                         AND (g.home_team = ANY($1) OR g.away_team = ANY($1)) ORDER BY g.game_date LIMIT $2", &[&codes, &last, &sport]).await
+            db.query("SELECT g.game_date, g.home_team, g.away_team, k.starts_at, g.game_id FROM sports_games g LEFT JOIN game_kickoffs k ON k.sport = g.sport AND k.game_id = g.game_id                       WHERE g.sport = $3 AND g.home_score IS NULL AND g.game_date >= (now() AT TIME ZONE 'America/New_York')::date                         AND (g.home_team = ANY($1) OR g.away_team = ANY($1)) ORDER BY g.game_date LIMIT $2", &[&codes, &last, &sport]).await
         };
         let rows = match rows { Ok(r) => r, Err(e) => return crate::internal(dberr(&e)) };
         let team_name = db.query_opt("SELECT name FROM entities WHERE entity_id = $1", &[&q.entity]).await.ok().flatten().map(|r| r.get::<_, String>(0));
@@ -270,7 +270,9 @@ pub async fn results_http(state: web::Data<State>, q: web::Query<ResultsQ>) -> i
             let (h, a): (String, String) = (r.get(1), r.get(2));
             let home = codes.contains(&h);
             let opp = crate::hitrates::canon(&sport, if home { &a } else { &h });
-            json!({ "date": r.get::<_, NaiveDate>(0), "start": r.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3), "home": home,
+            let (hc, ac) = (crate::hitrates::canon(&sport, &h), crate::hitrates::canon(&sport, &a));
+            json!({ "game_id": r.get::<_, String>(4), "date": r.get::<_, NaiveDate>(0), "start": r.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3), "home": home,
+                    "home_team": hc, "away_team": ac, "home_name": names.get(&hc), "away_name": names.get(&ac),
                     "opponent": opp, "opponent_name": names.get(&opp) })
         }).collect();
         return HttpResponse::Ok().json(json!({ "entity": q.entity, "name": team_name, "sport": sport, "upcoming": games,

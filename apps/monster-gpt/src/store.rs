@@ -8,7 +8,8 @@ use tokio_postgres::{Client, NoTls};
 use crate::llm::ChatMsg;
 use crate::router::Filters;
 
-pub struct Store { db: Client }
+#[derive(Clone)]
+pub struct Store { db: std::sync::Arc<Client> }
 
 pub fn new_id(prefix: &str) -> String {
     use rand::Rng;
@@ -27,7 +28,7 @@ impl Store {
         actix_web::rt::spawn(async move { if let Err(err) = conn.await { eprintln!("monster-gpt: postgres connection ended: {err}"); } });
         db.query("SELECT 1 FROM gpt_conversations LIMIT 1", &[]).await
             .map_err(|x| format!("{} (apply migration 0030_monster_gpt.sql)", e(x)))?;
-        Ok(Self { db })
+        Ok(Self { db: std::sync::Arc::new(db) })
     }
 
     /// Existing conversation (owner-checked) or a new one titled from the first message.
@@ -84,6 +85,21 @@ impl Store {
             msgs.push(ChatMsg::new(&role, r.get::<_, String>(1)));
         }
         Ok((msgs, prev))
+    }
+
+    /// A simulation run requested from chat (gpt_sim_runs; its inputs never change once written).
+    pub async fn sim_create(&self, run_id: &str, sport: &str, game_id: &str, engine: &str, seed: u64, n: u32, overrides: &Value, owner: &str) -> Result<(), String> {
+        self.db.execute("INSERT INTO gpt_sim_runs (run_id, sport, game_id, engine, seed, n, overrides, requested_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[&run_id, &sport, &game_id, &engine, &(seed as i64), &(n as i32), &Json(overrides), &owner]).await.map(|_| ()).map_err(e)
+    }
+    pub async fn sim_running(&self, run_id: &str) {
+        let _ = self.db.execute("UPDATE gpt_sim_runs SET status='running' WHERE run_id=$1 AND status='queued'", &[&run_id]).await;
+    }
+    /// done | failed | cancelled. A finished run refuses further changes (migration 0043).
+    pub async fn sim_finish(&self, run_id: &str, status: &str, model_version: Option<&str>, inputs: Option<&str>, result: Option<&Value>, error: Option<&str>) {
+        let _ = self.db.execute("UPDATE gpt_sim_runs SET status=$2, model_version=COALESCE($3, model_version), inputs_sha256=COALESCE($4, inputs_sha256), \
+            result=$5, error=$6, finished_at=now() WHERE run_id=$1",
+            &[&run_id, &status, &model_version, &inputs, &result.map(Json), &error]).await;
     }
 
     /// Per-sentence evidence for an answer (gpt_claims, write-once).

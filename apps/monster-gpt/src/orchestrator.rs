@@ -63,6 +63,8 @@ pub struct Gpt {
     pub models: Vec<ModelCfg>,
     /// generations allowed at once (the model is CPU-bound)
     pub slots: Arc<Semaphore>,
+    /// simulation jobs allowed at once (the engines are CPU-bound)
+    pub sim_slot: Arc<Semaphore>,
     pub max_slots: usize,
     pub sessions: Mutex<HashMap<String, Session>>,
     pub origins: Vec<String>,
@@ -198,6 +200,149 @@ pub async fn refresh_summary(g: &Gpt, m: &ModelCfg, conv: &str) {
     }
 }
 
+/// A simulation request (sim.rs): find the game, record the run, run it as a background
+/// job (one at a time), answer from the result with its seed and model version.
+#[allow(clippy::too_many_arguments)]
+async fn sim_turn(g: &Gpt, owner: &str, conv: &Option<String>, rid: &str, text: &str, sa: crate::sim::SimAsk, focus: &[String], filters: &router::Filters,
+                  tx: &mpsc::Sender<ServerMsg>, cancel: &Arc<AtomicBool>, today: chrono::NaiveDate) {
+    let send = |m: ServerMsg| { let tx = tx.clone(); async move { tx.send(m).await.is_ok() } };
+    send(ServerMsg::Status { request_id: rid.into(), stage: "route".into(), name: "simulation".into(), state: "completed".into(),
+        detail: Some(format!("{} simulations", crate::sim::fmt_count(sa.n as u64))), ms: Some(0) }).await;
+    let mut calls: Vec<tools::ToolCall> = Vec::new();
+    let plan = crate::sim::plan(&g.tools, &sa, focus, &mut calls).await;
+    let mut sources: Vec<Source> = Vec::new();
+    let mut facts: Vec<crate::verify::Fact> = Vec::new();
+    let mut entities: Vec<Value> = Vec::new();
+    let mut run_state = json!(null);
+    let (reply, usage) = match plan {
+        Err(msg) => (msg, json!({ "simulation": "not_run" })),
+        Ok(p) => {
+            entities = p.entities.clone();
+            let run_id = crate::store::new_id("sim");
+            let seed = sa.seed.unwrap_or_else(|| crate::sim::derive_seed(&run_id));
+            let note = match sa.asked_n { Some(a) if a < crate::sim::MIN_N as u64 => format!("The simulators run at least 100,000 games, so I ran {} instead of {}.\n\n", crate::sim::fmt_count(sa.n as u64), crate::sim::fmt_count(a)),
+                Some(a) if a > crate::sim::MAX_N as u64 => format!("The simulators run at most 1,000,000 games, so I ran {} instead of {}.\n\n", crate::sim::fmt_count(sa.n as u64), crate::sim::fmt_count(a)),
+                _ => String::new() };
+            let engine = format!("{}-sim", p.sport);
+            let overrides = json!({ "out": p.out_ids, "out_names": p.out_names });
+            if let Some(s) = &g.store { if let Err(e) = s.sim_create(&run_id, &p.sport, &p.game_id, &engine, seed, sa.n, &overrides, owner).await { eprintln!("monster-gpt: sim run not recorded: {e}"); } }
+            run_state = json!({ "run_id": run_id, "sport": p.sport, "game_id": p.game_id, "seed": seed, "n": sa.n, "overrides": overrides });
+            let job = |state: &str, detail: Option<String>| ServerMsg::Job { request_id: rid.into(), job_id: run_id.clone(), kind: "simulation".into(), state: state.into(), detail };
+            send(job("queued", Some(format!("{} at {}", p.names.away, p.names.home)))).await;
+            // one simulation at a time; wait up to 90 s for the simulator
+            let permit = match g.sim_slot.clone().try_acquire_owned() {
+                Ok(x) => Some(x),
+                Err(_) => {
+                    send(job("queued", Some("waiting for the simulator (another run is in progress)".into()))).await;
+                    tokio::time::timeout(Duration::from_secs(90), g.sim_slot.clone().acquire_owned()).await.ok().and_then(|r| r.ok())
+                }
+            };
+            match permit {
+                None => {
+                    if let Some(s) = &g.store { s.sim_finish(&run_id, "failed", None, None, None, Some("simulator busy")).await; }
+                    send(job("failed", Some("simulator busy".into()))).await;
+                    ("The simulator is busy with another run; try again in a minute.".to_string(), json!({ "simulation": "busy", "run_id": run_id }))
+                }
+                Some(permit) => {
+                    if let Some(s) = &g.store { s.sim_running(&run_id).await; }
+                    send(job("running", None)).await;
+                    let scenario = crate::tools::Tool::SimRun { sport: p.sport.clone(), game_id: p.game_id.clone(), n: sa.n, seed, out: p.out_ids.clone() };
+                    let baseline = (!p.out_ids.is_empty()).then(|| crate::tools::Tool::SimRun { sport: p.sport.clone(), game_id: p.game_id.clone(), n: sa.n, seed, out: vec![] });
+                    let ok = scenario.validate().and(baseline.as_ref().map(|b| b.validate()).unwrap_or(Ok(())));
+                    // the run is a background task: it records its own result even if this connection drops
+                    let (otx, mut orx) = tokio::sync::oneshot::channel::<Result<(Value, Option<Value>, u64), String>>();
+                    let (http, base, store, rid2) = (g.tools.http.clone(), g.tools.projection_url.clone(), g.store.clone(), run_id.clone());
+                    let (surl, burl, tmo) = (scenario.url(&base), baseline.as_ref().map(|b| b.url(&base)), scenario.timeout());
+                    actix_web::rt::spawn(async move {
+                        let _permit = permit;
+                        let t0 = Instant::now();
+                        let get = |url: String| { let http = http.clone(); async move {
+                            let r = http.get(&url).timeout(tmo).send().await.map_err(|e| if e.is_timeout() { "timed out".to_string() } else { format!("unreachable: {e}") })?;
+                            let st = r.status();
+                            let body: Value = r.json().await.map_err(|e| format!("bad JSON: {e}"))?;
+                            if !st.is_success() { return Err(format!("HTTP {st}: {}", body["error"].as_str().unwrap_or(""))); }
+                            Ok(body)
+                        } };
+                        let res = match ok {
+                            Err(e) => Err(e),
+                            Ok(()) => match get(surl).await {
+                                Err(e) => Err(e),
+                                Ok(v) => match burl { Some(u) => get(u).await.map(|b| (v, Some(b))), None => Ok((v, None)) },
+                            },
+                        }.map(|(v, b)| (v, b, t0.elapsed().as_millis() as u64));
+                        if let Some(s) = &store {
+                            match &res {
+                                Ok((v, b, _)) => s.sim_finish(&rid2, "done", v["model_version"].as_str(), Some(&crate::sim::inputs_fingerprint(v)),
+                                    Some(&json!({ "run": crate::sim::compact(v), "baseline": b.as_ref().map(crate::sim::compact) })), None).await,
+                                Err(e) => s.sim_finish(&rid2, "failed", None, None, None, Some(e)).await,
+                            }
+                        }
+                        let _ = otx.send(res);
+                    });
+                    let outcome = loop {
+                        if cancel.load(Ordering::Relaxed) { break None; }
+                        match tokio::time::timeout(Duration::from_millis(250), &mut orx).await {
+                            Ok(r) => break Some(r.unwrap_or_else(|_| Err("the run ended without a result".into()))),
+                            Err(_) => continue,
+                        }
+                    };
+                    match outcome {
+                        None => {
+                            if let Some(s) = &g.store { s.sim_finish(&run_id, "cancelled", None, None, None, None).await; }
+                            send(job("cancelled", None)).await;
+                            ("Cancelled: I stopped waiting for the simulation and its result won't be kept.".to_string(), json!({ "simulation": "cancelled", "run_id": run_id }))
+                        }
+                        Some(Err(e)) => {
+                            send(job("failed", Some(e.clone()))).await;
+                            (format!("The simulation failed ({e}), so I have no numbers for this game."), json!({ "simulation": "failed", "run_id": run_id }))
+                        }
+                        Some(Ok((v, b, ms))) => {
+                            send(job("done", Some(format!("{:.1} s", ms as f64 / 1000.0)))).await;
+                            let mut done_calls = vec![(scenario.clone(), v.clone(), !p.out_ids.is_empty())];
+                            if let (Some(bt), Some(bv)) = (&baseline, &b) { done_calls.push((bt.clone(), bv.clone(), false)); }
+                            for (t, val, hypothetical) in done_calls {
+                                let src = Source { id: format!("S{}", sources.len() + 1), tool: "sim.run".into(), label: t.label(), url: t.url(&g.tools.projection_url), fetched_at: chrono::Utc::now() };
+                                let c = crate::sim::compact(&val);
+                                let wrapped = if hypothetical { json!({ "hypothetical": c }) } else { c };
+                                facts.extend(crate::verify::facts_from("sim.run", &wrapped, &src, facts.len(), today));
+                                sources.push(src);
+                                g.record_tool("sim.run", true, ms);
+                                if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), rid, "sim.run", &json!({ "game_id": p.game_id, "n": sa.n, "seed": seed, "out": if hypothetical { json!(p.out_ids) } else { json!([]) } }), true, ms, None).await; }
+                            }
+                            let (body, derived, meta) = crate::sim::reply(&run_id, &v, b.as_ref(), &p.out_names, &p.names, &p.sport);
+                            if let Some(src) = sources.first().cloned() {
+                                let kind = if p.out_ids.is_empty() { crate::verify::FactKind::ModelEstimate } else { crate::verify::FactKind::Hypothetical };
+                                facts.push(crate::verify::fact_from_text(kind, &derived.join("\n"), &src, facts.len() + 1));
+                                // what the run was (count, time, draws, interval) is a record of the run, not a model output
+                                facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Computed, &meta.join("\n"), &src, facts.len() + 1));
+                            }
+                            (format!("{note}{body}"), json!({ "simulation": "done", "run_id": run_id, "ms": ms }))
+                        }
+                    }
+                }
+            }
+        }
+    };
+    for c in &calls {
+        g.record_tool(c.tool, c.ok, c.ms);
+        if let Some(s) = &g.store { s.audit(owner, conv.as_deref(), rid, c.tool, &c.args, c.ok, c.ms, c.error.as_deref()).await; }
+        send(ServerMsg::Status { request_id: rid.into(), stage: "tool".into(), name: c.tool.into(), state: if c.ok { "completed" } else { "failed" }.into(), detail: c.error.clone(), ms: Some(c.ms) }).await;
+        if let Some(mut src) = c.source.clone() { src.id = format!("S{}", sources.len() + 1); facts.extend(crate::verify::facts_from(c.tool, &c.value, &src, facts.len(), today)); sources.push(src); }
+    }
+    if usage["simulation"] == "done" { send(ServerMsg::Status { request_id: rid.into(), stage: "tool".into(), name: "sim.run".into(), state: "completed".into(), detail: None, ms: usage["ms"].as_u64() }).await; }
+    if !entities.is_empty() { send(ServerMsg::Entities { request_id: rid.into(), entities: json!(entities) }).await; }
+    send(ServerMsg::Sources { request_id: rid.into(), sources: json!(sources) }).await;
+    send(ServerMsg::Delta { request_id: rid.into(), seq: 0, text: reply.clone() }).await;
+    let state = json!({ "intent": "simulation", "filters": filters, "simulation": run_state,
+        "entities": entities.iter().filter_map(|e| e["entity_id"].as_str()).collect::<Vec<_>>() });
+    let message_id = match (&g.store, conv) {
+        (Some(s), Some(cv)) => s.save_turn(cv, rid, text, &reply, &Value::Null, &json!(sources), &state, None, &usage, false).await.ok(),
+        _ => None,
+    };
+    g.claims(tx, rid, &message_id, &reply, &facts).await;
+    send(ServerMsg::Done { request_id: rid.into(), message_id, model: None, cancelled: usage["simulation"] == "cancelled", usage }).await;
+}
+
 /// Background follow-up for a finished turn: refresh the conversation summary.
 pub struct FollowUp { pub conversation: String, pub model: ModelCfg }
 
@@ -289,19 +434,11 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
         if ask.is_none() {
             if let Ok(p) = serde_json::from_value::<crate::research::Ask>(prev_state["research"].clone()) { ask = crate::research::follow_up(&req.text, &p); }
         }
-        if ask.is_none() && crate::research::is_sim_request(&req.text) {
-            let reply = crate::research::SIM_REPLY.to_string();
-            send(ServerMsg::Status { request_id: rid.clone(), stage: "route".into(), name: "simulation".into(), state: "completed".into(),
-                detail: Some("simulation from chat is not available yet".into()), ms: Some(0) }).await;
-            send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
-            let usage = json!({ "simulation": "unavailable" });
-            let state = json!({ "intent": "simulation", "filters": route.filters });
-            let message_id = match (&g.store, &conv) {
-                (Some(s), Some(cv)) => s.save_turn(cv, &rid, &req.text, &reply, &Value::Null, &json!([]), &state, None, &usage, false).await.ok(),
-                _ => None,
-            };
-            send(ServerMsg::Done { request_id: rid, message_id, model: None, cancelled: false, usage }).await;
-            return None;
+        if ask.is_none() {
+            if let Some(sa) = crate::sim::parse(&req.text) {
+                sim_turn(g, owner, &conv, &rid, &req.text, sa, &focus, &route.filters, &tx, &cancel, today).await;
+                return None;
+            }
         }
         if let Some(ask) = ask {
             send(ServerMsg::Status { request_id: rid.clone(), stage: "route".into(), name: "research".into(), state: "completed".into(),
@@ -406,9 +543,16 @@ pub async fn run(g: &Gpt, owner: &str, req: Request, tx: mpsc::Sender<ServerMsg>
     // is the engine's, so no language model writes them
     if route.intent == Intent::Model {
         let reply = match results.get("model.validation") {
-            Some(v) => crate::diag::reply(v, sport.as_deref(), &req.text),
+            Some(v) => { let r = crate::diag::reply(v, sport.as_deref(), &req.text); format!("{r}{}", crate::diag::definitions(&r)) }
             None => "I couldn't load the validation scorecard from projection-service, so I can't report on the models right now.".to_string(),
         };
+        if reply.contains("What the measures mean:") {
+            let src = Source { id: format!("S{}", sources.len() + 1), tool: "docs.definitions".into(), label: "Metric definitions (monster-gpt diag.rs)".into(),
+                url: "apps/monster-gpt/src/diag.rs".into(), fetched_at: chrono::Utc::now() };
+            let defs: String = crate::diag::DEFINITIONS.iter().map(|(_, d)| *d).collect::<Vec<_>>().join("\n");
+            facts.push(crate::verify::fact_from_text(crate::verify::FactKind::Reference, &defs, &src, facts.len() + 1));
+            sources.push(src);
+        }
         send(ServerMsg::Sources { request_id: rid.clone(), sources: json!(sources) }).await;
         send(ServerMsg::Delta { request_id: rid.clone(), seq: 0, text: reply.clone() }).await;
         let usage = json!({ "diagnostics": true });

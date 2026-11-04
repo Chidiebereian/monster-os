@@ -90,6 +90,27 @@ pub fn experiments_text(sc: &Value, sport: Option<&str>, named: &[&str], limit: 
     s
 }
 
+/// One-line definitions of the metrics an answer uses (master plan 15.E: no accuracy
+/// figure without its metric). Only the metrics named in `answer` are listed.
+pub const DEFINITIONS: &[(&str, &str)] = &[
+    ("brier", "Brier score: the average squared gap between the forecast probability and what happened (1 or 0). Lower is better; always saying 50% scores 0.25."),
+    ("log loss", "Log loss: the average negative log of the probability given to what happened. Lower is better; it punishes confident misses hardest."),
+    ("clv", "Closing-line value (CLV): how much better the price taken was than the price at kick-off. Beating the close on average is the clearest sign of an edge."),
+    ("roi", "ROI: profit divided by the amount staked, over settled picks."),
+    ("calibrat", "Calibration: whether outcomes given a probability happen that often (picks rated 60% should win about 60% of the time)."),
+    ("mae", "MAE: the average absolute gap between a projection and the actual result."),
+    ("rmse", "RMSE: the square root of the average squared gap; it weighs big misses more than MAE."),
+    ("drawdown", "Drawdown: the largest fall in cumulative profit from a previous high."),
+    ("interval", "95% interval: a bootstrap range for the difference; if it excludes 0 the difference is unlikely to be noise."),
+    ("walk-forward", "Walk-forward backtest: each game is forecast using only data from before it, the way the model would have run at the time."),
+];
+
+pub fn definitions(answer: &str) -> String {
+    let l = answer.to_lowercase();
+    let lines: Vec<&str> = DEFINITIONS.iter().filter(|(k, _)| l.contains(k)).map(|(_, d)| *d).collect();
+    if lines.is_empty() { String::new() } else { format!("\n\nWhat the measures mean:\n- {}", lines.join("\n- ")) }
+}
+
 pub fn reply(sc: &Value, sport: Option<&str>, text: &str) -> String {
     if asks_ml(text) {
         let named = markets_named(text);
@@ -181,6 +202,14 @@ fn quarantine_note(sc: &Value, sport: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definitions_cover_only_the_metrics_used() {
+        let d = definitions("Brier 0.2813 vs market 0.249 (difference 0.0324, 95% interval 0.0218 to 0.0423)");
+        assert!(d.contains("Brier score:") && d.contains("95% interval:"));
+        assert!(!d.contains("Log loss") && !d.contains("ROI"));
+        assert_eq!(definitions("no metrics here"), "");
+    }
     use serde_json::json;
 
     fn sc() -> Value {

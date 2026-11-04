@@ -323,12 +323,37 @@
       "truth": null,
       "facts": [],
       "statuses": [
-        "model_estimated"
+        "model_estimated",
+        "verified"
       ],
       "forbid": [
         "(?i)guarantee",
         "(?i)can't lose",
         "(?i)sure thing"
+      ],
+      "statuses_model_only": true,
+      "no_statuses": [
+        "unverified",
+        "partially_verified"
+      ]
+    },
+    {
+      "id": "E3",
+      "workflow": "E",
+      "text": "Simulate the next Nuggets game without Nikola Jokic.",
+      "tools": [
+        "sim.run"
+      ],
+      "truth": null,
+      "facts": [
+        "ruled out (hypothetical)",
+        "With everyone available (same seed)"
+      ],
+      "statuses": [
+        "hypothetical"
+      ],
+      "forbid": [
+        "(?i)guarantee"
       ]
     }
   ]

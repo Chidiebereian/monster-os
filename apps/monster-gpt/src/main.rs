@@ -29,6 +29,7 @@ mod orchestrator;
 mod protocol;
 mod research;
 mod rag;
+mod sim;
 mod router;
 mod store;
 mod tools;
@@ -703,6 +704,7 @@ async fn main() -> std::io::Result<()> {
         store,
         models,
         slots: std::sync::Arc::new(tokio::sync::Semaphore::new(max_slots)),
+        sim_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         max_slots,
         sessions: Default::default(),
         origins: env_opt("MONSTER_GPT_ORIGINS").unwrap_or_else(|| "http://localhost:5190,http://127.0.0.1:5190".into())

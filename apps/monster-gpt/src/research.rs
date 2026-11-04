@@ -280,8 +280,6 @@ pub fn is_sim_request(text: &str) -> bool {
     (l.contains("simulat") || l.contains("monte carlo")) && !l.contains("how does") && !l.contains("what is") && !l.contains("explain")
 }
 
-pub const SIM_REPLY: &str = "I can't run simulations from chat yet, so I haven't simulated anything here. The game simulators exist (NBA possession, NFL play-by-play, NHL event and MLB plate-appearance engines) and you can run a game on the Broadcast Sim page; running one from chat, with the seed, model version and inputs recorded, is the next MonsterGPT step. I can give you the model's current numbers for a game instead: ask me to break down that game.";
-
 fn fmt_num(x: f64) -> String { if (x - x.round()).abs() < 1e-9 { format!("{x:.0}") } else if (x * 10.0 - (x * 10.0).round()).abs() < 1e-9 { format!("{x:.1}") } else { format!("{x:.2}") } }
 
 /// What a research turn produced.

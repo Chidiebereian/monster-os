@@ -55,6 +55,8 @@ pub enum Tool {
     TeamResults { entity: String, opponent: Option<String>, last: u32, season: Option<i32> },
     /// one team's next scheduled games
     TeamSchedule { entity: String, next: u32 },
+    /// a game simulator run (projection-service /{sport}/simulate/{game}); `out` rules players out
+    SimRun { sport: String, game_id: String, n: u32, seed: u64, out: Vec<String> },
     /// a name -> canonical entity, or the candidates when it is ambiguous
     Resolve { q: String, sport: Option<String>, kind: Option<String>, focus: Vec<String> },
 }
@@ -69,7 +71,7 @@ impl Tool {
     pub fn name(&self) -> &'static str {
         match self { Tool::PicksToday { .. } => "picks.today", Tool::PicksRecord { .. } => "picks.record", Tool::HubBrief { .. } => "hub.brief", Tool::HubSlate { .. } => "hub.slate", Tool::Validation { .. } => "model.validation",
             Tool::Standings { .. } => "kb.standings", Tool::Champions { .. } => "kb.champions", Tool::PlayerStats { .. } => "kb.player_stats",
-            Tool::TeamResults { .. } => "kb.results", Tool::TeamSchedule { .. } => "kb.schedule", Tool::Resolve { .. } => "entities.resolve" }
+            Tool::TeamResults { .. } => "kb.results", Tool::TeamSchedule { .. } => "kb.schedule", Tool::SimRun { .. } => "sim.run", Tool::Resolve { .. } => "entities.resolve" }
     }
 
     /// Argument checks: known sports only, bounded free text.
@@ -97,6 +99,13 @@ impl Tool {
                 if *last == 0 || *last > 200 { return Err("last must be 1-200".into()); }
                 Ok(())
             }
+            Tool::SimRun { sport, game_id, n, out, .. } => {
+                if !SPORTS.contains(&sport.as_str()) { return Err("unknown sport".into()); }
+                if game_id.is_empty() || game_id.len() > 32 || !game_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return Err("bad game id".into()); }
+                if !(crate::sim::MIN_N..=crate::sim::MAX_N).contains(n) { return Err("n must be 100,000-1,000,000".into()); }
+                if out.len() > 6 || out.iter().any(|o| o.is_empty() || o.len() > 20 || !o.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) { return Err("bad player ids".into()); }
+                Ok(())
+            }
             Tool::TeamSchedule { entity, next } => {
                 if !entity_ok(entity, "tm") { return Err("entity must be tm:<sport>:<code>".into()); }
                 if *next == 0 || *next > 20 { return Err("next must be 1-20".into()); }
@@ -113,11 +122,11 @@ impl Tool {
         }
     }
 
-    fn timeout(&self) -> Duration {
-        match self { Tool::HubBrief { .. } => Duration::from_secs(25), Tool::HubSlate { .. } => Duration::from_secs(20), Tool::Validation { .. } => Duration::from_secs(30), _ => Duration::from_secs(12) }
+    pub(crate) fn timeout(&self) -> Duration {
+        match self { Tool::SimRun { .. } => Duration::from_secs(150), Tool::HubBrief { .. } => Duration::from_secs(25), Tool::HubSlate { .. } => Duration::from_secs(20), Tool::Validation { .. } => Duration::from_secs(30), _ => Duration::from_secs(12) }
     }
 
-    fn url(&self, base: &str) -> String {
+    pub(crate) fn url(&self, base: &str) -> String {
         match self {
             Tool::PicksToday { sport } => format!("{base}/picks?status=open&sort=edge&limit=200{}", sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default()),
             Tool::PicksRecord { sport, days } => format!("{base}/picks/record?days={days}{}", sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default()),
@@ -131,12 +140,14 @@ impl Tool {
             Tool::TeamResults { entity, opponent, last, season } => format!("{base}/kb/results?entity={}&last={last}{}{}", crate::urlencode(entity),
                 opponent.as_deref().map(|o| format!("&opponent={}", crate::urlencode(o))).unwrap_or_default(), season.map(|y| format!("&season={y}")).unwrap_or_default()),
             Tool::TeamSchedule { entity, next } => format!("{base}/kb/results?entity={}&last={next}&upcoming=true", crate::urlencode(entity)),
+            Tool::SimRun { sport, game_id, n, seed, out } => format!("{base}/{sport}/simulate/{game_id}?n={n}&seed={seed}{}",
+                if out.is_empty() { String::new() } else { format!("&out={}", out.join(",")) }),
             Tool::Resolve { q, sport, kind, focus } => format!("{base}/entities/resolve?q={}{}{}{}", crate::urlencode(q), sport.as_deref().map(|s| format!("&sport={s}")).unwrap_or_default(),
                 kind.as_deref().map(|k| format!("&kind={k}")).unwrap_or_default(), if focus.is_empty() { String::new() } else { format!("&focus={}", crate::urlencode(&focus.join(","))) }),
         }
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Tool::PicksToday { sport } => format!("AI Picks: open {} picks", sport.as_deref().map(|s| s.to_uppercase()).unwrap_or_else(|| "all-sport".into())),
             Tool::PicksRecord { sport, days } => format!("AI Picks track record, last {days} days{}", sport.as_deref().map(|s| format!(" ({})", s.to_uppercase())).unwrap_or_default()),
@@ -148,6 +159,8 @@ impl Tool {
             Tool::PlayerStats { entity, .. } => format!("Player game logs ({entity})"),
             Tool::TeamResults { entity, .. } => format!("Team results ({entity})"),
             Tool::TeamSchedule { entity, .. } => format!("Team schedule ({entity})"),
+            Tool::SimRun { sport, game_id, n, seed, out } => format!("{} simulator: game {game_id}, {} runs, seed {seed}{}", sport.to_uppercase(), crate::sim::fmt_count(*n as u64),
+                if out.is_empty() { String::new() } else { format!(", ruled out: {}", out.join(", ")) }),
             Tool::Resolve { q, .. } => format!("Entity lookup: \"{q}\""),
         }
     }
@@ -178,6 +191,7 @@ impl Tools {
             Tool::PlayerStats { entity, stats, last, season } => json!({ "entity": entity, "stats": stats, "last": last, "season": season }),
             Tool::TeamResults { entity, opponent, last, season } => json!({ "entity": entity, "opponent": opponent, "last": last, "season": season }),
             Tool::TeamSchedule { entity, next } => json!({ "entity": entity, "next": next }),
+            Tool::SimRun { sport, game_id, n, seed, out } => json!({ "sport": sport, "game_id": game_id, "n": n, "seed": seed, "out": out }),
             Tool::Resolve { q, sport, kind, focus } => json!({ "q": q, "sport": sport, "kind": kind, "focus": focus }),
         };
         if let Err(e) = tool.validate() {
@@ -248,6 +262,11 @@ mod tests {
         assert!(Tool::Resolve { q: "James".into(), sport: Some("nba".into()), kind: Some("player".into()), focus: vec!["pl:nba:1966".into()] }.validate().is_ok());
         assert!(Tool::Resolve { q: "x".into(), sport: None, kind: Some("venue".into()), focus: vec![] }.validate().is_err());
         assert_eq!(Tool::Standings { sport: "nhl".into(), season: Some(2025) }.url("http://p"), "http://p/kb/standings?sport=nhl&season=2025");
+        let sim = Tool::SimRun { sport: "nba".into(), game_id: "401909923".into(), n: 100_000, seed: 42, out: vec!["3112335".into()] };
+        assert!(sim.validate().is_ok());
+        assert_eq!(sim.url("http://p"), "http://p/nba/simulate/401909923?n=100000&seed=42&out=3112335");
+        assert!(Tool::SimRun { sport: "nba".into(), game_id: "1".into(), n: 50_000, seed: 1, out: vec![] }.validate().is_err(), "below the engines' minimum");
+        assert!(Tool::SimRun { sport: "nba".into(), game_id: "1/../x".into(), n: 100_000, seed: 1, out: vec![] }.validate().is_err());
     }
 
     #[tokio::test]

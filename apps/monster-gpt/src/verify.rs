@@ -82,6 +82,8 @@ const COMPUTED_KEYS: &[&str] = &["summary", "mean", "median", "sd", "avg", "pct"
 fn kind_for(tool: &str, path: &[String]) -> FactKind {
     let has = |keys: &[&str]| path.iter().any(|p| { let p = p.to_lowercase(); keys.iter().any(|k| p == *k || p.starts_with(&format!("{k}_")) || p.ends_with(&format!("_{k}"))) });
     if tool == "docs.search" || tool == "research.search" { return FactKind::Reference; }
+    // a simulation is the model's estimate; a scenario run is hypothetical
+    if tool == "sim.run" { return if path.iter().any(|p| p == "hypothetical" || p == "overrides") { FactKind::Hypothetical } else { FactKind::ModelEstimate }; }
     if path.iter().any(|p| p == "overrides" || p == "hypothetical") { return FactKind::Hypothetical; }
     // an AI pick's price, line and book are what the sportsbook posted; the rest is the model's
     if tool == "picks.today" && path.iter().any(|p| matches!(p.as_str(), "price" | "line" | "odds" | "book" | "american")) && !has(&["fair", "playable", "p_model", "edge", "ev"]) {
@@ -190,6 +192,11 @@ pub fn check(answer: &str, facts: &[Fact]) -> Vec<Claim> {
         if s.starts_with("Source:") || s.starts_with("Sources:") || s.ends_with('?') { continue; }
         // the user's own words, quoted back ("I looked for \"Madison Square Garden\""), are not claims
         let bare: String = { let mut inq = false; s.chars().filter(|c| { if *c == '"' { inq = !inq; return false; } !inq }).collect() };
+        // identifiers (run ids, model versions, game ids) mix letters and digits; they are labels, not numbers
+        let bare: String = bare.split(' ').map(|w| {
+            let core = w.trim_matches(|c: char| !c.is_alphanumeric());
+            if core.chars().any(|c| c.is_ascii_digit()) && core.chars().any(|c| c.is_ascii_alphabetic()) && !core.ends_with('%') { " " } else { w }
+        }).collect::<Vec<_>>().join(" ");
         let nums: Vec<String> = crate::validate::numbers(&bare).into_iter().filter(|n| crate::validate::checkable(n)).collect();
         let names = sentence_names(&bare);
         if nums.is_empty() && names.is_empty() { continue; }
@@ -316,6 +323,12 @@ mod tests {
         let facts = facts_from("kb.player_stats", &json!({ "name": "LeBron James" }), &src("S1", "logs"), 0, today());
         assert!(check("Which James do you mean: LeBron James (PHI) or Jalen James?", &facts).is_empty());
         assert!(check("I looked for \"Madison Square Garden\" and found no match.", &facts).is_empty());
+    }
+
+    #[test]
+    fn identifiers_are_labels_not_numbers() {
+        let facts = facts_from("sim.run", &json!({ "seed": 42 }), &src("S1", "sim"), 0, today());
+        assert!(check("Run sim_c4f30c15731ebaecaf80: the same seed reproduces it.", &facts).is_empty());
     }
 
     #[test]
