@@ -91,8 +91,10 @@ def test_services_read_the_source_registry_but_cannot_change_it(scratch):
 def test_the_seeded_registry_claims_no_review_that_has_not_happened(scratch):
     rows = dict((r[0], r[1:]) for r in app("SELECT source_id, status, terms_reviewed_at, access, cost FROM data_sources"))
     reviewed = {k for k, v in rows.items() if v[0] == "approved"}
-    assert reviewed == {"monster_os"}, "only Monster OS's own outputs are approved until the terms review (Phase 3)"
-    assert all(v[1] is None for k, v in rows.items() if k != "monster_os")
+    assert reviewed == {"monster_os"}, "only Monster OS's own outputs are approved; approving a source is the owner's decision"
+    # 0044 records the terms review; sources whose terms could not be read carry no review date
+    assert rows["sportsgameodds"][1] is None and rows["kalshi"][1] is None
+    assert all(rows[k][1] is not None for k in ("espn_site", "nba_stats", "mlb_statsapi", "nhl_api", "nflverse", "moneypuck"))
     paid = {k for k, v in rows.items() if v[2] == "paid_api"}
     assert paid == {"the_odds_api", "sportsgameodds"} and all(rows[k][3].startswith("paid") for k in paid)
 

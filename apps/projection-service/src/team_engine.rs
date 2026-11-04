@@ -73,7 +73,7 @@ fn elo_margin(games: &[EloGame], season: i32, home: &str, away: &str) -> (f64, f
 /// Every completed NFL game before the date since 2010, in order (the ratings need the long history).
 async fn elo_games(db: &tokio_postgres::Client, before: NaiveDate) -> Result<Vec<EloGame>, String> {
     let rows = db.query("SELECT season, home_team, away_team, home_score - away_score FROM sports_games \
-                         WHERE sport = 'nfl' AND home_score IS NOT NULL AND away_score IS NOT NULL AND season >= 2010 AND game_date < $1 \
+                         WHERE sport = 'nfl' AND game_type = 'REG' AND home_score IS NOT NULL AND away_score IS NOT NULL AND season >= 2010 AND game_date < $1 \
                          ORDER BY game_date, game_id", &[&before]).await.map_err(|e| dberr(&e))?;
     Ok(rows.iter().map(|r| EloGame { season: r.get(0), home: r.get(1), away: r.get(2), margin: r.get::<_, i32>(3) as f64 }).collect())
 }
@@ -147,7 +147,7 @@ async fn past(db: &tokio_postgres::Client, sport: &str, before: NaiveDate, lookb
                            WHERE completed AND game_type IN (2,3) AND home_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
         _ => db.query("SELECT game_date, home_team, away_team, home_score, away_score, s.home_1h, s.away_1h FROM sports_games g \
                        LEFT JOIN game_segments s ON s.sport = g.sport AND s.game_id = g.game_id \
-                       WHERE g.sport = 'nfl' AND home_score IS NOT NULL AND away_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
+                       WHERE g.sport = 'nfl' AND g.game_type = 'REG' AND home_score IS NOT NULL AND away_score IS NOT NULL AND game_date < $1 AND game_date >= $1 - $2::int", &[&before, &lookback]).await,
     }.map_err(|e| dberr(&e))?;
     Ok(rows.iter().map(|r| {
         let seg = match (r.get::<_, Option<i32>>(5), r.get::<_, Option<i32>>(6)) { (Some(h), Some(a)) => Some((h as f64, a as f64)), _ => None };

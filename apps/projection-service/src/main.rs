@@ -64,6 +64,7 @@ mod nhl_api;
 mod nhl_game;
 mod nhl_sim;
 mod nhl_teams;
+mod entities;
 mod injury_snap;
 mod ops_status;
 mod proj_sync;
@@ -673,6 +674,9 @@ async fn main() -> std::io::Result<()> {
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(ops_status::readyz))
             .route("/ops/status", web::get().to(ops_status::ops_status))
+            .route("/entities/build", web::post().to(entities::build))
+            .route("/entities/search", web::get().to(entities::search))
+            .route("/entities/resolve", web::get().to(entities::resolve))
             .route("/ingest/nfl", web::post().to(ingest_nfl))
             .route("/stats/nfl", web::get().to(list_stats))
             .route("/projections/nfl/{stat}", web::get().to(list_stat))

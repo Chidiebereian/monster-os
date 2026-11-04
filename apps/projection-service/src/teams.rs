@@ -152,7 +152,7 @@ pub async fn ingest_teams(state: web::Data<State>, q: web::Query<IngestQuery>) -
     for rec in rdr.records() {
         let r = match rec { Ok(r) => r, Err(e) => return internal(format!("csv row: {e}")) };
         let gt = r.get(ity).unwrap_or("").to_string();
-        if gt != "REG" && gt != "POST" {
+        if !stored_game_type(&gt) {
             continue; // skip preseason
         }
         games.push(Game {
@@ -337,6 +337,13 @@ fn fit_ratings(games: &[Game], halflife: f64, epochs: usize, ridge: f64) -> Opti
         dispersion,
         n_games: completed.len(),
     })
+}
+
+/// nflverse game types kept: the regular season and every playoff round. nflverse labels
+/// playoff games by round (WC, DIV, CON, SB), not "POST", so before 2026-11-04 no NFL
+/// playoff game was stored. Model fits and engine histories read `game_type = 'REG'`.
+pub(crate) fn stored_game_type(gt: &str) -> bool {
+    matches!(gt, "REG" | "POST" | "WC" | "DIV" | "CON" | "SB")
 }
 
 async fn store_games(db: &tokio_postgres::Client, games: &[Game]) -> Result<(), String> {
@@ -565,4 +572,13 @@ fn hist(sorted: &[f64], bins: usize) -> Value {
     let total: u32 = counts.iter().sum();
     let density: Vec<f64> = counts.iter().map(|&c| if total > 0 { c as f64 / total as f64 } else { 0.0 }).collect();
     json!({ "lo": lo, "hi": hi, "bin_width": w, "density": density })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn playoff_rounds_are_stored_and_preseason_is_not() {
+        for gt in ["REG", "WC", "DIV", "CON", "SB"] { assert!(super::stored_game_type(gt), "{gt}"); }
+        assert!(!super::stored_game_type("PRE"));
+    }
 }
