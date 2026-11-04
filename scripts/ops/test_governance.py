@@ -187,11 +187,14 @@ def test_production_self_test_records_are_inert(production_unchanged):
     with psycopg.connect(OWNER) as cx:
         rows = cx.execute("SELECT request_id, status, approver, executed_at, decision_reason, last_actor FROM promotion_requests "
                           "WHERE decision_reason ILIKE 'governance self-test%' ORDER BY request_id").fetchall()
-        executed = cx.execute("SELECT count(*) FROM promotion_requests WHERE status IN ('APPROVED','EXECUTED')").fetchone()[0]
-        open_ = cx.execute("SELECT count(*) FROM promotion_requests WHERE status IN ('PROPOSED','PENDING_APPROVAL','APPROVED')").fetchone()[0]
-        audit = cx.execute("SELECT count(*) FROM learning_audit WHERE action IN ('promote','rollback') AND at > '2026-11-01'").fetchone()[0]
+        # scoped to the self-test's own records: real requests (proposed, approved or executed by the owner) are allowed
+        versions = [r[0] for r in cx.execute("SELECT candidate_version FROM promotion_requests WHERE decision_reason ILIKE 'governance self-test%' "
+                                             "AND candidate_version IS NOT NULL").fetchall()]
+        audit = cx.execute("SELECT count(*) FROM learning_audit WHERE action IN ('promote','rollback') AND version = ANY(%s)", (versions,)).fetchone()[0]
+        events = cx.execute("SELECT count(*) FROM promotion_request_events e JOIN promotion_requests r USING (request_id) "
+                            "WHERE r.decision_reason ILIKE 'governance self-test%' AND e.to_status IN ('APPROVED','EXECUTED')").fetchone()[0]
     assert len(rows) == 4 and all(r[1] == "REJECTED" and r[2] is None and r[3] is None and r[5] == "selftest" for r in rows)
-    assert executed == 0 and open_ == 0 and audit == 0
+    assert audit == 0 and events == 0, "a self-test request was approved, executed or promoted"
 
 
 def test_publication_state_in_production(production_unchanged):
@@ -213,11 +216,18 @@ def test_publication_state_in_production(production_unchanged):
         # markets with no decision whose first pick came after the cut-over: unpublished by design, never public
         late = cx.execute("""SELECT count(*), count(*) FILTER (WHERE a.published_at <= (SELECT max(decided_at) FROM publication_holds WHERE auth_method='seed'))
                              FROM ai_picks a WHERE NOT EXISTS (SELECT 1 FROM publication_state s WHERE s.engine=a.engine AND s.market=a.market)""").fetchone()
+        # markets the old rule showed whose picks the new rule does not: each must carry a later decision
+        # (the safety rule suspending it, or an admin changing it); nothing may be lost silently
+        undecided = cx.execute("""
+            SELECT count(DISTINCT (a.engine, a.market)) FROM ai_picks a WHERE a.status='open' AND a.starts_at > now() AND a.tier IN ('proven','baseline')
+              AND NOT EXISTS (SELECT 1 FROM publication_holds h WHERE h.auth_method='migration' AND h.engine=a.engine AND h.market=a.market)
+              AND NOT EXISTS (SELECT 1 FROM publication_state s WHERE s.engine=a.engine AND s.market=a.market AND s.status='published')
+              AND NOT EXISTS (SELECT 1 FROM publication_holds h WHERE h.engine=a.engine AND h.market=a.market AND h.auth_method IN ('safety_rule','admin_token'))""").fetchone()[0]
     assert HELD <= held
     assert late[1] == 0, "a market that had picks at the cut-over has no publication decision"
     # every pick the old rule showed is still shown, except picks of markets that appeared after the cut-over
-    # (unpublished until an admin decides) and markets the safety rule suspended since (which only removes)
-    assert (lost == 0 or suspended_since > 0) and gained == 0
+    # (unpublished until an admin decides) and markets the safety rule or an admin changed since (which only removes)
+    assert (lost == 0 or undecided == 0) and gained == 0
     assert (any_lost <= late[0] or suspended_since > 0) and any_gained == 0
     st, d = call(LIVE, "GET", "/picks?status=all&limit=1000&include_hidden=true")
     assert st == 200 and not any((p["engine"], p["market"]) in HELD for p in d["picks"])

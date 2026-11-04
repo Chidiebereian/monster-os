@@ -44,6 +44,18 @@ pub fn kind_of(path: &str) -> &'static str {
     else { "doc" }
 }
 
+/// A design or plan document (a `Status: design` / `Status: plan` line near the top)
+/// describes things that do not exist yet. It is indexed as kind "plan", which chat
+/// retrieval leaves out unless a caller asks for plans by kind, so planned tools are
+/// never presented as working ones.
+pub fn kind_of_doc(path: &str, text: &str) -> &'static str {
+    let planned = text.lines().take(12).any(|l| {
+        let l = l.trim().to_lowercase();
+        l.starts_with("status: design") || l.starts_with("status: plan")
+    });
+    if planned { "plan" } else { kind_of(path) }
+}
+
 pub fn sport_of(text: &str) -> Option<String> {
     let l = text.to_lowercase();
     let n = |keys: &[&str]| keys.iter().map(|k| l.matches(k).count()).sum::<usize>();
@@ -214,7 +226,7 @@ impl Index {
         let allowed = |c: &Chunk| {
             (f.access.is_empty() && c.access == "public" || f.access.iter().any(|a| *a == c.access))
                 && f.sport.as_ref().map(|s| c.sport.as_deref().map(|cs| cs == s).unwrap_or(true)).unwrap_or(true)
-                && f.kinds.as_ref().map(|ks| ks.iter().any(|k| *k == c.kind)).unwrap_or(true)
+                && f.kinds.as_ref().map(|ks| ks.iter().any(|k| *k == c.kind)).unwrap_or(c.kind != "plan")
         };
         let ok: Vec<usize> = (0..self.chunks.len()).filter(|i| allowed(&self.chunks[*i])).collect();
         let b = self.bm25.scores(q);
@@ -345,7 +357,7 @@ impl Rag {
             let pieces = chunk_markdown(&title, &text);
             let inputs: Vec<String> = pieces.iter().map(|(h, t)| format!("{h}\n{t}")).collect();
             let vecs = match self.embed(&inputs, "search_document: ").await { Ok(v) => v, Err(e) => { errors.push(format!("{f}: {e}")); continue } };
-            let kind = kind_of(f);
+            let kind = kind_of_doc(f, &text);
             let res: Result<(), tokio_postgres::Error> = async {
                 self.db.execute("DELETE FROM rag_docs WHERE doc_id=$1", &[f]).await?;
                 self.db.execute("INSERT INTO rag_docs (doc_id, title, kind, hash, chunks) VALUES ($1,$2,$3,$4,$5)", &[f, &title, &kind, &hash, &(pieces.len() as i32)]).await?;
@@ -466,6 +478,19 @@ mod tests {
         let f = rrf(&[vec![1, 2, 3], vec![3, 1, 9]]);
         assert_eq!(f[0].0, 1);
         assert_eq!(f[1].0, 3);
+    }
+
+    #[test]
+    fn plans_are_left_out_unless_asked_for() {
+        assert_eq!(kind_of_doc("docs/architecture/v2.md", "# V2\n\nStatus: design, 2026-11-03.\n"), "plan");
+        assert_eq!(kind_of_doc("docs/architecture/ai-picks.md", "# AI Picks\n\nThe feed lists picks.\n"), "architecture");
+        let mut planned = chunk("p#0", "v2.md", "kb standings tool returns standings", vec![1.0, 0.0], "public", None);
+        planned.kind = "plan".into();
+        let idx = Index::new(vec![planned, chunk("d#0", "d.md", "standings are computed from finals", vec![0.9, 0.1], "public", None)]);
+        let hits = idx.search("standings tool", Some(&[1.0, 0.0]), &Filter::default(), Mode::Hybrid, 5);
+        assert!(hits.iter().all(|h| h.doc_id != "v2.md"), "a plan is never retrieved by default");
+        let plans = Filter { kinds: Some(vec!["plan".into()]), ..Default::default() };
+        assert!(idx.search("standings tool", Some(&[1.0, 0.0]), &plans, Mode::Hybrid, 5).iter().any(|h| h.doc_id == "v2.md"));
     }
 
     #[test]

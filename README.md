@@ -51,21 +51,17 @@ infrastructure/  docker-compose, Postgres + ClickHouse schemas, monitoring
 docs/            architecture notes
 ```
 
-## Ports
+## Ports and setup
 
-| Port | Service | Port | Service |
-|------|---------|------|---------|
-| 8080 | api-gateway | 8100–8112 | services/* (see main.rs) |
-| 8081 | simulation-engine | 8113 | data-quality-service |
-| 8082 | pricing-engine | 8114–8119 | remaining apps |
-| 8120 | odds-service | | |
-| 8083 | arbitrage-engine | 5432 | Postgres |
-| 8084 | model-registry | 8123 | ClickHouse HTTP |
-| 8085 | monster-gpt | 11434 | Ollama |
+Setup from a clean checkout, the port map, database roles, schema changes and the
+check gate are in [docs/development.md](docs/development.md). In short: the stack
+starts with `scripts\windows\start-stack.ps1`, the gateway listens on 8090, the
+dashboard on 5190 and Postgres on 127.0.0.1:5434. Every service exposes
+`GET /healthz`; override any port with `PORT=`.
 
-Every service exposes `GET /healthz`. Override any port with `PORT=`.
+## Quick start (individual services)
 
-## Quick start
+The examples below use the gateway's original port 8080; the stack launcher runs it on 8090.
 
 ```bash
 cp .env.example .env

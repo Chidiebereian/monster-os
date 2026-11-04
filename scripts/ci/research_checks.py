@@ -8,14 +8,21 @@ Runs, in order, and fails closed (exit 1) on the first broken guarantee:
   3. integrity       write-once tables, decision-time features, game separation,
                      determinism, provenance, research isolation, publication holds
                      (scripts/ml/test_integrity.py; needs Postgres and projection-service)
-  4. rust            cargo test for projection-service and monster-gpt
+  4. rust            cargo test for every workspace crate (unit tests in the binaries)
   5. dashboard       TypeScript check
   6. e2e (--e2e)     MonsterGPT end-to-end tests (needs monster-gpt running)
   7. governance      admin authentication, database privileges, promotion lifecycle and
                      publication control (scripts/ops/test_governance.py): read-only checks
                      against production, everything that writes on a scratch instance that
                      connects as monster_app
-  8. secrets         tracked, staged and to-be-added files plus git history: database URLs
+  8. schema-v2       MonsterGPT v2 tables (0040-0043) on a scratch database: write-once claims,
+                     final simulation runs, a source registry the services cannot change
+                     (scripts/ops/test_schema_v2.py)
+  9. curriculum      the from-scratch model curriculum and Micro GPT (models/monster-gpt/tests)
+ 10. golden          golden.json is valid and every truth query computes (read-only);
+                     --golden also asks every question on a scratch MonsterGPT and grades it
+                     (reported, not gating, until the v2 tools exist)
+ 11. secrets         tracked, staged and to-be-added files plus git history: database URLs
                      with passwords, the live .env credentials, private keys, API-key shapes.
                      Files that already carried the local owner login before this gate
                      existed are listed as pre-existing; anything else fails. No value is printed.
@@ -24,6 +31,7 @@ Each step's output goes to %LOCALAPPDATA%/MonsterOS/logs/research/checks_<time>.
 
   python scripts/ci/research_checks.py            # before asking to commit research work
   python scripts/ci/research_checks.py --fast     # skip the slow research-mode batch and cargo
+  python scripts/ci/research_checks.py --golden   # also run the golden questions (minutes; needs Ollama)
 """
 import argparse
 import datetime as dt
@@ -112,6 +120,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--e2e", action="store_true")
+    ap.add_argument("--golden", action="store_true")
     a = ap.parse_args()
     py = sys.executable
     steps = [("migrations", migrations),
@@ -119,11 +128,17 @@ def main():
              ("integrity", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ml/test_integrity.py"] + (["-m", "not slow"] if a.fast else []))),
              ("governance", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ops/test_governance.py"]))]
     if not a.fast:
-        steps.append(("rust", lambda: run(["cargo", "test", "-p", "projection-service", "-p", "monster-gpt", "-j", "2", "--bins"], timeout=7200)))
+        steps.append(("rust", lambda: run(["cargo", "test", "--workspace", "-j", "2", "--bins"], timeout=7200)))
     steps.append(("dashboard", lambda: run("npx tsc --noEmit -p .", cwd=os.path.join(ROOT, "apps", "dashboard"))))
+    steps.append(("schema-v2", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "scripts/ops/test_schema_v2.py"])))
+    steps.append(("curriculum", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "models/monster-gpt/tests"])))
+    steps.append(("golden", lambda: run([py, "apps/monster-gpt/tests/golden.py", "--check"])))
     steps.append(("secrets", secrets_scan))
     if a.e2e:
         steps.append(("e2e", lambda: run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "apps/monster-gpt/tests/e2e_ws.py"], timeout=3600)))
+    if a.golden:
+        # graded and reported; not gating until the v2 tools exist (monster-gpt-v2.md section 12)
+        steps.append(("golden-run", lambda: (0, run([py, "apps/monster-gpt/tests/golden.py", "--run"], timeout=3600)[1])))
     os.makedirs(LOGDIR, exist_ok=True)
     path = os.path.join(LOGDIR, f"checks_{dt.datetime.now():%Y%m%d_%H%M%S}.log")
     with open(path, "w", encoding="utf-8") as log:
